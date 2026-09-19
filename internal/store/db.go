@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -489,6 +490,48 @@ func (s *Store) LogRequest(accountID, endpoint string, status int, elapsedMS flo
 		VALUES (?, ?, ?, ?, ?)
 	`, accountID, endpoint, status, elapsedMS, errVal)
 	return err
+}
+
+/* ------------------------------------------------------------------ *
+ * Settings
+ * ------------------------------------------------------------------ */
+
+// SettingKeyAccountIndex names the signed-in Google account the engine acts as.
+//
+// It is stored because it is a deliberate operator choice with a real cost
+// attached — accounts hold different balances, and a restart that quietly
+// returns to the first one can spend a test run against an account with nothing
+// left on it.
+const SettingKeyAccountIndex = "account_index"
+
+// Setting reads a stored value.
+//
+// The bool is false when the key has never been written, which is the normal
+// state on a fresh database and is not an error. Only a real failure to read
+// comes back as an error, so a caller can tell "unset" from "unreadable" — the
+// difference between using a default and not knowing what the value is.
+func (s *Store) Setting(key string) (string, bool, error) {
+	var value string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: read setting %q: %w", key, err)
+	}
+	return value, true, nil
+}
+
+// SetSetting stores a value, replacing any previous one.
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+	`, key, value)
+	if err != nil {
+		return fmt.Errorf("store: write setting %q: %w", key, err)
+	}
+	return nil
 }
 
 /* ------------------------------------------------------------------ *

@@ -96,3 +96,18 @@ CREATE TABLE IF NOT EXISTS request_logs (
 
 CREATE INDEX IF NOT EXISTS idx_reqlogs_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_reqlogs_status ON request_logs(status_code);
+
+-- ----------------------------------------------------------------------------
+-- settings: engine configuration that has to outlive a restart.
+--
+-- A single key/value table rather than a column somewhere, because what belongs
+-- here is exactly the set of choices an operator makes at runtime and expects to
+-- still hold tomorrow. The first one is the signed-in account: it used to live in
+-- memory alone, so every restart silently reverted to the first signed-in
+-- account — which is how a 1-credit account came to look like the only one.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS settings (
+    key                 TEXT PRIMARY KEY,
+    value               TEXT NOT NULL,
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

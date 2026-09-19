@@ -1,11 +1,27 @@
 # browser-Cdp — Is it pure CDP access?
 
-**Audit date:** 2026-09-18
-**Scope:** `../browser-Cdp/extension/` (extension) + `flow-go/internal/cdp`, `internal/bridge` (backend side)
+**Audit date:** 2026-09-18 (paths updated 2026-09-19)
+**Scope:** `../browser-Cdp/extension/` (extension) + `../browser-Cdp/cdp-control/{cdp,bridge}` (backend side)
 **Question asked:** does this give *pure* CDP access, or is something being faked/hidden?
 
 > Note: no file in the workspace matches `scene#16` / `Daily Development`, so this audit
 > is against the actual shipped code rather than a spec document.
+>
+> **Path note.** The backend side audited here was `flow-go/internal/{cdp,bridge}` at the
+> time. It has since moved out of this module into the sibling `browser-Cdp` project, and
+> is imported by a relative `replace` in `go.mod`. The findings are unchanged; only the
+> paths are.
+>
+> **Two extensions, not one.** This audits the **generic** one
+> (`browser-Cdp/extension/`, `chrome.debugger`, `<all_urls>`). flow-go also ships its own
+> narrow bridge (`flow-go/flow-go-extension/`) which has **no** `debugger` permission, is
+> limited to Google hosts, and exposes a fixed list of Flow operations instead of
+> arbitrary CDP. Both dial `ws://127.0.0.1:9222`; the backend tells them apart by the
+> `ops` list the extension reports on `ping`, and prefers the narrow one when both are
+> attached. See `README.md` for the comparison.
+>
+> The caveat below — that the running backend narrows the generic extension and never
+> un-narrows it — still applies, and applies to the generic extension only.
 
 ---
 

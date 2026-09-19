@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -984,6 +985,11 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			// which is which has moved at least once — so being able to vary it is
 			// the difference between testing that and guessing at it.
 			SourcePath string `json:"source_path"`
+			// AuthUser selects which signed-in Google account the call acts as.
+			// Several RPCs answer differently per account, and without this the
+			// route could only ever exercise the default one — which is exactly
+			// how a per-account value gets mistaken for a global one.
+			AuthUser int `json:"authuser"`
 		}
 		if err := c.Bind().JSON(&req); err != nil || req.RPC == "" || len(req.Arg) == 0 {
 			return c.Status(400).JSON(fiber.Map{"error": "rpc and arg are required"})
@@ -1003,9 +1009,19 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 		defer cancel()
 
-		captcha, err := eng.CaptchaToken(ctx, req.Action)
-		if err != nil {
-			return c.Status(502).JSON(fiber.Map{"error": "captcha: " + err.Error()})
+		// Mint a token only when the argument actually carries the placeholder.
+		//
+		// Most RPCs here take no reCAPTCHA at all, and demanding one for them
+		// made every such probe fail with "no reCAPTCHA provider configured"
+		// before the request under test was ever sent — which reads like a
+		// verdict on the RPC rather than on the token.
+		captcha := ""
+		if bytes.Contains(req.Arg, []byte(captchaPlaceholder)) {
+			token, err := eng.CaptchaToken(ctx, req.Action)
+			if err != nil {
+				return c.Status(502).JSON(fiber.Map{"error": "captcha: " + err.Error()})
+			}
+			captcha = token
 		}
 		jar := eng.Bridge().Jar()
 		if jar == nil {
@@ -1016,8 +1032,18 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
 
-		replaced := replacePlaceholder(arg, "__CAPTCHA__", captcha)
+		replaced := replacePlaceholder(arg, captchaPlaceholder, captcha)
 		client := eng.NewBatchexecuteClient(jar, hc)
+		client.SetAuthUser(req.AuthUser)
+		// Drop the seeded anti-CSRF token when acting as another account.
+		//
+		// The seed belongs to whichever account the page is showing, and sending
+		// it alongside a different `authuser` is answered with 400 — so without
+		// this the route can only ever exercise the default account, which is the
+		// exact blind spot it exists to remove.
+		if req.AuthUser != 0 {
+			client.SeedToken("")
+		}
 		sourcePath := req.SourcePath
 		if sourcePath == "" {
 			sourcePath = "/project/" + req.ProjectID
@@ -1263,6 +1289,34 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			"accounts_listed":  len(rows),
 			"note":             note,
 		})
+	})
+
+	// Which signed-in account would pay for a job of a given cost.
+	//
+	// Read-only: it reports the decision without moving to the account or
+	// submitting anything, so the choice can be inspected and checked against the
+	// balances it was made from. `?cost=` is what the render is expected to cost,
+	// i.e. config.VideoCost(duration, quality) × count.
+	app.Get("/v1/accounts/affordable", func(c fiber.Ctx) error {
+		cost := 0
+		if raw := strings.TrimSpace(c.Query("cost")); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 0 {
+				return c.Status(400).JSON(fiber.Map{
+					"error": "cost must be a non-negative integer",
+				})
+			}
+			cost = n
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+		defer cancel()
+
+		choice, err := eng.ChooseAccountFor(ctx, cost)
+		if err != nil {
+			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(choice)
 	})
 
 	// Fallback for operators who would rather push a cookie dump than run the
@@ -1719,6 +1773,12 @@ func shortID(id string) string {
 	return id
 }
 
+// captchaPlaceholder is the literal a captured payload carries where a
+// reCAPTCHA token used to be. The token is single-use and long expired by the
+// time a capture is replayed, so the capture stores this instead and the
+// placeholder is swapped for a fresh token at call time.
+const captchaPlaceholder = "__CAPTCHA__"
+
 // replacePlaceholder returns value with every string equal to placeholder
 // replaced by with, recursing through arrays and objects.
 //
@@ -1758,6 +1818,12 @@ func statusFor(err error) int {
 	}
 	message := err.Error()
 	switch {
+	// A refusal to spend money the account does not have is not an upstream
+	// failure and not a bad argument. It is the one outcome the caller can fix by
+	// topping up or asking for less, so it gets its own status rather than being
+	// reported as 502 alongside transport errors.
+	case strings.Contains(message, "insufficient credits"):
+		return 402
 	case strings.Contains(message, "not ready"),
 		strings.Contains(message, "no cookies available"),
 		strings.Contains(message, "no worker available"),

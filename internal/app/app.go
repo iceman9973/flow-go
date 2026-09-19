@@ -95,9 +95,10 @@ func Build(cfg Config) (*App, error) {
 	br.ListenAddr = fmt.Sprintf("127.0.0.1:%d", config.WSPort)
 
 	eng, err := engine.New(st, br, engine.Options{
-		ProjectID:   cfg.ProjectID,
-		ProxyURL:    cfg.ProxyURL,
-		CaptchaMode: cfg.CaptchaMode,
+		ProjectID:    cfg.ProjectID,
+		ProxyURL:     cfg.ProxyURL,
+		CaptchaMode:  cfg.CaptchaMode,
+		AccountIndex: config.AccountIndex,
 	})
 	if err != nil {
 		_ = st.Close()

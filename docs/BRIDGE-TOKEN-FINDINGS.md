@@ -1,5 +1,33 @@
 # Bridge token — state of play and two bugs
 
+> ## Status: both bugs are fixed. Read this before the analysis below.
+>
+> Updated 2026-09-19. The analysis is kept because the reasoning is still the
+> reference for how this was found, but **every path in it is wrong now and the two
+> bugs no longer exist.**
+>
+> **The code moved.** `internal/bridge/` and `internal/cdp/` are not in this module.
+> The bridge, the CDP client and the cookie jar live in the sibling `browser-Cdp`
+> project as `cdp-control/{bridge,cdp,cookiejar}` and are imported by a relative
+> `replace` in `go.mod`. Line numbers below refer to that code before it moved.
+>
+> | Finding | Status |
+> |---|---|
+> | **Bug A** — `AllowTokenless` captured by value, so the tokenless window never closed | **Fixed.** The field is a live read: `AllowTokenless func() bool`, called inside `authorize()` (`cdp-control/bridge/bridge.go`). The window closes the moment `claim()` runs. |
+> | **Bug B** — the extension never presents a token, so pairing never completes | **Fixed.** `browser-Cdp/extension/config.js` has `bridgeToken: ''` in `DEFAULTS`, and `background.js`'s `socketUrl()` appends `?token=<bridgeToken>` when it is set. Pairing completes and `data/bridge-token.claimed` is written. |
+> | Item 1 — version bump | Still `1.0.0`. Correct call: nothing changed on the wire. |
+> | Item 2 — heartbeat for stale sockets | Still absent. Unverified whether the leak is real. |
+> | Item 4 — `seq` on pushed events | Still absent. Events remain best-effort. |
+> | Item 5 — scope-drift on navigate | **Still open, and still the strongest item.** `chrome.tabs.onUpdated` in `browser-Cdp/extension/background.js` updates state and emits `tab.navigated` but never re-checks `urlAllowed()`, so a tab that navigates out of `targetUrlPrefixes` stays attached and keeps streaming CDP events. |
+> | Item 6 — docs parity | Fixed at the time; re-verify against the current READMEs. |
+> | Item 7 — stale binary | Nothing to do. |
+>
+> **One consequence worth stating plainly**, because the analysis below treats the
+> token as decorative: it is not, any more. A local process dialling
+> `ws://127.0.0.1:9222` without the token is now refused. That matters here because
+> **two** extensions dial that port and exactly one backend can own it — the token is
+> also what lets both extensions follow the backend across a restart.
+
 Written 2026-09-18. Findings on the **in-flight** token/auth work in `internal/bridge/`
 and `internal/cdp/`, and a fact-check of the 7-item improvement list.
 

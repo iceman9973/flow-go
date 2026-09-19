@@ -22,22 +22,30 @@ This port inverts that. The browser supplies cookies; Go derives everything else
 
 ```
                     ┌──────────────────────────────────────┐
-   Chrome           │  browser-Cdp extension               │
-   (signed in)      │  · attach to an allowed tab          │
+   Chrome           │  browser-Cdp extension               │  generic: any site,
+   (signed in)      │  · attach to an allowed tab          │  chrome.debugger
                     │  · read cookies in a scoped domain   │
                     │  · run CDP commands on request       │
+                    ├──────────────────────────────────────┤
+                    │  Flow Go Bridge                      │  narrow: Flow only,
+                    │  · the same, minus cdp.evaluate      │  no debugger
+                    │  · flow.at / flow.captcha / flow.upscale
                     └───────────────┬──────────────────────┘
                                     │ WebSocket, extension dials out
+                                    │ both extensions hardcode ws://127.0.0.1:9222,
+                                    │ so exactly one backend can own the port
                                     ▼
-   internal/cdp        ── protocol multiplexer (hosts the socket)
-   internal/bridge     ── allowlists, cookie sync, session refresh
+   cdp-control/bridge  ── protocol multiplexer (hosts the socket), token pairing,
+   cdp-control/cdp        allowlists, cookie sync, session refresh, tab control
+   cdp-control/cookiejar  cookie model, domain scoping, stable hashing
+   (external module, imported via a local `replace`)
                                     │
                                     ▼
-   internal/cookiejar  ── cookie model, domain scoping, stable hashing
    internal/auth       ── Labs session endpoint → access token, cached by jar hash
    internal/httpx      ── Chrome-impersonating transport (uTLS + HTTP/3 → HTTP/2)
-   internal/recaptcha  ── broker → http → empty
-   internal/flowapi    ── Flow endpoints, error classification, retry
+   internal/recaptcha  ── flow.captcha → broker → http → empty
+   internal/batchexecute ── the RPC transport the app actually uses
+   internal/flowapi    ── legacy aisandbox REST, error classification, retry
    internal/pool       ── account routing, failover, circuit breaking
    internal/store      ── SQLite WAL
    internal/engine     ── orchestration
@@ -46,25 +54,70 @@ This port inverts that. The browser supplies cookies; Go derives everything else
 
 Each layer depends only downward. `engine` is the only place that combines them.
 
+The three `cdp-control/*` packages are **not** part of this module. They live in the
+sibling `browser-Cdp` project and are pulled in by a relative `replace` in `go.mod`,
+which means flow-go cannot be built without that checkout beside it. The two
+projects also ship separate extensions; see `README.md` for which is which.
+
 ## Data flow for one video
 
-1. `POST /v1/videos/generations` → `engine.SubmitVideo` creates a job row and
-   returns a `job_id` immediately.
-2. A detached goroutine calls `engine.GenerateVideo`.
-3. Local image inputs are uploaded first (`flowapi.UploadImage`) so a slow upload
-   does not hold a pool slot.
-4. `pool.Execute` acquires a worker (free-tier-first, least-busy, affordable,
-   not circuit-broken) and calls the appropriate generator.
-5. `flowapi.Client.call` mints or reuses a token, injects `clientContext` with
-   the resolved project, tier and captcha token, and issues the request.
-6. On an auth failure it drops the token, re-mints once, and retries. On any
-   other retryable failure `pool.Execute` fails over to another account.
-7. Polling happens **outside** the pool — it is read-only and can take minutes,
-   and holding a generation slot for it would stall the pool.
-8. If a resolution above 720p was requested, a second upsampler pass runs and the
-   upsampled media IDs replace the originals.
-9. Media is streamed to disk with cookies attached to every redirect hop.
-10. The job, media, and per-account outcome are recorded.
+The video path is **batchexecute, and synchronous** — `GenerateVideoViaBatch` does
+the whole thing inside the request. The legacy `flowapi` path (`SubmitVideo` +
+detached goroutine + `pool.Execute`) is still in the tree but is not what
+`POST /v1/videos/generations` calls, because the aisandbox REST surface it needs
+is dead: its key is referrer-restricted to `labs.google` and refuses the app's own
+origin.
+
+1. `POST /v1/videos/generations` → `engine.GenerateVideoViaBatch`.
+2. Model and quality are resolved. The **model key is the authority on quality**:
+   `abra_t2v_4s_360p` is a 360p render whatever the `quality` field says, and
+   pricing it off the field would quote the 720p cost for a 360p render.
+3. A job row is written as `submitted`.
+4. The cookie jar and a batchexecute client are built for the current `authuser`.
+5. **Affordability gate.** `planVideo` reads the balance and compares it with
+   `VideoCosts[duration][quality] × count`. If it does not cover the render, the
+   other signed-in accounts are scanned and the engine moves to the one with the
+   most credits that can pay, then re-plans. Still short → **402** and nothing is
+   sent. 720p unaffordable but 360p affordable → the render is downgraded and the
+   response says so.
+6. `conditionImageID` resolves any start/end image to its **content id** — the
+   conditioning RPCs take the content id, not the media id.
+7. A reCAPTCHA token is minted. This is deliberately **after** the gate: a token is
+   a browser round trip, and minting one for a render the balance cannot cover
+   wastes it and buries the real reason behind a captcha failure.
+8. `client.GenerateVideo` picks its RPC id from the conditioning — `YhhmEf` for
+   text-to-video, `nprQif` / `eb1hJf` for image conditioning, `MZZa6b` for
+   references. A correct payload sent to the wrong id is **accepted and returns
+   nothing**.
+9. Media ids are parsed out of the response frames.
+10. The balance is read again. `credits_spent` is recorded as the **delta**, not
+    the table's figure — only the balance moving proves the render was charged.
+11. If `wait` / `download` was asked for, `collectVideo` polls `ResolveVideoURL`
+    until the signed URL appears.
+12. The file is streamed to `output/` with cookies attached to every redirect hop.
+
+Polling does **not** go through the pool: it is read-only and can take minutes, and
+holding a generation slot for it would stall the pool.
+
+### The two ids, and why a wrong one is invisible
+
+An asset carries several uuids and they are not interchangeable. Getting one wrong
+is never rejected — the RPC answers `200` with a `null` payload, which is
+indistinguishable from a render that has not finished:
+
+| RPC | Takes |
+| --- | --- |
+| `as29s` (media detail) | the listing's **media id** (`row[3][4]`) |
+| `SPrCad` (image upscale), `nprQif` / `eb1hJf` conditioning | the **content id** (`row[3][5]`) |
+| `/project/<id>/edit/<X>` | the media id |
+| `p0UkFb` (video upscale) | **both** |
+
+This is the defect that cost the most: `ResolveVideoURL` passed the content id to
+`as29s`, so every finished render looked like one that never finished. The poll
+waited its full timeout and gave up, while the video had been downloadable the whole
+time. `README.md` carried the same wrong claim in its id table, which is how the
+code came to be written that way.
+
 
 ## Token lifecycle
 
@@ -124,12 +177,37 @@ Selection order for a job costing `cost` credits:
 3. Anything idle, as a last resort.
 
 An **unknown** balance counts as affordable. Refusing to schedule a worker whose
-credits have simply not been polled yet would strand capacity.
+credits have simply not been polled yet would strand capacity. That is defensible
+for a pooled path and wrong for one with a hard, known cost — which is why the
+video path does not rely on it.
 
 A worker is parked for a cooldown after `FailureThreshold` consecutive failures.
 A success resets the streak. `Execute` excludes already-attempted workers, so a
 failing job cannot loop on the same account, and it stops as soon as every
 worker has been tried rather than waiting out the acquisition deadline.
+
+**Which paths actually use it.** `pool.Execute` is called by `upsample`,
+`UploadImage`, `GenerateImage`, and the legacy `GenerateVideo`. It is **not** called
+by `GenerateVideoViaBatch` — the one video path the HTTP API uses — because the
+pool's `Worker` carries a `flowapi.Client`, which the batchexecute path has no use
+for. Account selection for video is done by `switchToAffordableAccount` in the
+engine instead. That is a deliberate choice and it does leave two selection
+mechanisms in the tree; the honest summary is that the pool routes images and
+upscales, and the engine routes video.
+
+Two consequences worth knowing:
+
+- `GenerateImage` and `UploadImage` pass `cost = 0`, and `Affordable` returns true
+  for `cost <= 0`. So the affordability check is effectively disabled on those
+  paths — a broke account is scheduled and then fails upstream. Only video has a
+  pre-flight gate.
+- `Worker.Affordable` treats an unknown balance as affordable, so even the pooled
+  paths will accept an account whose balance has not been read.
+
+`Bootstrap` calls `pool.Retain(accountID)` before registering, so a switch does not
+leave the previous account's worker behind. Without it the pool accumulates
+accounts the engine can no longer route to, and `/status` sums a balance that is no
+longer available.
 
 ## Persistence
 
@@ -159,9 +237,15 @@ with a regression test where the fix is behavioural.
 | 2 | The stale key cache was never cleared, so `/health` advertised a usable credential the extension did not have | Token cache is keyed on the cookie jar hash and invalidated on any auth failure | `TestSessionJarSwapInvalidates` |
 | 3 | `has_flow_key()` reported a server-side cache, not the actual state | `bridge.Status().HasCredentials` is derived from the live cookie jar | `TestHasAuthCookies` |
 | 4 | `tests/test_worker_pool.py` had no isolation and wrote fixtures into the production database | Tests open a private temporary database; `Open` requires an explicit path | `TestStoresAreIsolated` |
-| 5 | The worker pool was dead code — `register_worker` / `acquire_worker` / `execute_with_failover` had no production callers | Every generation goes through `pool.Execute` | `TestExecuteFailover`, `TestFreeTierIsSpentFirst` |
+| 5 | The worker pool was dead code — `register_worker` / `acquire_worker` / `execute_with_failover` had no production callers | The pool is wired for images, uploads and upscales. The video path does not use it (see Worker pool above), which is a deliberate exception rather than an oversight | `TestExecuteFailover`, `TestFreeTierIsSpentFirst` |
 | 6 | `/stats` reported 1600 credits of test fixtures as live analytics | Statistics aggregate real rows only; credits are `NULL` until observed | `TestEmptyDatabaseReportsZeros`, `TestCreditsAreNotInvented` |
 | 7 | `direct_client.py` was never wired in, so the "reduced browser dependency" claim was false | The browser is out of the generation path entirely | verified live: token minted without a browser |
+| 8 | `as29s` was passed the asset's **content id**; it takes the **media id**. The wrong id is answered with a `null` payload and no error, so every finished render looked like one that never finished | `ResolveVideoURL` passes `row[3][4]`; `MediaDetail`'s parameters are named for where they go | verified live: a render that had "never resolved" downloaded immediately |
+| 9 | `"no video URL … yet (still rendering?)"` was not wrapped as retryable, so the poll treated a still-rendering video as permanently failed and gave up after 10s | `ErrAssetNotReady` + `RetryableResolveError`, which covers both stages of a render | `TestRetryableResolveErrorCoversBothStagesOfARender` |
+| 10 | Every signed-in account was labelled with the first one's email, because the address came from the authuser-blind session endpoint | The address comes from the account-scoped `o30O0e` profile RPC | `TestFindProfileReadsIdentityFromItsTrueShape` |
+| 11 | The selected account index lived in memory only, so every restart reverted to index 0 — which is how a 1-credit account came to look like the only one | The index is written to the `settings` table and restored at construction | `TestSetSettingRoundTripsAndReplaces` |
+| 12 | Nothing checked whether an account could afford a render. The server accepts an uncovered submission and answers with no media, so an empty wallet presented as a broken request | A pre-flight gate refuses with **402** and the arithmetic, downgrades to 360p when that fits, and moves to another signed-in account when one can pay | `TestDecideVideoPlanRefusesWhenNothingFits`, `TestBestAffordableAccountPicksTheRichestThatCanPay` |
+| 13 | `Bootstrap` registered a worker on every account switch and removed none, so the pool accumulated accounts the engine could no longer route to and summed their balances as available | `pool.Retain(accountID)` before registering | `TestRetainDropsThePreviousAccount` |
 
 Defect 7 in the report was stated as "two of five phases produced dead code". Here
 the equivalent claim is load-bearing and verified: the browser participates only
@@ -185,22 +269,28 @@ caller is authorized". A wrong token therefore returned `ok == true` and was
 admitted. The test caught it. The function now returns
 `(authenticated, authorized)` and every wrong-token case is covered.
 
-## Open item
+## Verification status
 
-The cookie → Labs-session step works and is verified live. The Labs-session →
-`aisandbox` step does not, because Labs marks the session
-`ACCESS_TOKEN_REFRESH_NEEDED` and issues a Labs-scoped token that `aisandbox`
-rejects with `401`.
+**Video generation works end to end and is verified.** A 4s 720p render submitted
+through `POST /v1/videos/generations` reaches `status: "ready"` in ~42s, resolves
+its signed URL, and downloads a playable MP4 to `output/`. 7 credits, and
+`credits_spent: 7` is recorded from the balance delta.
 
-Recovery options, in order of effort:
+That matters for the "open item" this section used to carry, which said the
+generation endpoints should be treated as unverified. The blocker it described —
+Labs marking the session `ACCESS_TOKEN_REFRESH_NEEDED` and issuing a Labs-scoped
+token that `aisandbox` rejects with `401` — is real, but it is a blocker for the
+**legacy aisandbox REST path only**. The working path does not use it: batchexecute
+is authenticated by `SAPISIDHASH` over the Google cookies, never asks for a Labs
+bearer token, and so never touches that exchange.
 
-1. **Browser session refresh** — `POST /v1/bridge/refresh`. No code change; the
-   site renews its own session. Needs the extension reloaded so the improved
-   tab-wait logic is active.
-2. **NextAuth token exchange** — derive a fresh
-   `__Secure-next-auth.session-token` from the Google cookies, as
-   `flow2api`'s `session_login.py` does. This is the substantive remaining work
-   and would remove the browser from the auth path entirely.
+What is still open, in order of effort:
 
-Until one is done and a real generation has been observed to complete, the
-generation endpoints should be treated as unverified.
+1. **`SPrCad` (image upscale) cannot run over the Go transport.** It is rejected
+   `PUBLIC_ERROR_UNUSUAL_ACTIVITY` regardless of TLS profile, so it runs in the
+   page. This is a genuine, unexplained difference and the only operation that
+   still needs the browser for more than credentials.
+2. **The image path has no affordability gate** (see Worker pool above).
+3. **`row.SKU` is still authuser-blind**, read from the same session endpoint that
+   made every account's email look alike. It is why the account-selection policy
+   deliberately ignores free-tier preference — it is not trustworthy per account.

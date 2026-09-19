@@ -245,11 +245,16 @@ const (
 
 	// RPCIDMediaDetail returns the signed URLs for one asset.
 	//
-	// Payload is the asset's content id. The source-path matters: it must be
-	// "/project/<project-id>/edit/<media-id>", not the plain project path, or the
-	// call is rejected. The response carries both the poster
-	// (flow-content.google/image/<content-id>) and, for a video, the asset itself
-	// (flow-content.google/video/<content-id>), each with its own signature.
+	// Payload is the asset's **media id** — field 4 of its project-listing row.
+	// This comment used to say "content id", and that is what the caller passed;
+	// the call is accepted either way, so the mistake was invisible: it answered
+	// `null` and the code read that as "the render is not ready", for as long as
+	// anyone cared to wait.
+	//
+	// The source-path must be "/project/<project-id>/edit/<media-id>", not the
+	// plain project path, or the call is rejected. The response carries both the
+	// poster (flow-content.google/image/<media-id>) and, for a video, the asset
+	// itself (flow-content.google/video/<media-id>), each with its own signature.
 	//
 	// This is how a finished video is fetched. The generation call returns only an
 	// id because video is asynchronous; the URL appears here once it is ready.
@@ -1282,6 +1287,130 @@ func (c *Client) Credits(ctx context.Context, opts CallOptions) (int, error) {
 	return 0, fmt.Errorf("batchexecute: the credits response carried no numeric balance")
 }
 
+// Profile is the identity of the account a client is acting as.
+type Profile struct {
+	// Name is the display name the account publishes.
+	Name string
+	// PhotoURL is the account's avatar.
+	PhotoURL string
+	// Email is the account's address, and the only per-account identifier the
+	// backend will admit to. Read it from here rather than from the labs session
+	// endpoint: that endpoint answers for the default account whatever
+	// `authuser` says, so taking the address from it stamps every signed-in
+	// account with the first one's address.
+	Email string
+}
+
+// profileArg is the captured argument for RPCIDProfile — ask for "me", and name
+// the three fields wanted back.
+var profileArg = []any{
+	[]any{"me"},
+	[]any{
+		[]any{[]any{"person.photo", "person.name", "person.email"}},
+		nil,
+		[]any{1, 7},
+	},
+}
+
+// Profile reads the identity of the account this client is acting as.
+//
+// Takes no argument and needs no project context, but it is account-scoped: the
+// answer follows `authuser`, which is what makes it the one place a per-account
+// address can be had.
+func (c *Client) Profile(ctx context.Context, opts CallOptions) (Profile, error) {
+	frames, err := c.CallWith(ctx, RPCIDProfile, profileArg, opts)
+	if err != nil {
+		return Profile{}, err
+	}
+	for _, frame := range frames {
+		var payload any
+		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+			continue
+		}
+		if p, ok := findProfile(payload); ok {
+			return Profile{Name: p.name, PhotoURL: p.photo, Email: p.email}, nil
+		}
+	}
+	return Profile{}, fmt.Errorf("batchexecute: the profile response carried no identity")
+}
+
+// profile is the subset of the response this engine needs.
+type profile struct {
+	name  string
+	photo string
+	email string
+}
+
+// complete reports whether enough was found to identify an account. The name is
+// required alongside the address because an address alone would accept a
+// half-read response, and the avatar is optional — plenty of accounts have none.
+func (p profile) complete() bool { return p.email != "" && p.name != "" }
+
+// findProfile walks the profile response and collects the identity fields.
+//
+// The response is a deep, sparsely populated tree, and the three wanted values
+// sit at unrelated positions inside it — name, avatar and address were observed
+// at indices 2, 3 and 9 of one run. Each arrives as a one-element array wrapping
+// a [<flags...>, "<value>", ...] pair, and nothing keys them: the flags in front
+// are opaque and their width differs per field. So the values are picked out by
+// what they hold rather than by where they sit — the address contains an @, the
+// avatar is a googleusercontent URL, and the display name is whatever is left.
+// That survives a column being added, which fixed offsets would not.
+func findProfile(v any) (profile, bool) {
+	var p profile
+	collectProfile(v, &p)
+	if !p.complete() {
+		return profile{}, false
+	}
+	return p, true
+}
+
+func collectProfile(v any, p *profile) {
+	arr, ok := v.([]any)
+	if !ok {
+		return
+	}
+	for _, entry := range arr {
+		if s, ok := profileField(entry); ok {
+			switch {
+			case strings.Contains(s, "@"):
+				if p.email == "" {
+					p.email = s
+				}
+			case strings.Contains(s, "googleusercontent.com"):
+				if p.photo == "" {
+					p.photo = s
+				}
+			default:
+				if p.name == "" {
+					p.name = s
+				}
+			}
+			continue
+		}
+		collectProfile(entry, p)
+	}
+}
+
+// profileField returns the value of a single profile field: a one-element array
+// wrapping a [<flags...>, "<value>", ...] pair. Anything else — a bare string, a
+// flags-only array, a pair with no value — is not a field.
+func profileField(entry any) (string, bool) {
+	wrapper, ok := entry.([]any)
+	if !ok || len(wrapper) != 1 {
+		return "", false
+	}
+	pair, ok := wrapper[0].([]any)
+	if !ok || len(pair) < 2 {
+		return "", false
+	}
+	value, ok := pair[1].(string)
+	if !ok || value == "" {
+		return "", false
+	}
+	return value, true
+}
+
 // UploadMediaRequest is one image to upload into a project.
 type UploadMediaRequest struct {
 	ProjectID string
@@ -1970,17 +2099,22 @@ func parseMedia(payload json.RawMessage, wantKind string) []GeneratedMedia {
 // appears here once the render is ready. The response carries the poster and, for
 // a video, the asset itself.
 //
-// mediaID is the id the generation returned; contentID is the asset's storage id,
-// which the project listing carries at field 4 of each entry.
-func (c *Client) MediaDetail(ctx context.Context, projectID, mediaID, contentID string) ([]GeneratedMedia, error) {
-	if projectID == "" || mediaID == "" || contentID == "" {
-		return nil, fmt.Errorf("batchexecute: project, media and content ids are all required")
+// It takes two ids because it needs two, and they are not interchangeable:
+// sourceMediaID builds the source-path, and payloadID is the argument. Both come
+// from the same listing row but are different fields of it, and they are named
+// here for where they go rather than for what the listing calls them — the
+// earlier naming ("contentID" for the payload) is what had this asking for an id
+// the RPC does not answer for, and a `null` payload with no error looks exactly
+// like a render that has not finished.
+func (c *Client) MediaDetail(ctx context.Context, projectID, sourceMediaID, payloadID string) ([]GeneratedMedia, error) {
+	if projectID == "" || sourceMediaID == "" || payloadID == "" {
+		return nil, fmt.Errorf("batchexecute: project, source and payload ids are all required")
 	}
 
-	frames, err := c.CallWith(ctx, RPCIDMediaDetail, []any{contentID}, CallOptions{
+	frames, err := c.CallWith(ctx, RPCIDMediaDetail, []any{payloadID}, CallOptions{
 		// The /edit/<media-id> suffix is required; the plain project path is
 		// rejected.
-		SourcePath: "/project/" + projectID + "/edit/" + mediaID,
+		SourcePath: "/project/" + projectID + "/edit/" + sourceMediaID,
 	})
 	if err != nil {
 		return nil, err
@@ -2178,13 +2312,37 @@ func stringAt(row []any, i int) string {
 	return s
 }
 
-// ErrAssetNotListed marks the one resolve failure that is worth waiting on.
+// ErrAssetNotListed marks the first of the two resolve failures that are worth
+// waiting on: the render has not appeared in the project listing yet.
 //
-// A render in flight is not in the listing yet, and that is expected. Everything
-// else — a media-detail call that answers nothing, a listing that moved, an id
-// that never landed — is permanent, and a caller that cannot tell them apart
-// polls a ten-second failure for its whole timeout.
+// A render in flight produces it, and that is expected. Everything else — a
+// media-detail call that answers nothing, a listing that moved, an id that never
+// landed — is permanent, and a caller that cannot tell them apart polls a
+// ten-second failure for its whole timeout. Use RetryableResolveError rather
+// than testing this directly, so the other half of the wait is not forgotten.
 var ErrAssetNotListed = errors.New("asset is not in the project listing yet")
+
+// ErrAssetNotReady marks the second half of the same wait: the asset is in the
+// listing, but the media-detail call has no downloadable URL for it yet.
+//
+// Both are what a render in flight looks like — the asset appears before its
+// file exists — and both are worth retrying. Only the first used to be marked as
+// such, so a render that had been accepted, charged for and listed was abandoned
+// the moment its URL lagged, with a log line asking "still rendering?" while
+// treating the answer as permanent.
+var ErrAssetNotReady = errors.New("asset is listed but has no download URL yet")
+
+// RetryableResolveError reports whether a resolve failure is one that a render
+// in flight produces, and is therefore worth waiting on.
+//
+// There are exactly two, and they arrive in sequence: the asset is missing from
+// the listing entirely, then it appears while its URL is still being produced.
+// Every other failure — a media-detail call that answers nothing, a listing that
+// moved, an id that never landed — is permanent, and polling one of those for the
+// full timeout turns a ten-second failure into a seven-minute one.
+func RetryableResolveError(err error) bool {
+	return errors.Is(err, ErrAssetNotListed) || errors.Is(err, ErrAssetNotReady)
+}
 
 // ProjectAssets reads the project listing.
 func (c *Client) ProjectAssets(ctx context.Context, projectID string) ([]ProjectAsset, error) {
@@ -2205,27 +2363,36 @@ func (c *Client) ProjectAssets(ctx context.Context, projectID string) ([]Project
 // ResolveVideoURL returns the signed download URL for a submitted video.
 //
 // Video is asynchronous, so this is a two-step lookup: find the asset in the
-// project listing to learn its content id, then ask the media-detail RPC for the
-// signed URL. It returns an error when the render is not ready yet, which the
-// caller is expected to retry.
+// project listing, then ask the media-detail RPC for the signed URL. It returns
+// an error when the render is not ready yet, which the caller is expected to
+// retry.
 func (c *Client) ResolveVideoURL(ctx context.Context, projectID, mediaID string) (string, error) {
 	assets, err := c.ProjectAssets(ctx, projectID)
 	if err != nil {
 		return "", err
 	}
 
-	contentID := ""
-	for _, asset := range assets {
-		if asset.matchesID(mediaID) {
-			contentID = asset.ContentID
+	var found *ProjectAsset
+	for i := range assets {
+		if assets[i].matchesID(mediaID) {
+			found = &assets[i]
 			break
 		}
 	}
-	if contentID == "" {
+	if found == nil {
 		return "", fmt.Errorf("batchexecute: %s: %w", mediaID, ErrAssetNotListed)
 	}
 
-	media, err := c.MediaDetail(ctx, projectID, mediaID, contentID)
+	// The media-detail RPC is addressed by the listing's own media id, which is
+	// field 4 of the row — not the content id at field 5, and not the id the
+	// submission returned.
+	//
+	// All three are uuids and all three address "the asset", so the wrong one is
+	// not rejected: the call answers 200 with a `null` payload and no error. That
+	// is what made every finished render look like a render that had never
+	// finished — the URL was there the whole time, under an id this was not
+	// asking for.
+	media, err := c.MediaDetail(ctx, projectID, mediaID, found.MediaID)
 	if err != nil {
 		return "", err
 	}
@@ -2234,7 +2401,8 @@ func (c *Client) ResolveVideoURL(ctx context.Context, projectID, mediaID string)
 			return item.URL, nil
 		}
 	}
-	return "", fmt.Errorf("batchexecute: no video URL for %s yet (still rendering?)", mediaID)
+	return "", fmt.Errorf("batchexecute: no video URL for %s yet (still rendering?): %w",
+		mediaID, ErrAssetNotReady)
 }
 
 // ParseFrames walks a batchexecute response.

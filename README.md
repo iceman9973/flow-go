@@ -7,20 +7,19 @@ tokens, project resolution, generation, polling, upscaling, downloads, storage �
 happens in this process. No generation request travels through a browser.
 
 ```
-Chrome ──(cookies + tab URL only)──▶ browser-Cdp extension
-                                            │  WebSocket
-                                            ▼
-                                     flow-go bridge
-                                            │
-                       cookies ──▶ auth ──▶ access token
-                                            │
-                                            ▼
-                              aisandbox-pa.googleapis.com
-                                            │
-                            submit ──▶ poll ──▶ upsample ──▶ download
-                                            │
-                                            ▼
-                                    SQLite (WAL) + output/
+Chrome ──(cookies + page tokens + captcha)──▶ Flow Go Bridge extension
+   (or browser-Cdp, the generic one)                 │  WebSocket, extension dials out
+                                                     ▼
+                                       flow-go serve ── hosts the bridge on :9222
+                                                     │
+                          cookies ──▶ SAPISIDHASH    │  (no API key, no bearer token)
+                                                     ▼
+                    flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute
+                                                     │
+                          gate ──▶ submit ──▶ poll ──▶ resolve ──▶ download
+                                                     │
+                                                     ▼
+                                             SQLite (WAL) + output/
 ```
 
 ## Why
@@ -31,8 +30,8 @@ through a Chrome extension, and the extension had to observe a live
 token. That made the browser a hard dependency on the critical path, and when the
 token went stale the pipeline deadlocked.
 
-This port keeps the browser only where it is genuinely required — reading cookies
-— and does the rest in Go.
+This port keeps the browser only where it is genuinely required — cookies, page
+tokens, a reCAPTCHA token, and one in-page upscale call — and does the rest in Go.
 
 ## Quick start
 
@@ -40,15 +39,16 @@ This port keeps the browser only where it is genuinely required — reading cook
 # 1. Build
 go build -o flow-go .
 
-# 2. Load browser-Cdp/ as an unpacked extension
-#    chrome://extensions -> Developer mode -> Load unpacked -> select browser-Cdp/
+# 2. Load flow-go-extension/ as an unpacked extension
+#    chrome://extensions -> Developer mode -> Load unpacked -> select flow-go-extension/
+#    (Optionally also load ../browser-Cdp/extension/ — see "The two extensions".)
 
 # 3. Run
 ./flow-go serve
 ```
 
 The extension dials in on `ws://127.0.0.1:9222`. The server pushes its allowlists
-to the extension on connect, syncs cookies, mints an access token, and comes
+to the extension on connect, syncs cookies, reads the page tokens, and comes
 ready. The HTTP API listens on `http://127.0.0.1:8200`.
 
 ```bash
@@ -133,8 +133,9 @@ popup has no editor by design, so clear `browserCdp.config` from
 | GET | `/v1/jobs/:id` | One job |
 | GET | `/v1/media` | Recent generated media |
 | GET | `/v1/accounts` | Tracked accounts |
-| GET | `/v1/accounts/credits` | Balance of every signed-in account (`?max=N`, default 4) |
-| POST | `/v1/accounts/switch` | Act as another signed-in account (`{"index": N}`) |
+| GET | `/v1/accounts/credits` | Email, name and balance of every signed-in account (`?max=N`, default 4) |
+| GET | `/v1/accounts/affordable` | Which signed-in account would pay for a job (`?cost=N`) — read-only |
+| POST | `/v1/accounts/switch` | Act as another signed-in account (`{"index": N}`), and remember it |
 | POST | `/api/sync-cookies` | Push a cookie dump directly (extension fallback) |
 | GET | `/output/*` | Generated files |
 
@@ -152,13 +153,48 @@ the server answers with an empty frame rather than an error.
 
 ```
 GET  /v1/accounts/credits?max=3
-  u/0: credits=4    ay375475@gmail.com
-  u/1: credits=50   ay375475@gmail.com
-  u/2: credits=50   ay375475@gmail.com
+  u/0: 1 credit    <first>@gmail.com    Akash Yadav
+  u/1: 11 credits  <second>@gmail.com   Akash Yadav
+  u/2: 25 credits  <third>@gmail.com    Bumika
 
-POST /v1/accounts/switch  {"index": 1}
-  index=1  account=acct-…-u1  project=aabe2926-237f-4a4a-b0fc-c4be690d7670
+POST /v1/accounts/switch  {"index": 2}
+  index=2  account=acct-…-u2  project=a9153ea6-…
 ```
+
+(Addresses are placeholders. The point is that the three are **different** — they used
+to be one address repeated three times, which reads as "these accounts share an email"
+rather than as a bug.)
+
+**The address comes from the profile RPC, not from the session.** The labs session
+endpoint answers for the *default* account whatever `authuser` says, so reading the
+address from it stamps every signed-in account with the first one's. That is what
+this listing used to do — the three rows above were one address repeated three
+times, which reads as "these accounts share an email" rather than as a bug. The
+`o30O0e` profile RPC is account-scoped and is the only source that follows
+`authuser`; `session.Sku` is still read from the blind endpoint and is **not**
+trustworthy per account.
+
+**The choice is remembered.** `/v1/accounts/switch` writes the index to the
+`settings` table, so a restart comes back on the account that was chosen rather
+than on index 0. `ACCOUNT_INDEX` only seeds a database that has never recorded one.
+
+**A job that the current account cannot pay for moves the engine.** Before a video
+is submitted its cost is known — `VideoCosts[duration][quality] × count` — and the
+balance is read. If it does not cover the render, the other signed-in accounts are
+scanned and the engine moves to the one with the most credits that can, then
+re-plans. `GET /v1/accounts/affordable?cost=N` reports that decision without
+performing it:
+
+```
+GET /v1/accounts/affordable?cost=15
+  current_index: 0   chosen_index: 2   chosen_balance: 25   would_switch: true
+```
+
+If nothing can pay, the submission is refused with **402** and the arithmetic in the
+message, and nothing is sent — the server would otherwise accept it and answer with
+no media, which reads as a broken request rather than an empty wallet. When 720p
+does not fit but 360p does, the render is downgraded rather than refused, and the
+response says so (`quality`, `credits_cost`, `quality_downgraded`).
 
 Switching re-bootstraps, because the session, the account row and the project all
 have to move together. Projects are per-account, so the engine opens
@@ -184,7 +220,7 @@ row[2] = media id     ← what the UI and the editor URL use
 | `SPrCad` (image upscale) | content id |
 | `p0UkFb` (video upscale) | **both** — content at `request[0]`, media at `request[4]` |
 | `nprQif` / `eb1hJf` (image-to-video) | content id, in `startImage`/`endImage` |
-| `as29s` (media detail) | content id |
+| `as29s` (media detail) | **media id** — see below |
 | `/project/<id>/edit/<X>` | media id |
 | `maseQ` (upload) | returns **both** |
 
@@ -193,6 +229,25 @@ this was found: an image-to-video submission carrying a freshly uploaded file's
 **media id** returned `empty` in 4 seconds, while the same call with a content id
 rendered normally. `POST /v1/media/upload` therefore returns both, and the video
 endpoint resolves either into the content id before submitting.
+
+#### `as29s` takes the media id, and getting it wrong is silent
+
+This table said "content id" for `as29s`, and the code did what the table said. The
+call is not rejected — it answers **`200` with a `null` payload and no error**, which
+reads exactly like a render that has not finished yet. So every completed video
+looked like a video that never completed, and the poll waited out its full timeout
+before giving up.
+
+Measured against one project, both a current and an older asset:
+
+| id passed | which field of the listing row | `as29s` |
+|---|---|---|
+| `a31690a2…` | `row[3][4]` — the **media id** | full payload, both signed URLs |
+| `4356865a…` | `row[3][5]` — the content id | `null` |
+| `3db0bad8…` | `row[0]` — the id the submission returned | `null` |
+
+So it is neither the content id **nor** the id the generation handed back; it is the
+listing's own media id. `ResolveVideoURL` now passes that.
 
 ### Uploading a local file
 
@@ -367,22 +422,45 @@ flow-go cookies                        # cookie and credential status
 `flow-go cookies` never prints a cookie value — only counts, names on request,
 and whether credentials are present.
 
-## browser-Cdp
+## The two extensions
 
-`browser-Cdp/` is a generic, project-agnostic Chrome DevTools Protocol bridge. It
-is a de-branded, slimmed-down descendant of the Weavy extension bridge: all
-site-specific logic was removed, leaving attach, arbitrary CDP commands, CDP
-events, and scoped cookie access.
+They are **separate projects** and neither is a subset of the other. Loading both is
+fine and is the normal debugging setup.
+
+| | `flow-go-extension/` | `../browser-Cdp/extension/` |
+| --- | --- | --- |
+| Chrome name | **Flow Go Bridge** | **browser-Cdp** |
+| Belongs to | this repo | the `browser-Cdp` project |
+| Surface | a fixed list of Flow operations (`flow.at`, `flow.captcha`, `flow.upscale`, …) | arbitrary CDP: `cdp.call`, `cdp.evaluate` |
+| `debugger` permission | **no** | yes |
+| Host access | Google hosts only | `<all_urls>` |
+| Empty scope means | refuse (fail-closed) | allow (fail-open) |
+
+**flow-go uses the narrow one.** It needs cookies, a page token, a reCAPTCHA token
+and one in-page upscale call — all of which are named operations. Arbitrary CDP is a
+debugging convenience, not a requirement, and the narrow extension is the one that
+cannot be talked into driving an unrelated site.
+
+Load it as unpacked from `flow-go/flow-go-extension/`. The generic one is worth
+loading too when you need `cdp.evaluate` to see what a page actually looks like; it
+connects to the same backend.
+
+Both dial `ws://127.0.0.1:9222`, so **exactly one backend can own that port**. The
+backend tells them apart from the `ops` list each reports on `ping`, and prefers the
+narrow one as `current` when both are attached. The generic one is still reachable
+by address — `/v1/debug/cookies {"all": true}` lists every attached client.
+
+The bridge itself is **not part of this module**. `cdp-control/{bridge,cdp,cookiejar}`
+live in the `browser-Cdp` project and are pulled in by a relative `replace` in
+`go.mod`, which means flow-go cannot be built without that checkout beside it.
+`flow-go serve` hosts the socket on that port — the standalone `cdp-control` binary
+hosts the same library and is not needed alongside it. See `browser-Cdp/README.md`
+for the protocol.
 
 Its popup is deliberately two things — a status line and a **Copy AI prompt**
 button. That button copies a self-contained brief (endpoint, full protocol, live
 allowlists, worked examples, operating rules) that can be pasted into any AI
 assistant so it can connect and drive the bridge.
-
-The Go counterpart lives in `internal/cdp`, which hosts the socket the extension
-dials into.
-
-See `browser-Cdp/README.md` for the protocol.
 
 ## Configuration
 
@@ -395,6 +473,8 @@ The settings that matter most:
 | `--proxy` | CLI flag. Route upstream traffic through one exit IP. Flow scores on IP consistency, so a stable proxy measurably improves success. |
 | `--captcha` | CLI flag, **not** an environment variable: `auto` (default), `broker`, `http`, or `off`. Setting `FLOW_RECAPTCHA` does nothing. |
 | `WS_PORT` / `HTTP_PORT` | Environment variables. Extension bridge and API ports. |
+| `ACCOUNT_INDEX` | Environment variable. Seeds which signed-in account to act as. Only a seed — once `/v1/accounts/switch` has been used, the stored index wins, so a deliberate choice survives a restart. |
+| `ACCOUNT_SCAN_LIMIT` | Environment variable, default 6. How many account indices are examined when looking for one that can pay. Chrome permits ten, but the scan costs a session, a profile and a balance read per index and runs on the request path. |
 | `FLOW_ACCESS_TOKEN` | Environment variable. Supply a bearer token directly, bypassing cookie minting. |
 | `FLOW_SESSION_REBUILD` | Environment variable. `off` disables the pure-Go session rebuild, leaving the raw upstream error visible. |
 
@@ -491,11 +571,14 @@ credits. The media id and prompt were then read back out of the project.
 
 Video is **asynchronous**, so the URL only exists once the render finishes. A
 third RPC resolves it: **`as29s`**, whose `source-path` must carry an
-`/edit/<media-id>` suffix, and whose payload is the asset's *content id* — a
-different uuid from the media id the generation returned. Its response carries
-both the poster (`/image/<content-id>`) and the asset (`/video/<content-id>`),
-each separately signed, so filtering by kind matters: taking the first URL would
-download the poster as if it were the video.
+`/edit/<media-id>` suffix, and whose payload is the asset's *media id* — the
+listing's `row[3][4]`, which is a different uuid from the content id **and** from
+the id the generation returned. Passing either of the others is answered with a
+`null` payload and no error, so the wrong id is indistinguishable from a render
+that is still going. Its response carries both the poster
+(`/image/<media-id>`) and the asset (`/video/<media-id>`), each separately signed,
+so filtering by kind matters: taking the first URL would download the poster as if
+it were the video.
 
 Verified end to end:
 
@@ -514,6 +597,41 @@ elapsed: 40.7s  (submit + wait for the render + download)
 
 $ file output/acct-1370d7c6-6e2.mp4
 ISO Media, MP4 Base Media v1 [ISO 14496-12:2003]
+```
+
+#### It broke, and why it was hard to see
+
+That block was true, then stopped being true, and nothing said so. Two defects,
+either of which alone would have hidden the other:
+
+1. **The wrong id was being sent.** `ResolveVideoURL` passed the asset's *content
+   id* to `as29s`, which takes the *media id*. The call is not rejected — it
+   answers `200` with a `null` payload — so the code read it as "not ready yet" and
+   kept waiting.
+2. **The "not ready" error was not marked retryable.** `"no video URL … yet (still
+   rendering?)"` was not wrapped, so the poll treated a still-rendering video as a
+   permanent failure and abandoned it after **10 seconds**.
+
+Defect 1 made the poll wait forever for a URL it was never going to be given.
+Defect 2 made it give up instantly. Fixing only one still fails: with just defect 2
+fixed the poll waits the full 420s and then reports "still unresolved"; with only
+defect 1 fixed it abandons a render that was one second from ready.
+
+The render had been completing the whole time. Recovered after the fix:
+
+```
+$ file output/paper-boat-4s-720p.mp4
+ISO Media, MP4 Base Media v1 [ISO 14496-12:2003]      1934912 bytes
+```
+
+And the first clean run after it:
+
+```
+status:  ready          (was: submitted, after 438s of failing)
+media:   74c50a39-fe1f-4ff5-9536-4682c8efd61e
+file:    output/acct-74c50a39-fe1.mp4   1640064 bytes
+credits: 11  (18 → 11, so a 4s 720p video costs 7)
+elapsed: 41.6s
 ```
 
 ### Upscaling — solved
@@ -661,9 +779,11 @@ refused for want of entitlement.
 #### Both upscales need the source's *content* id, and rows are not interchangeable
 
 A caller holds a media id — it is what a generation returns and what the editor
-URL carries — while `SPrCad` and the media-detail RPC take a **content id**. They
-are different values, so both endpoints resolve the content id from the project
-listing when only a media id is given.
+URL carries — while `SPrCad` takes a **content id**. They are different values, so
+the upscale endpoints resolve the content id from the project listing when only a
+media id is given. (The media-detail RPC `as29s` is the exception and goes the
+other way: it takes the listing's media id. See "`as29s` takes the media id"
+above.)
 
 That resolution has a trap. One media id can have **several rows**: the original
 and each derived asset share it. They are not interchangeable, and picking the
@@ -1022,13 +1142,34 @@ Every step below was a wrong assumption that a live probe corrected.
     what the Flow account menu shows. The old endpoint's token belonged to a
     *different* signed-in Google account than the one the app session uses, so it
     was never going to agree.
+12. **`as29s` takes the media id, not the content id.** The doc said content id and
+    the code did what the doc said. It is not rejected — `200` with a `null`
+    payload — so a finished render is indistinguishable from one that never
+    finished. This is the one that cost the most: it hid a *working* pipeline
+    behind a seven-minute wait, twice, for 14 credits.
+13. **"No video URL yet" was not marked retryable.** The poll only waited on
+    `ErrAssetNotListed`; the other half of the same wait — listed, URL not ready —
+    was treated as permanent, so a render was abandoned after 10 seconds. Fixing
+    either one alone still fails.
+14. **The session endpoint is `authuser`-blind.** It answers for the *default*
+    account whatever index you pass, so reading an address from it labels every
+    signed-in account with the first one's. Three distinct accounts were reported
+    under one email, which reads as "they share an email" rather than as a bug.
+15. **A deliberate account choice did not survive a restart.** The index lived in
+    memory, so every restart reverted to index 0 — which is how a 1-credit account
+    came to look like the only one available.
+16. **Nothing checked whether the account could afford the render.** The server
+    accepts an uncovered submission and answers with no media, so an empty wallet
+    presents as a broken request. It now refuses with `402` and the arithmetic, and
+    moves to another signed-in account when one can pay.
 
-Nine of those ten would have been invisible to a passing test suite. Each has a
+Ten of those sixteen would have been invisible to a passing test suite. Each has a
 regression test where the fix is behavioural.
 
 ### What the browser is still needed for
 
-Cookies, and a signed-in Flow editor tab for the reCAPTCHA broker. See
+Cookies, a signed-in Flow editor tab for the reCAPTCHA broker, and the one
+in-page call `SPrCad` needs. Generation itself never travels through it. See
 `docs/WHAT-WE-NEED-FROM-THE-BROWSER.md`.
 
 ## Layout
@@ -1036,25 +1177,27 @@ Cookies, and a signed-in Flow editor tab for the reCAPTCHA broker. See
 ```
 flow-go/
 ├── main.go                     entry point
-├── browser-Cdp/                generic CDP extension (reusable, no Flow logic)
+├── flow-go-extension/          the narrow Flow bridge (this repo's extension)
 ├── internal/
 │   ├── app/                    assembly and lifecycle
 │   ├── auth/                   Labs session → access token
-│   ├── bridge/                 extension WebSocket host
-│   ├── cdp/                    generic CDP protocol client
+│   ├── batchexecute/           the RPC transport the app actually uses
 │   ├── cli/                    command line
 │   ├── config/                 endpoints, models, credits, ports
-│   ├── cookiejar/              cookie model, scoping, hashing
 │   ├── engine/                 orchestration
-│   ├── flowapi/                Flow API client and generators
+│   ├── flowapi/                legacy aisandbox REST client
 │   ├── httpx/                  Chrome-impersonating transport
-│   ├── pool/                   worker pool
+│   ├── pool/                   worker pool (images, uploads, upscales)
 │   ├── recaptcha/              reCAPTCHA Enterprise strategies
 │   ├── server/                 HTTP API
 │   └── store/                  SQLite persistence
 ├── docs/ARCHITECTURE.md
 └── .env.example
 ```
+
+Not in this module: `cdp-control/{bridge,cdp,cookiejar}` and the generic
+`browser-Cdp/extension/`. Both belong to the sibling `browser-Cdp` project and are
+consumed through a relative `replace` in `go.mod`.
 
 ## Responsible use
 

@@ -52,9 +52,22 @@ disappears and the browser drops to "cookies only", which was the original goal.
 ## Checklist to run it
 
 1. Chrome, signed in to the Google account that has Flow access.
-2. `../browser-Cdp/extension/` loaded as an unpacked extension, and paired.
+2. **The Flow Go Bridge extension loaded** — `flow-go/flow-go-extension/`. That is the
+   narrow one and the one this backend is built against: Flow hosts only, no
+   `debugger` permission, and a fixed list of operations. The generic
+   `../browser-Cdp/extension/` also works and is what you load when you need
+   `cdp.evaluate` for debugging, but it is a separate project and flow-go does not
+   require it. Both dial `ws://127.0.0.1:9222`.
 3. A Flow project tab open — the engine will open one if it is not.
 4. `flow-go serve`.
 
 That is it. The extension reads cookies, opens/attaches to the editor tab, and
 does nothing else.
+
+> **Status update (2026-09-19).** Requirement 3 is now narrower than this document
+> originally claimed. Video generation completes end to end without the
+> session-context blob — a 4s 720p render reaches `status: ready`, resolves its
+> signed URL and downloads. The blob at `[1][0][7][10][0]` belongs to the
+> **image** RPC (`RPCIDGenerate`), not to the video RPCs, so if it is still
+> required it is required there. The live tab remains needed for the reCAPTCHA
+> broker regardless.

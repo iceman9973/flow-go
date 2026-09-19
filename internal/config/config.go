@@ -383,6 +383,22 @@ var (
 	HTTPPort = envInt("HTTP_PORT", 8200)
 )
 
+// AccountIndex seeds which signed-in Google account the engine acts as, as an
+// `authuser` index. It is only a seed: once /v1/accounts/switch has been used,
+// the index it recorded is what the engine starts on, so a deliberate choice is
+// not undone by the next restart.
+var AccountIndex = envInt("ACCOUNT_INDEX", 0)
+
+// AccountScanLimit bounds how many signed-in account indices are examined when
+// looking for one that can pay for a job.
+//
+// Chrome permits ten, but the scan costs a session, a profile and a balance read
+// per index and it runs on the request path — so the default covers the common
+// case and the knob covers the rest. Scanning past the real number of signed-in
+// accounts is harmless rather than wrong: an index beyond the last falls back to
+// the default account, and those repeats are recognised and dropped.
+var AccountScanLimit = envInt("ACCOUNT_SCAN_LIMIT", 6)
+
 var (
 	// PollInterval is seconds between generation status polls.
 	PollInterval = envInt("POLL_INTERVAL", 10)

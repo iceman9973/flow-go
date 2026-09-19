@@ -15,11 +15,11 @@ package engine
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +48,11 @@ type Options struct {
 	CaptchaMode string
 	// AccountID labels this account. Defaults to a hash of the cookie jar.
 	AccountID string
+	// AccountIndex is the signed-in Google account to act as, as an `authuser`
+	// index. It only seeds a database that has never recorded a choice; once
+	// /v1/accounts/switch has been used, the stored index wins. A negative value
+	// is clamped to zero.
+	AccountIndex int
 }
 
 // Engine is the running system.
@@ -194,12 +199,50 @@ func New(st *store.Store, br *bridge.Bridge, opts Options) (*Engine, error) {
 	}
 
 	return &Engine{
-		store:  st,
-		pool:   pool.New(),
-		bridge: br,
-		hc:     hc,
-		opts:   opts,
+		store:        st,
+		pool:         pool.New(),
+		bridge:       br,
+		hc:           hc,
+		opts:         opts,
+		accountIndex: storedAccountIndex(st, opts.AccountIndex),
 	}, nil
+}
+
+// storedAccountIndex resolves which signed-in account the engine should act as
+// when it starts.
+//
+// The stored value wins, because it is the record of a deliberate choice made
+// through /v1/accounts/switch and the whole point of storing it is that the
+// choice outlives the process. The configured value is only the seed for a
+// database that has never recorded one — that is, the first run.
+//
+// A read that fails is logged and treated as unset rather than taken as zero:
+// falling back silently is what made this setting necessary in the first place,
+// and a failed read is not evidence that the answer is the first account.
+func storedAccountIndex(st *store.Store, configured int) int {
+	if st != nil {
+		raw, found, err := st.Setting(store.SettingKeyAccountIndex)
+		switch {
+		case err != nil:
+			log.Printf("engine: could not read the stored account index (%v); "+
+				"falling back to the configured one", err)
+		case found:
+			index, convErr := strconv.Atoi(strings.TrimSpace(raw))
+			if convErr != nil {
+				log.Printf("engine: the stored account index %q is not a number (%v); "+
+					"falling back to the configured one", raw, convErr)
+			} else if index < 0 {
+				log.Printf("engine: the stored account index %d is negative; "+
+					"falling back to the configured one", index)
+			} else {
+				return index
+			}
+		}
+	}
+	if configured < 0 {
+		return 0
+	}
+	return configured
 }
 
 // Store exposes the database.
@@ -282,6 +325,17 @@ func (e *Engine) SetAccountIndex(ctx context.Context, index int) error {
 	e.mu.Lock()
 	e.accountIndex = index
 	e.mu.Unlock()
+
+	// Record the choice before re-bootstrapping, and treat a failed write as a
+	// failure of the switch rather than a detail: the caller asked for this
+	// account to be the one in use, and a switch that silently does not survive
+	// the next restart is the bug this exists to fix.
+	if e.store != nil {
+		if err := e.store.SetSetting(store.SettingKeyAccountIndex, strconv.Itoa(index)); err != nil {
+			return fmt.Errorf("engine: account %d selected but not recorded: %w", index, err)
+		}
+	}
+
 	log.Printf("engine: switching to signed-in account %d", index)
 	return e.Bootstrap(ctx)
 }
@@ -294,6 +348,10 @@ type AccountCredits struct {
 	// SignedIn reports whether a session could be minted for this index at all.
 	SignedIn bool   `json:"signed_in"`
 	Email    string `json:"email,omitempty"`
+	// Name is the account's display name. It is carried because several accounts
+	// in one browser routinely share a display name, so the address alone is not
+	// always enough to tell two rows apart.
+	Name string `json:"name,omitempty"`
 	// Credits is nil when the balance could not be read. It used to be a plain
 	// int, so a failed read and a genuine zero were both reported as 0 — and
 	// adding the rows up produced a confident, wrong total.
@@ -344,7 +402,6 @@ func (e *Engine) AccountsCredits(ctx context.Context, max int) ([]AccountCredits
 			continue
 		}
 		row.SignedIn = true
-		row.Email = session.Email
 		row.SKU = session.Sku
 
 		client := e.newBatchexecuteClient(jar, e.hc)
@@ -356,6 +413,23 @@ func (e *Engine) AccountsCredits(ctx context.Context, max int) ([]AccountCredits
 		// with 400. Clearing it makes the client prime for its own token instead,
 		// which is the handshake it already knows how to do.
 		client.SeedToken("")
+
+		// Take the address from the profile RPC, not from the session.
+		//
+		// The labs session endpoint answers for the default account whatever
+		// `authuser` says, so `session.Email` is the same string for every index —
+		// which is how three distinct accounts came to be reported under one
+		// address. The profile RPC is account-scoped and is the only source that
+		// follows `authuser`.
+		if prof, err := client.Profile(ctx, batchexecute.CallOptions{
+			SourcePath: "/", BuildLabel: config.BuildLabel(),
+		}); err == nil {
+			row.Email = prof.Email
+			row.Name = prof.Name
+		} else if row.Error == "" {
+			row.Error = "profile: " + err.Error()
+		}
+
 		credits, err := client.Credits(ctx, batchexecute.CallOptions{
 			SourcePath: "/", BuildLabel: config.BuildLabel(),
 		})
@@ -573,6 +647,10 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	})
 
 	worker := pool.NewWorker(accountID, client)
+	// Drop the previous account's worker first. Bootstrap runs again on every
+	// switch, and keeping the old one would leave the pool holding an account the
+	// engine can no longer route to — and reporting its balance as available.
+	e.pool.Retain(accountID)
 	e.pool.Register(worker)
 
 	// Record the account. Credits are left unknown until a real check runs —
@@ -1405,6 +1483,19 @@ type BatchVideoOutcome struct {
 	Credits   int         `json:"credits_remaining"`
 	ElapsedS  float64     `json:"elapsed_seconds"`
 	Status    string      `json:"status"`
+	// Quality is the quality the render was actually submitted at. It is
+	// reported rather than assumed from the request because the two can differ:
+	// a request the balance could not cover at 720p is submitted at 360p
+	// instead, and a caller reading only its own request would conclude the
+	// wrong thing about what came back.
+	Quality string `json:"quality,omitempty"`
+	// CreditsCost is what the submission was expected to cost, per the cost
+	// table. It is the number the affordability check used, so a caller can see
+	// the budget the engine worked to rather than inferring it.
+	CreditsCost int `json:"credits_cost,omitempty"`
+	// QualityDowngraded says the requested quality was reduced to fit the
+	// balance. It is explicit so a lower-resolution result is never a surprise.
+	QualityDowngraded bool `json:"quality_downgraded,omitempty"`
 	// RawFrames carries the unparsed response frames, and only when the parse
 	// produced no media. An empty result is indistinguishable from a parser that
 	// missed a new shape unless the payload is visible, and this is the only
@@ -1418,6 +1509,244 @@ type BatchVideoOutcome struct {
 // to hold the request open. Twenty seconds is generous for one RPC and short
 // enough that a stuck one is noticed rather than waited on.
 const creditsReadTimeout = 20 * time.Second
+
+// videoPlan is a video submission's cost and whether the account can pay it.
+type videoPlan struct {
+	Model   string
+	Quality string
+	// Cost is the total for the request: the per-render cost times the count.
+	Cost int
+	// Balance is the balance observed while planning, and Known says whether it
+	// was actually read. Balance zero with Known false means "not read", never
+	// "empty" — the two are different answers and only one of them is a reason
+	// to refuse.
+	Balance int
+	Known   bool
+	// Downgraded says the requested quality did not fit and a cheaper one does.
+	Downgraded bool
+	// Reason explains a refusal. It is empty when the plan is affordable, so a
+	// caller tests Reason rather than a separate flag.
+	Reason string
+}
+
+// Affordable reports whether the plan can be submitted.
+func (p videoPlan) Affordable() bool { return p.Reason == "" }
+
+// planVideo works out what a submission will cost and whether the account can
+// pay for it.
+//
+// This check exists because the server does not make it. A submission the
+// balance cannot cover is accepted and answered with no media rather than an
+// error, so a 1-credit account against a 7-credit render presents as a broken
+// request — and the cost was previously consulted only *after* that empty
+// answer, to choose which log line to write. Deciding it before the call means
+// the request is either affordable or refused, and a reCAPTCHA is never spent on
+// a render that cannot be paid for.
+func (e *Engine) planVideo(ctx context.Context, client *batchexecute.Client, req BatchVideoRequest, model, quality string) videoPlan {
+	duration := req.Duration
+	if duration == 0 {
+		duration = config.DefaultDuration
+	}
+	count := req.Count
+	if count < 1 {
+		count = 1
+	}
+
+	perRender, known := config.VideoCost(duration, quality)
+	if !known {
+		// An unrecorded pair is not a refusal. The table covers the durations the
+		// app offers, and a model named outright can sit outside it — making the
+		// table the limit on what can be generated would be a worse failure than
+		// the one being fixed.
+		log.Printf("engine: no recorded cost for %ds at %s; the balance cannot be checked "+
+			"before submitting", duration, quality)
+		return videoPlan{Model: model, Quality: quality}
+	}
+
+	creditCtx, cancel := context.WithTimeout(ctx, creditsReadTimeout)
+	balance, err := client.Credits(creditCtx, batchexecute.CallOptions{
+		SourcePath: "/", BuildLabel: config.BuildLabel(),
+	})
+	cancel()
+	if err != nil {
+		// A failed read is not evidence of an empty wallet. Proceed, and say so —
+		// treating an unreadable balance as zero would refuse work the account can
+		// pay for.
+		log.Printf("engine: could not read the balance before submitting (%v); the "+
+			"affordability check cannot be made, so the submission proceeds", err)
+		return videoPlan{Model: model, Quality: quality, Cost: perRender * count}
+	}
+
+	return decideVideoPlan(duration, count, model, quality, balance)
+}
+
+// decideVideoPlan is the whole affordability decision, given a balance that has
+// already been read.
+//
+// It is separated from the read so it can be tested without a network: the
+// arithmetic here is what decides whether a render is submitted, downgraded or
+// refused, and it is the part that has to be right.
+func decideVideoPlan(duration, count int, model, quality string, balance int) videoPlan {
+	perRender, known := config.VideoCost(duration, quality)
+	if !known {
+		// An unrecorded pair is not a refusal; see planVideo.
+		return videoPlan{Model: model, Quality: quality, Balance: balance, Known: true}
+	}
+
+	plan := videoPlan{
+		Model:   model,
+		Quality: quality,
+		Cost:    perRender * count,
+		Balance: balance,
+		Known:   true,
+	}
+	if balance >= plan.Cost {
+		return plan
+	}
+
+	// The account cannot pay for what was asked. 360p is the same render for
+	// less — the table records it at roughly half — so when the cheaper quality
+	// fits, serve it rather than refusing a request that can be met.
+	if quality != "360p" {
+		if cheap, ok := config.VideoCost(duration, "360p"); ok && balance >= cheap*count {
+			plan.Quality = "360p"
+			plan.Model = config.VideoModelQuality(model, "360p")
+			plan.Cost = cheap * count
+			plan.Downgraded = true
+			return plan
+		}
+	}
+
+	plan.Reason = fmt.Sprintf(
+		"insufficient credits: %ds at %s costs %d (%d per render ×%d) and the account has %d",
+		duration, quality, plan.Cost, perRender, count, balance)
+	return plan
+}
+
+// AccountChoice is which signed-in account would pay for a job of a given cost.
+type AccountChoice struct {
+	Cost int `json:"cost"`
+	// Current is the account in use right now.
+	Current int `json:"current_index"`
+	// Accounts is every signed-in account the scan reached, so the decision can
+	// be checked against the numbers it was made from rather than taken on trust.
+	Accounts []AccountCredits `json:"accounts"`
+	// ChosenIndex is the account that would be used, or -1 when none can pay.
+	ChosenIndex int `json:"chosen_index"`
+	// ChosenBalance is that account's balance, and is only meaningful when
+	// ChosenIndex is not -1.
+	ChosenBalance int `json:"chosen_balance,omitempty"`
+	// WouldSwitch says the engine is not already on the chosen account.
+	WouldSwitch bool `json:"would_switch"`
+}
+
+// ChooseAccountFor reports which signed-in account would pay for a job of the
+// given cost, without moving to it.
+//
+// Read-only, and separate from the switch on purpose: it is how the decision can
+// be inspected — and verified — without spending anything or changing which
+// account is in use.
+func (e *Engine) ChooseAccountFor(ctx context.Context, cost int) (*AccountChoice, error) {
+	if cost < 0 {
+		cost = 0
+	}
+	rows, err := e.AccountsCredits(ctx, config.AccountScanLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	choice := &AccountChoice{
+		Cost:     cost,
+		Current:  e.AccountIndex(),
+		Accounts: rows,
+	}
+	choice.ChosenIndex, choice.ChosenBalance = bestAffordableAccount(rows, cost)
+	choice.WouldSwitch = choice.ChosenIndex != -1 && choice.ChosenIndex != choice.Current
+	return choice, nil
+}
+
+// switchToAffordableAccount moves the engine onto a signed-in account that can
+// pay for a job, when the one in use cannot.
+//
+// Returns true only when the engine is now on a *different* account. False
+// covers both "the current account is already fine" and "nothing signed in can
+// pay" — the caller re-plans either way and refuses if the plan is still
+// unaffordable, so the two do not need to be told apart.
+//
+// The switch is a full Bootstrap, because the session, the account row and the
+// project have to move together: a project belonging to one account submitted
+// under another's session comes back empty. That is also why this is the whole
+// mechanism rather than a second one — Bootstrap already knows how to resolve a
+// project for a given account, so there is nothing new to invent.
+//
+// The chosen account is recorded, not just used for this request. The engine
+// converges on an account that can pay, which is the point: sitting on one that
+// cannot only guarantees the next refusal.
+func (e *Engine) switchToAffordableAccount(ctx context.Context, cost int) bool {
+	choice, err := e.ChooseAccountFor(ctx, cost)
+	if err != nil {
+		log.Printf("engine: could not read the signed-in balances to find an account that "+
+			"can cover %d credits (%v)", cost, err)
+		return false
+	}
+
+	if choice.ChosenIndex == -1 {
+		log.Printf("engine: no signed-in account can cover %d credits; scanned %s",
+			cost, describeBalances(choice.Accounts))
+		return false
+	}
+	if !choice.WouldSwitch {
+		return false
+	}
+
+	log.Printf("engine: account %d cannot cover %d credits, so the engine is moving to "+
+		"account %d, which holds %d",
+		choice.Current, cost, choice.ChosenIndex, choice.ChosenBalance)
+	if err := e.SetAccountIndex(ctx, choice.ChosenIndex); err != nil {
+		log.Printf("engine: could not move to account %d (%v); staying on account %d",
+			choice.ChosenIndex, err, choice.Current)
+		return false
+	}
+	return true
+}
+
+// bestAffordableAccount returns the index and balance of the signed-in account
+// with the most credits that can still cover cost.
+//
+// Returns -1 when none can. An account whose balance could not be read is not a
+// candidate: `Credits` is nil precisely when the read failed, and treating that
+// as a balance would move the engine onto an account on no evidence.
+//
+// It is separate from the scan so the choice can be tested without a network —
+// this is the decision that picks which wallet gets charged.
+func bestAffordableAccount(rows []AccountCredits, cost int) (index, balance int) {
+	index, balance = -1, 0
+	for _, row := range rows {
+		if !row.SignedIn || row.Credits == nil || *row.Credits < cost {
+			continue
+		}
+		if index == -1 || *row.Credits > balance {
+			index, balance = row.Index, *row.Credits
+		}
+	}
+	return index, balance
+}
+
+// describeBalances renders a scan for a log line.
+func describeBalances(rows []AccountCredits) string {
+	if len(rows) == 0 {
+		return "nothing readable"
+	}
+	parts := make([]string, 0, len(rows))
+	for _, row := range rows {
+		balance := "unknown"
+		if row.Credits != nil {
+			balance = strconv.Itoa(*row.Credits)
+		}
+		parts = append(parts, fmt.Sprintf("%d=%s", row.Index, balance))
+	}
+	return "accounts " + strings.Join(parts, ", ")
+}
 
 // GenerateVideoViaBatch submits a video generation over batchexecute.
 func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoRequest) (*BatchVideoOutcome, error) {
@@ -1448,6 +1777,16 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	quality := config.NormalizeVideoQuality(req.Quality)
 	model = config.VideoModelQuality(model, quality)
 
+	// The model key is the authority on quality, not the field.
+	//
+	// A caller can name a model outright, and `abra_t2v_4s_360p` is a 360p render
+	// whatever `quality` says. Pricing it off the field alone would quote the
+	// 720p cost for a 360p render, which overstates what the account needs and
+	// refuses requests that would in fact have been served.
+	if strings.HasSuffix(model, "_360p") {
+		quality = "360p"
+	}
+
 	projectID := req.ProjectID
 	if projectID == "" {
 		projectID = e.ProjectID()
@@ -1473,12 +1812,6 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 	_ = rowID
 
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
 	jar := e.bridge.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
@@ -1487,6 +1820,44 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 
 	client := e.newBatchexecuteClient(jar, e.hc)
+
+	// Keep the pair as requested. A retry against another account has to re-plan
+	// from what was asked for, not from a downgrade the previous account forced —
+	// otherwise a richer account is handed the cheaper render it never needed.
+	requestedModel, requestedQuality := model, quality
+
+	// Decide whether this account can pay for the render before anything is spent
+	// on the request.
+	//
+	// This runs ahead of the reCAPTCHA mint deliberately: a token is a browser
+	// round trip, and minting one for a render the balance cannot cover wastes it
+	// and buries the real reason behind a captcha failure.
+	plan := e.planVideo(ctx, client, req, requestedModel, requestedQuality)
+	if !plan.Affordable() {
+		// The account in use cannot pay. Another signed-in account might, and
+		// preferring the one that can is the whole reason for having several — so
+		// look before refusing.
+		if e.switchToAffordableAccount(ctx, plan.Cost) {
+			// The switch re-bootstrapped, so both the client and the project now
+			// belong to the account that was just left behind and have to be
+			// rebuilt before anything is sent under them.
+			if switchedJar := e.bridge.Jar(); switchedJar != nil {
+				jar = switchedJar
+				client = e.newBatchexecuteClient(jar, e.hc)
+				if id := e.ProjectID(); id != "" {
+					projectID = id
+				}
+				plan = e.planVideo(ctx, client, req, requestedModel, requestedQuality)
+			}
+		}
+	}
+	if !plan.Affordable() {
+		err := fmt.Errorf("engine: %s", plan.Reason)
+		e.finishJob(jobID, "failed", nil, start, err)
+		return nil, err
+	}
+	model, quality = plan.Model, plan.Quality
+
 	// startImage/endImage take content ids, not media ids. Resolve whatever the
 	// caller supplied so a freshly uploaded file's media id also works.
 	startImage, err := e.conditionImageID(ctx, req.StartImage)
@@ -1498,6 +1869,12 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err)
 		return nil, err
+	}
+
+	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
+	if err != nil {
+		e.finishJob(jobID, "failed", nil, start, err)
+		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
 	frames, err := client.GenerateVideo(ctx, batchexecute.GenerateVideoRequest{
@@ -1521,11 +1898,14 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 
 	outcome := &BatchVideoOutcome{
-		JobID:     jobID,
-		AccountID: e.AccountID(),
-		ProjectID: projectID,
-		Model:     model,
-		Status:    "submitted",
+		JobID:             jobID,
+		AccountID:         e.AccountID(),
+		ProjectID:         projectID,
+		Model:             model,
+		Quality:           quality,
+		CreditsCost:       plan.Cost,
+		QualityDowngraded: plan.Downgraded,
+		Status:            "submitted",
 	}
 	for _, frame := range frames {
 		outcome.MediaIDs = append(outcome.MediaIDs, batchexecute.ParseGeneratedMediaIDs(frame.Payload)...)
@@ -1568,30 +1948,44 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		}
 	}
 
+	// What the render actually cost, as a delta rather than the table's figure.
+	//
+	// The table says what the request was *expected* to cost; only the balance
+	// moving proves it was charged. The delta is also the only way the table
+	// itself gets checked against reality — `credits_spent` was previously
+	// written as NULL on every job, so the recorded costs had never been
+	// confirmed by a single real submission.
+	var spent *int
+	if plan.Known && credErr == nil && credits < plan.Balance {
+		delta := plan.Balance - credits
+		spent = &delta
+	}
+
 	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
+	e.finishJob(jobID, outcome.Status, spent, start, nil)
 	_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
 
 	if len(outcome.MediaIDs) == 0 {
-		// Say what it costs and what is left.
+		// Say what it cost and what is left.
 		//
 		// The server accepts a submission the balance cannot cover and answers
 		// with no media rather than an error, so "submitted 0 videos" was the
 		// whole report — which reads as a broken request. It sent someone looking
 		// for a wrong argument for hours when the answer was an empty wallet.
-		cost, known := config.VideoCost(req.Duration, quality)
+		//
+		// The affordability check has already passed by this point, so the
+		// balance is no longer a candidate cause and the line says so. Reporting
+		// it as the likely culprit here would send the next reader after the same
+		// wrong answer.
 		balance := "unknown"
-		if outcome.Credits > 0 {
-			balance = fmt.Sprintf("%d", outcome.Credits)
+		if plan.Known {
+			balance = fmt.Sprintf("%d", plan.Balance)
 		}
-		if known && outcome.Credits > 0 && outcome.Credits < cost {
+		if plan.Cost > 0 {
 			log.Printf("engine: nothing submitted for %s — it costs %d credits at %s and the "+
-				"account has %s, which will not cover it",
-				model, cost, quality, balance)
-		} else if known {
-			log.Printf("engine: nothing submitted for %s — it costs %d credits at %s and the "+
-				"account has %s; the balance is not the obvious cause, so check the model key "+
-				"and the RPC it went to", model, cost, quality, balance)
+				"account has %s, which was checked and covers it; so the balance is not the "+
+				"cause — check the model key and the RPC it went to",
+				model, plan.Cost, quality, balance)
 		} else {
 			log.Printf("engine: nothing submitted for %s at %s — the cost of that pair is not "+
 				"recorded, so the balance cannot be ruled in or out", model, quality)
@@ -2309,16 +2703,17 @@ func (e *Engine) collectVideo(ctx context.Context, client *batchexecute.Client, 
 			if err != nil {
 				lastErr[mediaID] = err.Error()
 
-				// "Not in the listing yet" is what a render in flight reports, and
-				// it is the only reason worth waiting for. Anything else — a
-				// media-detail call that answers nothing, a listing that moved, an
-				// id that never landed — is permanent, and polling it for the full
-				// timeout turns a ten-second failure into a seven-minute one.
-				if !errors.Is(err, batchexecute.ErrAssetNotListed) {
-					log.Printf("engine: giving up on %s — %v", shortID(mediaID), err)
-					delete(pending, mediaID)
-					failed = append(failed, mediaID)
-				}
+			// A render in flight fails this in two stages, and both are worth
+			// waiting for: first the asset is missing from the listing, then it
+			// appears while its URL is still being produced. Anything else — a
+			// media-detail call that answers nothing, a listing that moved, an id
+			// that never landed — is permanent, and polling it for the full
+			// timeout turns a ten-second failure into a seven-minute one.
+			if !batchexecute.RetryableResolveError(err) {
+				log.Printf("engine: giving up on %s — %v", shortID(mediaID), err)
+				delete(pending, mediaID)
+				failed = append(failed, mediaID)
+			}
 				continue
 			}
 			delete(pending, mediaID)

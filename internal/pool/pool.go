@@ -277,6 +277,26 @@ func (p *Pool) Remove(id string) {
 	}
 }
 
+// Retain drops every worker except the named one.
+//
+// The engine acts as a single signed-in account at a time and re-bootstraps on
+// every account switch, so without this each switch leaves the previous
+// account's worker behind and the pool accumulates accounts the engine can no
+// longer route to. That is not just untidy: with two workers registered, the
+// pool's balance is a sum over an account that is no longer in use, and /status
+// reports it as though it were available.
+func (p *Pool) Retain(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := p.workers[:0]
+	for _, w := range p.workers {
+		if w.ID == id {
+			kept = append(kept, w)
+		}
+	}
+	p.workers = kept
+}
+
 // Workers returns a snapshot of the registered workers.
 func (p *Pool) Workers() []*Worker {
 	p.mu.RLock()

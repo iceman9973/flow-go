@@ -1005,6 +1005,34 @@ veo_3_1_extend_* / _interpolation_*     extend and interpolate
 **Resolution is the `_360p` suffix**, which is why the upscalers are separate keys
 rather than a parameter.
 
+#### The cheapest key exists and does not render
+
+`abra_t2v_4s_360p` is in the catalog — all eight `abra_t2v_*` keys are, `_360p`
+included — and a submission against it is accepted:
+
+```
+POST /v1/videos/generations  {"duration":4,"quality":"360p"}
+  -> model  abra_t2v_4s_360p
+  -> media  1ebf70e2-4530-4b39-9151-1a1d5679d073     ← an id comes back
+  -> 440s of polling, no URL
+```
+
+No asset ever appears in the project listing — the newest entry was still from
+before the submission, eight minutes later — so there is nothing to resolve and
+nothing to download. The balance did not move, which reads as the render being
+discarded rather than charged for.
+
+So the key is accepted and the render never happens. **The cheapest video that
+actually renders is 4s at 720p for 7 credits, not 4s at 360p for 4.** The cost
+table is still right about what each pair *costs*; it is the 360p text-to-video key
+that does not produce anything.
+
+Worth knowing because the cost gate downgrades 720p → 360p when the balance will not
+cover 720p. For **text-to-video** that downgrade turns a render that would have
+worked into one that produces nothing — which is worse than refusing. The downgrade
+is correct for image-to-video (`abra_i2v_4s_360p` renders fine, measured at 194s)
+and for the other durations, so it is specifically this key.
+
 For the `veo_*` keys, **aspect ratio is a model key too** — `_portrait` against a
 landscape default. The `abra_*` and `omni_flash_*` keys have no `_portrait` variants.
 

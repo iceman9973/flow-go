@@ -65,6 +65,17 @@ const Origin = "https://flow.google.com"
 // Note the argument's `projects/*` — the listing is expressed as a resource
 // pattern, not as a call about a project. That is also why it needs no project
 // context and works before one is known.
+//
+// The same id was also recorded here as `RPCIDAssetPage`, "pages through a
+// project's assets", with this identical payload. It was never called under that
+// name, so the label went unverified — the second time this one id was
+// mislabelled, after `WuwhI`. The third argument is a page cursor, null on the
+// first page; nothing here has needed a second page yet.
+//
+// An empty list is a real answer, not an error, and it is the answer whenever
+// the account has no projects. Checked against the app itself: with the listing
+// empty, flow.google.com/u/0/ shows only "New project" — the two agree, so a
+// caller must treat empty as "none" and not as "the call failed".
 const RPCIDProjectList = "UpteDb"
 
 // RPC ids discovered by capturing the Flow app's own page-load traffic and
@@ -299,17 +310,6 @@ const (
 
 	// RPCIDMediaCatalog returns a large project-scoped asset catalog.
 	RPCIDMediaCatalog = "DTaVef"
-
-	// RPCIDAssetPage pages through a project's assets.
-	//
-	// Decoded from a live call:
-	//
-	//	["projects/*", 21, "<page-token>", null, null, null, [1]]
-	//
-	// The third slot is a base64 page token and is null on the first page, so this
-	// is the cursor the listing is walked with. `21` is likely a page size or a
-	// resource type and was constant across the captures.
-	RPCIDAssetPage = "UpteDb"
 
 	// RPCIDProjectMeta returns project metadata.
 	RPCIDProjectMeta = "mrlkwd"

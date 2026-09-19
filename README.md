@@ -631,6 +631,13 @@ carries no poster — which is why `Thumbnail` and `LastAssetID` are optional. A
 account with no projects answers with an empty list, not an error; that case
 panicked the parser once, so it is tested.
 
+**An empty listing is a real answer.** Verified against the app itself: when
+`UpteDb` came back empty, `flow.google.com/u/0/` showed only "New project" — the
+two agree. So empty means "this account has none", and it falls through to the
+browser for the same reason a failed call does: neither can name a project. In
+that state *both* routes are empty, and the remedy is to create a project or set
+`FLOW_PROJECT_ID` — the browser is not a better source, it is the same source.
+
 ### Token caching
 
 A minted token is keyed on a hash of the cookie jar and carries a local TTL. New

@@ -578,6 +578,11 @@ func TestParseProjectAssets(t *testing.T) {
 // project id takes row[3]'s place. A reader that required four leading non-empty
 // strings matched no rows at all here — so an asset that was plainly in the
 // listing read as absent, and an upscale could not resolve its content id.
+//
+// The pair is the *opposite* way round from the flat shape: row[0] is the media id
+// and detail[4] is the content id. This test previously asserted the reverse, and
+// that assertion is what the parser was written to satisfy — so the test passed
+// while `as29s` was being handed an id it does not answer for.
 func TestParseProjectAssetsReadsTheNestedListingShape(t *testing.T) {
 	const payload = `[null,null,[` +
 		`["f7af1f07-af43-49ab-9f6d-dd5a606a459e",null,null,` +
@@ -593,18 +598,50 @@ func TestParseProjectAssetsReadsTheNestedListingShape(t *testing.T) {
 	}
 
 	got := assets[0]
-	if got.MediaID != "e95cdd98-63f7-4563-8f52-1f630632fd11" {
-		t.Errorf("MediaID = %q, want the value at detail[4]", got.MediaID)
+	if got.MediaID != "f7af1f07-af43-49ab-9f6d-dd5a606a459e" {
+		t.Errorf("MediaID = %q, want the value at row[0]", got.MediaID)
 	}
-	if got.ContentID != "3b696c3c-fbea-4242-b612-83a9dba1c9f0" {
-		t.Errorf("ContentID = %q, want the value at detail[5]", got.ContentID)
+	if got.ContentID != "e95cdd98-63f7-4563-8f52-1f630632fd11" {
+		t.Errorf("ContentID = %q, want the value at detail[4]", got.ContentID)
 	}
 	if got.MediaID == got.ContentID {
-		t.Error("the media id and the content id must stay distinct — the upscale takes " +
-			"the content id and the UI addresses the media id")
+		t.Error("the media id and the content id must stay distinct — the media-detail " +
+			"and upscale RPCs take the content id and the editor URL takes the media id")
 	}
 	if got.Title != "Green paper leaf on paper" {
 		t.Errorf("Title = %q, want the value at detail[0]", got.Title)
+	}
+}
+
+// TestParseProjectAssetsReadsAnUploadedImage covers the row an upload produces.
+//
+// An uploaded image has no derived variant, so detail[5] is null — and requiring
+// both ids rejected the row outright. Every uploaded asset was invisible, which is
+// why image-to-video from an upload reported "not in the project listing" for an
+// asset that was in the listing.
+func TestParseProjectAssetsReadsAnUploadedImage(t *testing.T) {
+	const payload = `[null,null,[` +
+		`["b41e8168-ff3f-49e6-95c7-edd69bc1bf17",null,null,` +
+		`["Red_paper_lantern_floating_on_2K.jpeg",[1789814295,462140000],null,null,` +
+		`"d2f68ce0-63ab-4fbe-a2d9-65ee33a82c98",null,[1789814303,257020000]],` +
+		`"a9153ea6-f142-4708-a005-ee2bbaf27c91"]` +
+		`]]`
+
+	assets := ParseProjectAssets([]byte(payload))
+	if len(assets) != 1 {
+		t.Fatalf("parsed %d assets, want 1 — an uploaded image was rejected", len(assets))
+	}
+	got := assets[0]
+	if got.MediaID != "b41e8168-ff3f-49e6-95c7-edd69bc1bf17" {
+		t.Errorf("MediaID = %q, want the value at row[0]", got.MediaID)
+	}
+	// The upload response reports these two separately, which is what pins the
+	// mapping down: media_id lands at row[0] and content_id at detail[4].
+	if got.ContentID != "d2f68ce0-63ab-4fbe-a2d9-65ee33a82c98" {
+		t.Errorf("ContentID = %q, want the value at detail[4]", got.ContentID)
+	}
+	if got.Title != "Red_paper_lantern_floating_on_2K.jpeg" {
+		t.Errorf("Title = %q", got.Title)
 	}
 }
 

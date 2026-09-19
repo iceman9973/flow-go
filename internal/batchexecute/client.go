@@ -245,16 +245,15 @@ const (
 
 	// RPCIDMediaDetail returns the signed URLs for one asset.
 	//
-	// Payload is the asset's **media id** — field 4 of its project-listing row.
-	// This comment used to say "content id", and that is what the caller passed;
-	// the call is accepted either way, so the mistake was invisible: it answered
-	// `null` and the code read that as "the render is not ready", for as long as
-	// anyone cared to wait.
+	// Payload is the asset's **content id** — for the nested listing shape that is
+	// `detail[4]` of the row, and for the flat one it is `row[0]`. Getting it
+	// wrong is not rejected: the call answers 200 with a `null` payload and no
+	// error, so a finished render reads exactly like one that is still going.
 	//
 	// The source-path must be "/project/<project-id>/edit/<media-id>", not the
 	// plain project path, or the call is rejected. The response carries both the
-	// poster (flow-content.google/image/<media-id>) and, for a video, the asset
-	// itself (flow-content.google/video/<media-id>), each with its own signature.
+	// poster (flow-content.google/image/<content-id>) and, for a video, the asset
+	// itself (flow-content.google/video/<content-id>), each with its own signature.
 	//
 	// This is how a finished video is fetched. The generation call returns only an
 	// id because video is asynchronous; the URL appears here once it is ready.
@@ -2100,18 +2099,16 @@ func parseMedia(payload json.RawMessage, wantKind string) []GeneratedMedia {
 // a video, the asset itself.
 //
 // It takes two ids because it needs two, and they are not interchangeable:
-// sourceMediaID builds the source-path, and payloadID is the argument. Both come
-// from the same listing row but are different fields of it, and they are named
-// here for where they go rather than for what the listing calls them — the
-// earlier naming ("contentID" for the payload) is what had this asking for an id
-// the RPC does not answer for, and a `null` payload with no error looks exactly
-// like a render that has not finished.
-func (c *Client) MediaDetail(ctx context.Context, projectID, sourceMediaID, payloadID string) ([]GeneratedMedia, error) {
-	if projectID == "" || sourceMediaID == "" || payloadID == "" {
-		return nil, fmt.Errorf("batchexecute: project, source and payload ids are all required")
+// sourceMediaID builds the source-path, and contentID is the argument. Both come
+// from the same listing row but are different fields of it. Passing the wrong one
+// is not rejected — the call answers 200 with a `null` payload, which is
+// indistinguishable from a render that has not finished.
+func (c *Client) MediaDetail(ctx context.Context, projectID, sourceMediaID, contentID string) ([]GeneratedMedia, error) {
+	if projectID == "" || sourceMediaID == "" || contentID == "" {
+		return nil, fmt.Errorf("batchexecute: project, source and content ids are all required")
 	}
 
-	frames, err := c.CallWith(ctx, RPCIDMediaDetail, []any{payloadID}, CallOptions{
+	frames, err := c.CallWith(ctx, RPCIDMediaDetail, []any{contentID}, CallOptions{
 		// The /edit/<media-id> suffix is required; the plain project path is
 		// rejected.
 		SourcePath: "/project/" + projectID + "/edit/" + sourceMediaID,
@@ -2200,22 +2197,26 @@ func ParseProjectAssets(payload json.RawMessage) []ProjectAsset {
 			continue
 		}
 
-		contentID := stringAt(row, 0)
-		mediaID := stringAt(row, 2)
-		title := ""
-		typeCode := ""
+		// Which field is which depends on the shape, and getting it backwards is
+		// silent: the ids are all uuids, so a swapped pair still looks like a
+		// valid asset and only fails later, at the RPC that wanted the other one.
+		//
+		//	flat   [content-id, project-id, media-id, type-code, null, detail, …]
+		//	nested [media-id, null, null, [title, ts, …, content-id, ?, ts], project]
+		//
+		// The nested pair was read backwards here — detail[4] was called the media
+		// id and detail[5] the content id. detail[4] is the content id, which the
+		// upload response proves directly: it reports `media_id` and `content_id`
+		// separately, and the content id is the one that lands at detail[4].
+		var mediaID, contentID, title, typeCode string
 
 		if detail, ok := row[3].([]any); ok {
-			// The nested shape: the pair sits inside the detail array, and the
-			// project id takes row[3]'s place in the flat one.
-			if s := stringAt(detail, 4); s != "" {
-				mediaID = s
-			}
-			if s := stringAt(detail, 5); s != "" {
-				contentID = s
-			}
+			mediaID = stringAt(row, 0)
+			contentID = stringAt(detail, 4)
 			title = stringAt(detail, 0)
 		} else if s, ok := row[3].(string); ok {
+			contentID = stringAt(row, 0)
+			mediaID = stringAt(row, 2)
 			typeCode = s
 		}
 
@@ -2287,11 +2288,18 @@ func findEntryList(value any, depth int) []any {
 // The one the app serves today leads with a single id and nests the pair inside
 // the detail array, leaving row[1] and row[2] null:
 //
-//	[asset-id, null, null, [title, ts, null, null, media-id, content-id, ts], project-id]
+//	[media-id, null, null, [title, ts, null, null, content-id, ?, ts], project-id]
 //
 // Matching only the first shape found no rows at all in the second — so every
 // media id looked absent from its own project, and an upscale could not resolve
 // a content id for an asset that was sitting right there in the listing.
+//
+// **Only detail[4] is required**, not detail[5]. An uploaded image carries a
+// content id at detail[4] and nothing at detail[5], because it has no derived
+// variant — so demanding both rejected every uploaded asset. That is why
+// conditioning on a freshly uploaded image reported it as "not in the project
+// listing" while it was in the listing, and why the engine could not do
+// image-to-video from an upload at all.
 func isAssetRow(row []any) bool {
 	if len(row) < 4 || !isNonEmptyString(row[0]) {
 		return false
@@ -2300,7 +2308,7 @@ func isAssetRow(row []any) bool {
 		return true
 	}
 	detail, ok := row[3].([]any)
-	return ok && len(detail) > 5 && isNonEmptyString(detail[4]) && isNonEmptyString(detail[5])
+	return ok && len(detail) > 4 && isNonEmptyString(detail[4])
 }
 
 // stringAt reads a string field, returning "" when it is absent or not a string.
@@ -2383,16 +2391,15 @@ func (c *Client) ResolveVideoURL(ctx context.Context, projectID, mediaID string)
 		return "", fmt.Errorf("batchexecute: %s: %w", mediaID, ErrAssetNotListed)
 	}
 
-	// The media-detail RPC is addressed by the listing's own media id, which is
-	// field 4 of the row — not the content id at field 5, and not the id the
-	// submission returned.
+	// The media-detail RPC is addressed by the asset's **content id**, which is
+	// what the parser now puts in ContentID for both listing shapes.
 	//
-	// All three are uuids and all three address "the asset", so the wrong one is
-	// not rejected: the call answers 200 with a `null` payload and no error. That
-	// is what made every finished render look like a render that had never
-	// finished — the URL was there the whole time, under an id this was not
-	// asking for.
-	media, err := c.MediaDetail(ctx, projectID, mediaID, found.MediaID)
+	// This is the defect that cost the most. The nested listing's id pair was read
+	// backwards, so ContentID held the wrong uuid — and the call does not reject a
+	// wrong uuid, it answers 200 with a `null` payload. That is indistinguishable
+	// from a render that has not finished, so a completed video looked like one
+	// that never completed and the poll waited out its whole timeout.
+	media, err := c.MediaDetail(ctx, projectID, found.MediaID, found.ContentID)
 	if err != nil {
 		return "", err
 	}

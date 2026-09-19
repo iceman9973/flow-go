@@ -220,7 +220,7 @@ row[2] = media id     ← what the UI and the editor URL use
 | `SPrCad` (image upscale) | content id |
 | `p0UkFb` (video upscale) | **both** — content at `request[0]`, media at `request[4]` |
 | `nprQif` / `eb1hJf` (image-to-video) | content id, in `startImage`/`endImage` |
-| `as29s` (media detail) | **media id** — see below |
+| `as29s` (media detail) | content id |
 | `/project/<id>/edit/<X>` | media id |
 | `maseQ` (upload) | returns **both** |
 
@@ -230,24 +230,32 @@ this was found: an image-to-video submission carrying a freshly uploaded file's
 rendered normally. `POST /v1/media/upload` therefore returns both, and the video
 endpoint resolves either into the content id before submitting.
 
-#### `as29s` takes the media id, and getting it wrong is silent
+#### Which field is the content id depends on the listing shape
 
-This table said "content id" for `as29s`, and the code did what the table said. The
-call is not rejected — it answers **`200` with a `null` payload and no error**, which
-reads exactly like a render that has not finished yet. So every completed video
-looked like a video that never completed, and the poll waited out its full timeout
-before giving up.
+This is where it goes wrong, and it goes wrong silently — every id here is a uuid,
+so a swapped pair still looks like a valid asset and only fails later, at the RPC
+that wanted the other one.
 
-Measured against one project, both a current and an older asset:
-
-| id passed | which field of the listing row | `as29s` |
+| shape | media id | content id |
 |---|---|---|
-| `a31690a2…` | `row[3][4]` — the **media id** | full payload, both signed URLs |
-| `4356865a…` | `row[3][5]` — the content id | `null` |
-| `3db0bad8…` | `row[0]` — the id the submission returned | `null` |
+| flat — `[content-id, project-id, media-id, type-code, …]` | `row[2]` | `row[0]` |
+| nested — `[media-id, null, null, [title, ts, …, content-id, ?, ts], project]` | `row[0]` | `detail[4]` |
 
-So it is neither the content id **nor** the id the generation handed back; it is the
-listing's own media id. `ResolveVideoURL` now passes that.
+The nested pair was read **backwards** in the parser: `detail[4]` was called the
+media id and `detail[5]` the content id. It is the other way round, and the upload
+response is what proves it — it reports `media_id` and `content_id` separately, and
+the content id is the one that lands at `detail[4]`.
+
+Two consequences, both of which looked like something else:
+
+- **`as29s` was handed the wrong uuid.** It is not rejected; it answers `200` with
+  a `null` payload, which is indistinguishable from a render that has not
+  finished. Every completed video therefore looked like a video that never
+  completed, and the poll waited out its full timeout before giving up.
+- **An uploaded image was invisible.** `detail[5]` is `null` for an upload — it has
+  no derived variant — and the row matcher required both ids, so every uploaded
+  asset was dropped and conditioning on one reported it as "not in the project
+  listing" while it sat right there in the listing.
 
 ### Uploading a local file
 
@@ -571,14 +579,14 @@ credits. The media id and prompt were then read back out of the project.
 
 Video is **asynchronous**, so the URL only exists once the render finishes. A
 third RPC resolves it: **`as29s`**, whose `source-path` must carry an
-`/edit/<media-id>` suffix, and whose payload is the asset's *media id* — the
-listing's `row[3][4]`, which is a different uuid from the content id **and** from
-the id the generation returned. Passing either of the others is answered with a
-`null` payload and no error, so the wrong id is indistinguishable from a render
-that is still going. Its response carries both the poster
-(`/image/<media-id>`) and the asset (`/video/<media-id>`), each separately signed,
-so filtering by kind matters: taking the first URL would download the poster as if
-it were the video.
+`/edit/<media-id>` suffix, and whose payload is the asset's **content id** — for
+the nested listing shape that is `detail[4]`, which is a different uuid from the
+media id the generation returned **and** from the third id at `detail[5]`.
+Passing either of the others is answered with a `null` payload and no error, so the
+wrong id is indistinguishable from a render that is still going. Its response
+carries both the poster (`/image/<content-id>`) and the asset
+(`/video/<content-id>`), each separately signed, so filtering by kind matters:
+taking the first URL would download the poster as if it were the video.
 
 Verified end to end:
 
@@ -604,10 +612,11 @@ ISO Media, MP4 Base Media v1 [ISO 14496-12:2003]
 That block was true, then stopped being true, and nothing said so. Two defects,
 either of which alone would have hidden the other:
 
-1. **The wrong id was being sent.** `ResolveVideoURL` passed the asset's *content
-   id* to `as29s`, which takes the *media id*. The call is not rejected — it
-   answers `200` with a `null` payload — so the code read it as "not ready yet" and
-   kept waiting.
+1. **The listing's id pair was read backwards.** The parser called `detail[4]` the
+   media id and `detail[5]` the content id; it is the other way round. So
+   `ResolveVideoURL` handed `as29s` the wrong uuid, and the call does not reject a
+   wrong uuid — it answers `200` with a `null` payload — so the code read it as
+   "not ready yet" and kept waiting.
 2. **The "not ready" error was not marked retryable.** `"no video URL … yet (still
    rendering?)"` was not wrapped, so the poll treated a still-rendering video as a
    permanent failure and abandoned it after **10 seconds**.
@@ -781,9 +790,9 @@ refused for want of entitlement.
 A caller holds a media id — it is what a generation returns and what the editor
 URL carries — while `SPrCad` takes a **content id**. They are different values, so
 the upscale endpoints resolve the content id from the project listing when only a
-media id is given. (The media-detail RPC `as29s` is the exception and goes the
-other way: it takes the listing's media id. See "`as29s` takes the media id"
-above.)
+media id is given. (`as29s` takes the content id too — it was the *listing parser*
+that had the two swapped, not the RPC table. See "Which field is the content id
+depends on the listing shape" above.)
 
 That resolution has a trap. One media id can have **several rows**: the original
 and each derived asset share it. They are not interchangeable, and picking the
@@ -1142,11 +1151,18 @@ Every step below was a wrong assumption that a live probe corrected.
     what the Flow account menu shows. The old endpoint's token belonged to a
     *different* signed-in Google account than the one the app session uses, so it
     was never going to agree.
-12. **`as29s` takes the media id, not the content id.** The doc said content id and
-    the code did what the doc said. It is not rejected — `200` with a `null`
-    payload — so a finished render is indistinguishable from one that never
-    finished. This is the one that cost the most: it hid a *working* pipeline
-    behind a seven-minute wait, twice, for 14 credits.
+12. **The nested listing's id pair was read backwards.** `detail[4]` was called the
+    media id and `detail[5]` the content id; it is the reverse. Every id is a uuid,
+    so the swap was invisible — the asset looked valid and only the RPC that wanted
+    the other id failed, and it failed by answering `200` with a `null` payload. A
+    finished render was therefore indistinguishable from one that never finished.
+    This is the one that cost the most: it hid a *working* pipeline behind a
+    seven-minute wait, twice, for 14 credits.
+13. **An uploaded image was rejected by the row matcher**, because it required both
+    `detail[4]` and `detail[5]` and an upload has no `detail[5]` — it has no
+    derived variant. So every uploaded asset was invisible, and image-to-video from
+    an upload reported "not in the project listing" for an asset that was in the
+    listing.
 13. **"No video URL yet" was not marked retryable.** The poll only waited on
     `ErrAssetNotListed`; the other half of the same wait — listed, URL not ready —
     was treated as permanent, so a render was abandoned after 10 seconds. Fixing

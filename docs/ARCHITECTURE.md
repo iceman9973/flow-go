@@ -107,16 +107,35 @@ indistinguishable from a render that has not finished:
 
 | RPC | Takes |
 | --- | --- |
-| `as29s` (media detail) | the listing's **media id** (`row[3][4]`) |
-| `SPrCad` (image upscale), `nprQif` / `eb1hJf` conditioning | the **content id** (`row[3][5]`) |
+| `as29s` (media detail) | the **content id** |
+| `SPrCad` (image upscale), `nprQif` / `eb1hJf` conditioning | the **content id** |
 | `/project/<id>/edit/<X>` | the media id |
 | `p0UkFb` (video upscale) | **both** |
 
-This is the defect that cost the most: `ResolveVideoURL` passed the content id to
-`as29s`, so every finished render looked like one that never finished. The poll
-waited its full timeout and gave up, while the video had been downloadable the whole
-time. `README.md` carried the same wrong claim in its id table, which is how the
-code came to be written that way.
+**Which field holds the content id depends on the listing shape**, and this is
+where it went wrong:
+
+| shape | media id | content id |
+| --- | --- | --- |
+| flat — `[content-id, project-id, media-id, type-code, …]` | `row[2]` | `row[0]` |
+| nested — `[media-id, null, null, [title, ts, …, content-id, ?, ts], project]` | `row[0]` | `detail[4]` |
+
+The nested pair was parsed **backwards** — `detail[4]` was labelled the media id and
+`detail[5]` the content id. The upload response is what settles it: it reports
+`media_id` and `content_id` separately, and the content id is the one that lands at
+`detail[4]`.
+
+That single swap produced two failures that both looked like something else:
+
+1. **Every finished render looked like one that never finished.** `ResolveVideoURL`
+   handed `as29s` the wrong uuid; it answered `null`; the poll read that as "not
+   ready" and waited out its full timeout while the video was downloadable the whole
+   time. `README.md` carried the same wrong claim in its id table, which is how the
+   code came to be written that way.
+2. **Every uploaded image was invisible.** The row matcher required both `detail[4]`
+   and `detail[5]`, and an upload has no `detail[5]` — it has no derived variant —
+   so the row was dropped entirely and image-to-video from an upload reported "not
+   in the project listing" for an asset that was in the listing.
 
 
 ## Token lifecycle
@@ -240,12 +259,13 @@ with a regression test where the fix is behavioural.
 | 5 | The worker pool was dead code — `register_worker` / `acquire_worker` / `execute_with_failover` had no production callers | The pool is wired for images, uploads and upscales. The video path does not use it (see Worker pool above), which is a deliberate exception rather than an oversight | `TestExecuteFailover`, `TestFreeTierIsSpentFirst` |
 | 6 | `/stats` reported 1600 credits of test fixtures as live analytics | Statistics aggregate real rows only; credits are `NULL` until observed | `TestEmptyDatabaseReportsZeros`, `TestCreditsAreNotInvented` |
 | 7 | `direct_client.py` was never wired in, so the "reduced browser dependency" claim was false | The browser is out of the generation path entirely | verified live: token minted without a browser |
-| 8 | `as29s` was passed the asset's **content id**; it takes the **media id**. The wrong id is answered with a `null` payload and no error, so every finished render looked like one that never finished | `ResolveVideoURL` passes `row[3][4]`; `MediaDetail`'s parameters are named for where they go | verified live: a render that had "never resolved" downloaded immediately |
-| 9 | `"no video URL … yet (still rendering?)"` was not wrapped as retryable, so the poll treated a still-rendering video as permanently failed and gave up after 10s | `ErrAssetNotReady` + `RetryableResolveError`, which covers both stages of a render | `TestRetryableResolveErrorCoversBothStagesOfARender` |
-| 10 | Every signed-in account was labelled with the first one's email, because the address came from the authuser-blind session endpoint | The address comes from the account-scoped `o30O0e` profile RPC | `TestFindProfileReadsIdentityFromItsTrueShape` |
-| 11 | The selected account index lived in memory only, so every restart reverted to index 0 — which is how a 1-credit account came to look like the only one | The index is written to the `settings` table and restored at construction | `TestSetSettingRoundTripsAndReplaces` |
-| 12 | Nothing checked whether an account could afford a render. The server accepts an uncovered submission and answers with no media, so an empty wallet presented as a broken request | A pre-flight gate refuses with **402** and the arithmetic, downgrades to 360p when that fits, and moves to another signed-in account when one can pay | `TestDecideVideoPlanRefusesWhenNothingFits`, `TestBestAffordableAccountPicksTheRichestThatCanPay` |
-| 13 | `Bootstrap` registered a worker on every account switch and removed none, so the pool accumulated accounts the engine could no longer route to and summed their balances as available | `pool.Retain(accountID)` before registering | `TestRetainDropsThePreviousAccount` |
+| 8 | The nested listing's id pair was parsed backwards, so `as29s` was handed the wrong uuid. A wrong uuid is answered with a `null` payload and no error, so every finished render looked like one that never finished | `ParseProjectAssets` maps the nested shape as `row[0]` = media id, `detail[4]` = content id; `ResolveVideoURL` passes the content id | `TestParseProjectAssetsReadsTheNestedListingShape`; verified live: a render that had "never resolved" downloaded immediately |
+| 9 | An uploaded image was dropped by the row matcher, which required both `detail[4]` and `detail[5]` — and an upload has no `detail[5]`, having no derived variant | `isAssetRow` requires only `detail[4]` for the nested shape | `TestParseProjectAssetsReadsAnUploadedImage` |
+| 10 | `"no video URL … yet (still rendering?)"` was not wrapped as retryable, so the poll treated a still-rendering video as permanently failed and gave up after 10s | `ErrAssetNotReady` + `RetryableResolveError`, which covers both stages of a render | `TestRetryableResolveErrorCoversBothStagesOfARender` |
+| 11 | Every signed-in account was labelled with the first one's email, because the address came from the authuser-blind session endpoint | The address comes from the account-scoped `o30O0e` profile RPC | `TestFindProfileReadsIdentityFromItsTrueShape` |
+| 12 | The selected account index lived in memory only, so every restart reverted to index 0 — which is how a 1-credit account came to look like the only one | The index is written to the `settings` table and restored at construction | `TestSetSettingRoundTripsAndReplaces` |
+| 13 | Nothing checked whether an account could afford a render. The server accepts an uncovered submission and answers with no media, so an empty wallet presented as a broken request | A pre-flight gate refuses with **402** and the arithmetic, downgrades to 360p when that fits, and moves to another signed-in account when one can pay | `TestDecideVideoPlanRefusesWhenNothingFits`, `TestBestAffordableAccountPicksTheRichestThatCanPay` |
+| 14 | `Bootstrap` registered a worker on every account switch and removed none, so the pool accumulated accounts the engine could no longer route to and summed their balances as available | `pool.Retain(accountID)` before registering | `TestRetainDropsThePreviousAccount` |
 
 Defect 7 in the report was stated as "two of five phases produced dead code". Here
 the equivalent claim is load-bearing and verified: the browser participates only
@@ -271,10 +291,18 @@ admitted. The test caught it. The function now returns
 
 ## Verification status
 
-**Video generation works end to end and is verified.** A 4s 720p render submitted
-through `POST /v1/videos/generations` reaches `status: "ready"` in ~42s, resolves
-its signed URL, and downloads a playable MP4 to `output/`. 7 credits, and
-`credits_spent: 7` is recorded from the balance delta.
+**Video generation works end to end and is verified**, for both text-to-video and
+image-to-video:
+
+- 4s 720p text-to-video reaches `status: "ready"` in ~42s, resolves its signed URL
+  and downloads a playable MP4 to `output/`. 7 credits.
+- 4s **360p image-to-video** from an uploaded still does the same in ~194s for
+  **4 credits** — the cheapest render the cost table offers. The conditioning image
+  is uploaded over `maseQ` first and the engine resolves its content id from the
+  listing.
+
+In both cases `credits_spent` is recorded from the balance delta, not from the cost
+table.
 
 That matters for the "open item" this section used to carry, which said the
 generation endpoints should be treated as unverified. The blocker it described —

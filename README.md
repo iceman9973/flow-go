@@ -204,6 +204,17 @@ message, and nothing is sent — the server would otherwise accept it and answer
 no media, which reads as a broken request rather than an empty wallet. The engine
 does **not** substitute a cheaper quality: a caller who wants 360p asks for 360p.
 
+**A request conditioned on an existing asset is never moved.** Projects are
+per-account, so a `start_image` or `end_image` id belongs to the project of the
+account that supplied it; moving the engine to a richer account leaves that id
+pointing at a project the new account cannot see. Measured: an image generated on
+one account was used as the start frame of a request the engine moved to a second
+account to afford, and resolution retried its full window before failing with "not
+in the project listing" for an asset that was in the listing — just not that one. A
+conditioned request that the current account cannot pay for is refused instead. A
+request with no conditioning carries no such id and can be served anywhere, which is
+the case this exists for.
+
 Switching re-bootstraps, because the session, the account row and the project all
 have to move together. Projects are per-account, so the engine opens
 `flow.google.com/u/<n>/` and reads that account's project list rather than reusing a

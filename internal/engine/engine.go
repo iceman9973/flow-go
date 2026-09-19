@@ -1785,6 +1785,26 @@ func describeBalances(rows []AccountCredits) string {
 	return "accounts " + strings.Join(parts, ", ")
 }
 
+// canMoveAccounts reports whether a request may be served by a different
+// signed-in account than the one in use.
+//
+// Moving accounts moves the **project** — they are per-account, which is why
+// switching re-bootstraps — and any asset id the caller supplied is scoped to the
+// project of the account that supplied it. So a request conditioned on an existing
+// asset cannot be moved: the id is not in the new account's project, and the
+// render fails after a long wait spent looking for it.
+//
+// This is not theoretical. An image generated on one account was used as the
+// start frame of a request that the engine then moved to a second account to
+// afford; resolution retried its full window against the wrong project and failed
+// with "not in the project listing" for an asset that was in the listing all
+// along, just not that one.
+//
+// A request with no conditioning carries no such id and can be served anywhere.
+func canMoveAccounts(req BatchVideoRequest) bool {
+	return strings.TrimSpace(req.StartImage) == "" && strings.TrimSpace(req.EndImage) == ""
+}
+
 // GenerateVideoViaBatch submits a video generation over batchexecute.
 func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoRequest) (*BatchVideoOutcome, error) {
 	if !e.Ready() {
@@ -1870,7 +1890,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	// round trip, and minting one for a render the balance cannot cover wastes it
 	// and buries the real reason behind a captcha failure.
 	plan := e.planVideo(ctx, client, req, requestedModel, requestedQuality)
-	if !plan.Affordable() {
+	if !plan.Affordable() && canMoveAccounts(req) {
 		// The account in use cannot pay. Another signed-in account might, and
 		// preferring the one that can is the whole reason for having several — so
 		// look before refusing.

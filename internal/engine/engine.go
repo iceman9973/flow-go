@@ -775,8 +775,16 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 
 	tab, err := e.bridge.EnsureProjectTab(tabCtx, accountIndex)
 	if err != nil {
-		log.Printf("engine: could not determine a Flow project from the browser (%v); "+
-			"falling back to %s", err, config.DefaultProject)
+		// Say what actually happens. This used to claim it was "falling back
+		// to <config.DefaultProject>", and it was not: it returns "" and the
+		// caller does not apply the default, so the engine came up with no
+		// project at all and every generation failed at "no project id
+		// resolved". A log line that describes a fallback which does not happen
+		// sends the reader looking for the wrong problem — which is the same
+		// failure this codebase keeps recording.
+		log.Printf("engine: no Flow project could be determined from the browser (%v). "+
+			"The engine will start with no project, and a generation will fail until one "+
+			"is set: open a project in the browser once, or pass FLOW_PROJECT_ID", err)
 		return ""
 	}
 

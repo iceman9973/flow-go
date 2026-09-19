@@ -1021,27 +1021,32 @@ the two upsamplers, which are a second pass rather than a generation model.
 **Resolution is the `_360p` suffix**, which is why the upscalers are separate keys
 rather than a parameter.
 
-#### Aspect is decided by the model family, not by the quality
+#### Aspect is decided by the model family; `_360p` is only resolution
 
-Measured, from one landscape source image (1376×768):
+Measured, all four on the same account:
 
-| request | model | output |
-|---|---|---|
-| text-to-video, 720p | `abra_t2v_4s` | **1280×720** landscape |
-| image-to-video, 720p | `abra_i2v_4s` | **720×1280** portrait |
-| image-to-video, 360p | `abra_i2v_4s_360p` | **360×640** portrait |
+| request | model | output | |
+|---|---|---|---|
+| text-to-video, 720p | `abra_t2v_4s` | **1280×720** | landscape |
+| text-to-video, 360p | `abra_t2v_4s_360p` | **640×360** | landscape, half |
+| image-to-video, 720p | `abra_i2v_4s` | **720×1280** | portrait |
+| image-to-video, 360p | `abra_i2v_4s_360p` | **360×640** | portrait, half |
 
-So `abra_*` **image-to-video renders portrait whatever the quality and whatever the
-source's shape** — the image conditioning does not carry the aspect across. `_360p`
-is a resolution change on top of that, not the thing causing it. (An earlier reading
-of this table blamed the quality suffix, which was wrong: it compared a 720p
-text-to-video against a 360p image-to-video and attributed the difference to the one
-variable that was not responsible.)
+**The family decides the aspect and the suffix decides the size.** `abra_t2v_*` is
+landscape at both qualities and `abra_i2v_*` is portrait at both, and `_360p` halves
+the pixels either way — it does not rotate anything.
 
-**The catalog says why.** `abra_i2v_*` has no aspect variants at all — only duration
-and `_360p`. There is no `_portrait` and no `_landscape`, so within the family the
-aspect is not selectable, and none of the `abra_*` keys measured renders landscape
-from an image.
+That matters because it is the opposite of what this section said twice. The first
+reading blamed `_360p` for the portrait output after comparing a 720p text-to-video
+against a 360p image-to-video — two variables, and the wrong one was blamed. The
+second reading kept the blame and added a claim that `abra_t2v_4s_360p` never
+renders, which was also wrong: its earlier failures were a stale session and a
+cookie file that was hours out of date, not the model.
+
+**The catalog says why.** Neither family carries an aspect variant — only duration
+and `_360p` — so within `abra_*` the aspect is not selectable, and it follows from
+the conditioning instead: text conditioning renders landscape, image conditioning
+renders portrait, and the source image's own shape does not carry across.
 
 There is no aspect parameter to reach for instead. `BatchVideoRequest` has no
 `Aspect` field, and the composer's 16:9 / 9:16 toggle does not reach the request
@@ -1055,33 +1060,28 @@ path. The only `veo_*` keys the engine does use are the **upsamplers**
 (`veo_3_1_upsampler_1080p` / `_4k`), which are a second pass over a finished render
 rather than a generation model.
 
-#### The cheapest key exists and does not render
+#### `abra_t2v_4s_360p` renders — the earlier failures were not the model
 
-`abra_t2v_4s_360p` is in the catalog — all eight `abra_t2v_*` keys are, `_360p`
-included — and a submission against it is accepted:
+This section previously said the key never renders, on the strength of one 440s
+submission that returned a media id and never produced an asset, plus six older
+attempts that had also failed. That conclusion was wrong. Run again:
 
 ```
 POST /v1/videos/generations  {"duration":4,"quality":"360p"}
   -> model  abra_t2v_4s_360p
-  -> media  1ebf70e2-4530-4b39-9151-1a1d5679d073     ← an id comes back
-  -> 440s of polling, no URL
+  -> status ready, 640x360, 592 KB, 37.8s, 4 credits
 ```
 
-No asset ever appears in the project listing — the newest entry was still from
-before the submission, eight minutes later — so there is nothing to resolve and
-nothing to download. The balance did not move, which reads as the render being
-discarded rather than charged for.
+The failures were environmental: a session that needed refreshing and a cookie file
+that was **eight and a half hours out of date** (`loadJar` read `cookies/cookies.json`
+while the bridge wrote `data/cookies.json`). A render that is accepted and never
+lands is what a dead session looks like from here, and it was recorded as a property
+of the model.
 
-So the key is accepted and the render never happens. **The cheapest video that
-actually renders is 4s at 720p for 7 credits, not 4s at 360p for 4.** The cost
-table is still right about what each pair *costs*; it is the 360p text-to-video key
-that does not produce anything.
-
-This is also why the cost gate refuses rather than downgrading. It used to fall back
-to 360p when the balance would not cover 720p, on the reasoning that a cheaper render
-beats none — which for this key converts a request that would have worked at 720p
-into seven minutes of polling and nothing at all, with no error to explain it. An
-unaffordable request is now refused immediately with the arithmetic.
+So **the cheapest video is 4s at 360p for 4 credits**, and it is a landscape render
+at half the size of 720p. The cost gate refuses rather than downgrading, which is
+still right for a different reason: substituting a quality the caller did not ask
+for is a different render, and it hid a genuine failure behind a plausible one.
 
 Neither the `abra_*` nor the `omni_flash_*` keys — the only families this engine
 selects from — carry an aspect variant. The catalog has a `_portrait` suffix on some

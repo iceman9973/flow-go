@@ -601,21 +601,52 @@ func runCookies(args []string) int {
 	showNames := fs.Bool("names", false, "list cookie names (values are never printed)")
 	_ = fs.Parse(args)
 
-	path := filepath.Join(config.CookieDir(), "cookies.json")
-	jar, err := cookiejar.LoadFile(path)
-	if err != nil {
-		fmt.Printf("  no cookies at %s\n", path)
+	// The same two candidates the engine tries, in the same order, so this
+	// reports the jar a run would actually use. Reading only CookieDir reported
+	// a file the engine never loaded once the bridge started writing its own.
+	candidates := []string{
+		filepath.Join(config.DataDir(), "cookies.json"),
+		filepath.Join(config.CookieDir(), "cookies.json"),
+	}
+
+	var (
+		path string
+		jar  *cookiejar.Jar
+		err  error
+	)
+	for _, candidate := range candidates {
+		jar, err = cookiejar.LoadFile(candidate)
+		if err == nil {
+			path = candidate
+			break
+		}
+	}
+
+	if path == "" {
+		fmt.Printf("  no cookies at %s\n", strings.Join(candidates, " or "))
 		fmt.Println()
 		fmt.Println("  Options:")
-		fmt.Println("    1. Load ../browser-Cdp/extension/ in Chrome and run `flow-go serve`; the extension")
-		fmt.Println("       hands over cookies automatically.")
+		fmt.Println("    1. Load flow-go/flow-go-extension/ in the browser and run `flow-go serve`;")
+		fmt.Println("       the extension hands over cookies automatically.")
 		fmt.Println("    2. POST a cookie dump to /api/sync-cookies.")
-		fmt.Println("    3. Write a JSON array of cookies to that path yourself.")
+		fmt.Println("    3. Write a JSON array of cookies to one of those paths yourself.")
 		return 1
 	}
 
 	fmt.Println()
 	fmt.Printf("  %-24s %s\n", "cookie file", path)
+	if len(candidates) > 1 {
+		// Which of the two was read is the first thing to check when a run
+		// behaves like it is holding an old session.
+		for _, other := range candidates {
+			if other == path {
+				continue
+			}
+			if info, statErr := os.Stat(other); statErr == nil {
+				fmt.Printf("  %-24s %s (not used)\n", "other copy", fmt.Sprintf("%s, %s", other, info.ModTime().Format(time.RFC3339)))
+			}
+		}
+	}
 	fmt.Printf("  %-24s %d\n", "cookies", jar.Count())
 	fmt.Printf("  %-24s %s\n", "has credentials", yesNo(jar.HasAuthCookies()))
 	fmt.Printf("  %-24s %s\n", "jar hash", short(jar.Hash()))

@@ -216,16 +216,60 @@ func adoptRunningSession(ctx context.Context) (projectID, at, fsid string, ok bo
 }
 
 // adoptSessionFor fills in what a running server can supply, leaving anything the
-// caller set explicitly alone.
-func adoptSessionFor(ctx context.Context, common *commonFlags) {
+// caller set explicitly alone. Returns whether a session was adopted, so the caller
+// knows whether it still needs to look for a browser itself.
+func adoptSessionFor(ctx context.Context, common *commonFlags) bool {
 	projectID, at, fsid, ok := adoptRunningSession(ctx)
 	if !ok {
-		return
+		return false
 	}
 	if strings.TrimSpace(common.projectID) == "" {
 		common.projectID = projectID
 	}
 	common.at, common.fsid = at, fsid
+	return true
+}
+
+// bridgeAttachWindow bounds how long this process waits to become the bridge host.
+//
+// The extension reconnects on its own schedule — immediately after a disconnect,
+// and on a 30-second alarm — so a process that starts listening cannot know how
+// long it will be until one of those fires. Five seconds catches the common case
+// and does not turn every browserless run into a wait.
+const bridgeAttachWindow = 5 * time.Second
+
+// attachBridge makes this process the bridge host, when it can be.
+//
+// This is the other half of not needing a browser to have a session: the port
+// admits exactly one host, so if a server already has it the listen fails and the
+// caller falls back to taking that server's session. If the port is free, the
+// extension connects here instead and the engine reads cookies from the live page
+// rather than from a snapshot — which is the same thing the server does, and the
+// only version of this that does not decay.
+//
+// Best-effort and bounded: the extension may simply not be loaded, and the
+// persisted copy is still there when it is not.
+func attachBridge(ctx context.Context, a *app.App) bool {
+	go func() {
+		if err := a.Bridge.Listen(ctx); err != nil {
+			// Expected whenever a server owns the port; the caller falls back.
+			fmt.Printf("  bridge           not started (%v)\n", err)
+		}
+	}()
+
+	deadline := time.Now().Add(bridgeAttachWindow)
+	for time.Now().Before(deadline) {
+		if a.Bridge.Connected() {
+			fmt.Printf("  bridge           extension attached, cookies read live\n")
+			return true
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return false
 }
 
 /* ------------------------------------------------------------------ *
@@ -299,7 +343,7 @@ func runGenerate(args []string) int {
 
 	// Seed from a running server before building, because the engine reads its
 	// cookies and page tokens at construction.
-	adoptSessionFor(context.Background(), &common)
+	adopted := adoptSessionFor(context.Background(), &common)
 
 	a, err := common.build()
 	if err != nil {
@@ -309,6 +353,13 @@ func runGenerate(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// No server to take a session from, so try to be the bridge host ourselves —
+	// that is how a run with no server still gets cookies from the browser
+	// instead of from a snapshot.
+	if !adopted {
+		attachBridge(ctx, a)
+	}
 
 	if err := bootstrap(ctx, a); err != nil {
 		return fail(err)
@@ -391,7 +442,7 @@ func runImage(args []string) int {
 
 	// Seed from a running server before building, because the engine reads its
 	// cookies and page tokens at construction.
-	adoptSessionFor(context.Background(), &common)
+	adopted := adoptSessionFor(context.Background(), &common)
 
 	a, err := common.build()
 	if err != nil {
@@ -401,6 +452,11 @@ func runImage(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// No server to take a session from, so try to be the bridge host ourselves.
+	if !adopted {
+		attachBridge(ctx, a)
+	}
 
 	if err := bootstrap(ctx, a); err != nil {
 		return fail(err)

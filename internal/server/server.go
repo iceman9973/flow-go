@@ -159,7 +159,14 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			return c.Status(400).JSON(fiber.Map{"error": "expression is required"})
 		}
 
-		client := br.Current()
+		// pickClient, not Current(): `cdp.evaluate` is the generic extension's
+		// operation and the Flow one does not implement it. Current() is the Flow
+		// extension whenever both are attached — which is the normal setup — so
+		// this route answered "Unknown operation: cdp.evaluate" for the one
+		// extension it exists to drive, and ignored `?addr=`. The generic
+		// extension is the monitoring and debugging surface and the narrow one is
+		// for the engine's own work; neither can stand in for the other.
+		client := pickClient(c)
 		if client == nil || !client.Connected() {
 			return c.Status(503).JSON(fiber.Map{"error": "no extension connected"})
 		}
@@ -194,7 +201,12 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			req.Limit = 500
 		}
 
-		client := br.Current()
+		// pickClient, for the same reason as /v1/bridge/eval: CDP events come
+		// from the generic extension, and Current() is the Flow one whenever both
+		// are attached. Reading events off the narrow extension returns its own
+		// (deliberately empty) buffer, so this looked like "the page made no
+		// requests" rather than "the wrong extension was asked".
+		client := pickClient(c)
 		if client == nil || !client.Connected() {
 			return c.Status(503).JSON(fiber.Map{"error": "no extension connected"})
 		}

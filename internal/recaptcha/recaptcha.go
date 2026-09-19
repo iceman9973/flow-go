@@ -23,6 +23,7 @@ package recaptcha
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -53,16 +54,27 @@ const DefaultSiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
 
 // Enterprise endpoints and the origin the token is scoped to.
 const (
-	recaptchaBase   = "https://www.google.com/recaptcha/enterprise"
-	recaptchaOrigin = "https://labs.google"
-	// recaptchaCO is the base64-encoded origin ("https://labs.google:443") the
-	// widget expects. The trailing dot is part of the value, not a typo.
-	recaptchaCO = "aHR0cHM6Ly9sYWJzLmdvb2dsZTo0NDM."
+	recaptchaBase = "https://www.google.com/recaptcha/enterprise"
+	// recaptchaOrigin is the site the widget is embedded in. The token is scoped
+	// to it, so a wrong value is a mismatch the assessment can see.
+	//
+	// This said "https://labs.google" and the app has since moved to
+	// flow.google.com — the same move that retired the legacy REST surface. The
+	// stale value survived because nothing here compared it against where the
+	// requests actually go.
+	recaptchaOrigin = "https://flow.google.com"
 	// recaptchaUA is pinned to a real Chrome build. The widget scores the request
 	// fingerprint, so a generic UA measurably lowers the score.
 	recaptchaUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+// recaptchaCO is the base64-encoded origin the widget expects, derived from
+// recaptchaOrigin so the two cannot drift apart again.
+//
+// The trailing dot is part of the observed value rather than a typo, and is kept
+// because it was captured that way.
+var recaptchaCO = base64.RawURLEncoding.EncodeToString([]byte(recaptchaOrigin+":443")) + "."
 
 // minTokenLength is what a real Enterprise token looks like. Anything shorter is
 // a placeholder or a failure page, and submitting one is worse than submitting
@@ -121,10 +133,11 @@ func (EmptyProvider) Name() string { return "empty" }
 
 // HTTPProvider speaks the reCAPTCHA Enterprise anchor/reload protocol directly.
 type HTTPProvider struct {
-	hc       *httpx.Client
-	siteKey  string
-	origin   string
-	cacheTTL time.Duration
+	hc        *httpx.Client
+	siteKey   string
+	origin    string
+	userAgent string
+	cacheTTL  time.Duration
 
 	mu     sync.Mutex
 	token  string
@@ -146,6 +159,10 @@ func NewHTTP(hc *httpx.Client, siteKey, origin string) *HTTPProvider {
 		hc:      hc,
 		siteKey: siteKey,
 		origin:  origin,
+		// The pinned default, replaced by WithUserAgent when the caller knows the
+		// real client — which a process with a browser, or one that took a
+		// fingerprint from a process that had one, always does.
+		userAgent: recaptchaUA,
 		// Enterprise tokens are short-lived; two minutes is comfortably inside
 		// their validity window and still removes the per-call round trip when a
 		// batch is submitted.
@@ -155,6 +172,20 @@ func NewHTTP(hc *httpx.Client, siteKey, origin string) *HTTPProvider {
 
 // Name identifies the provider in logs.
 func (p *HTTPProvider) Name() string { return "http" }
+
+// WithUserAgent sets the client this provider claims to be.
+//
+// The widget scores the client that asks for a token, and the token is then
+// checked against the client that spends it — so a provider that declares one
+// machine and hands the token to a process presenting another is a mismatch the
+// assessment can see. An empty value leaves the pinned default in place, which is
+// what a caller with no browser to read from has to accept.
+func (p *HTTPProvider) WithUserAgent(userAgent string) *HTTPProvider {
+	if strings.TrimSpace(userAgent) != "" {
+		p.userAgent = userAgent
+	}
+	return p
+}
 
 // Token returns a token, using a short-lived cache.
 func (p *HTTPProvider) Token(ctx context.Context, action string) (string, error) {
@@ -203,7 +234,7 @@ func (p *HTTPProvider) fetch(ctx context.Context, action string) (string, error)
 		Method: "GET",
 		URL:    anchorURL,
 		Headers: map[string]string{
-			"User-Agent":      recaptchaUA,
+			"User-Agent":      p.userAgent,
 			"Accept-Language": "en-US,en;q=0.9",
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Referer":         p.origin + "/",
@@ -245,7 +276,7 @@ func (p *HTTPProvider) fetch(ctx context.Context, action string) (string, error)
 		URL:    reloadURL,
 		Body:   []byte(form.Encode()),
 		Headers: map[string]string{
-			"User-Agent":      recaptchaUA,
+			"User-Agent":      p.userAgent,
 			"Accept-Language": "en-US,en;q=0.9",
 			"Content-Type":    "application/x-www-form-urlencoded",
 			"Accept":          "*/*",
@@ -282,7 +313,7 @@ func (p *HTTPProvider) releaseVersion(ctx context.Context) (string, error) {
 		Method: "GET",
 		URL:    recaptchaBase + ".js?render=" + p.siteKey,
 		Headers: map[string]string{
-			"User-Agent":      recaptchaUA,
+			"User-Agent":      p.userAgent,
 			"Accept-Language": "en-US,en;q=0.9",
 			"Accept":          "*/*",
 			"Referer":         p.origin + "/",
@@ -571,15 +602,15 @@ func (p *FlowProvider) Token(ctx context.Context, action string) (string, error)
 //
 // current resolves the attached extension at call time. It may be nil, and a
 // provider built from it fails cleanly rather than minting nothing.
-func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client) Provider {
+func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client, userAgent string) Provider {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "off", "none", "empty":
 		return EmptyProvider{}
 	case "http":
-		return NewChain(NewHTTP(hc, "", ""), EmptyProvider{})
+		return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 	case "broker":
 		if broker == nil {
-			return NewChain(NewHTTP(hc, "", ""), EmptyProvider{})
+			return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 		}
 		return NewChain(NewBroker(broker, "", pageURL), EmptyProvider{})
 	default: // "auto"
@@ -593,7 +624,7 @@ func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLRes
 		if broker != nil {
 			providers = append(providers, NewBroker(broker, "", pageURL))
 		}
-		providers = append(providers, NewHTTP(hc, "", ""), EmptyProvider{})
+		providers = append(providers, NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 		return NewChain(providers...)
 	}
 }

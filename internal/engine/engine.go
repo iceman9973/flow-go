@@ -826,15 +826,22 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 		}
 	}
 
+	// Read the browser identity first, because two things below depend on it:
+	// the captcha provider presents it when it mints a token, and every call
+	// this engine makes has to present the same identity as the token's.
+	browserFP := e.browserFingerprint(ctx)
+
 	// The resolver, not a resolved client: whichever extension is attached can
 	// change after this point, and a provider holding a captured client reports
 	// "no connection" while a perfectly good one is attached.
-	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(), e.captchaPageURL, e.bridge.Current)
-
-	// Read the browser identity before resolving the project, because the
-	// project listing goes out over the transport and every call this engine
-	// makes has to present the same identity.
-	browserFP := e.browserFingerprint(ctx)
+	//
+	// The user agent goes in because the widget scores the client that asks for a
+	// token, and a token minted under one client and spent under another is the
+	// mismatch this engine's own notes warn about. It was pinned to a Windows
+	// build while the browser here is macOS, so the HTTP provider declared a
+	// different machine than the one the generation call came from.
+	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(),
+		e.captchaPageURL, e.bridge.Current, userAgentOf(browserFP))
 
 	// Prefer the account's own project list over navigating a browser to read an
 	// editor URL: both are live, and only one of them drives a tab. The browser
@@ -1003,6 +1010,14 @@ func chooseProjectID(explicit, configured string, askRPC, askBrowser func() stri
 		}
 	}
 	return "", projectSourceNone
+}
+
+// userAgentOf reads the user agent out of a fingerprint that may be nil.
+func userAgentOf(fp *flowapi.BrowserFingerprint) string {
+	if fp == nil {
+		return ""
+	}
+	return fp.UserAgent
 }
 
 // projectFromRPC reads the account's project list over the transport and returns

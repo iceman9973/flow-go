@@ -45,10 +45,27 @@ const EndpointPath = "/_/AiSandboxAngularFrontend/data/batchexecute"
 // Origin is the host the RPC is served from and bound to.
 const Origin = "https://flow.google.com"
 
-// RPCIDProjectList is the one RPC id observed in the app's own traffic. It is
-// kept as a named constant because it is the only confirmed id, and it makes a
-// useful smoke test for the transport.
-const RPCIDProjectList = "WuwhI"
+// RPCIDProjectList returns the account's projects.
+//
+// This was recorded as `WuwhI` for a long time, and that was wrong: `WuwhI` is
+// the generation-status RPC and answers `null` or `[]` to everything else,
+// including this RPC's own payload. The mistake cost the feature — with the id
+// believed known, the absence of a project listing read as "the API cannot list
+// projects" and the browser tab stayed the only way to learn a project id.
+//
+// The real id answers with one row per project:
+//
+//	[["<project-id>",
+//	  ["12 Jul, 18:11", null, [<unix-sec>, <nsec>], "<thumbnail-url>", "<asset-id>"]],
+//	 ["<project-id>", ["11 Jul, 11:38", null, [<unix-sec>, <nsec>]]]]
+//
+// A project with no assets carries only the first three detail slots, which is
+// why the thumbnail and the trailing id are optional in Project.
+//
+// Note the argument's `projects/*` — the listing is expressed as a resource
+// pattern, not as a call about a project. That is also why it needs no project
+// context and works before one is known.
+const RPCIDProjectList = "UpteDb"
 
 // RPC ids discovered by capturing the Flow app's own page-load traffic and
 // replaying each one. Every entry below was verified to return HTTP 200 with real
@@ -319,6 +336,7 @@ var KnownRPCs = []struct {
 	Payload string
 }{
 	{RPCIDProfile, "signed-in user profile", `[["me"],[[["person.photo","person.name","person.email"]],null,[1,7]]]`},
+	{RPCIDProjectList, "the account's projects", `["projects/*",21,null,null,null,null,[1]]`},
 	{RPCIDGenerate, "SUBMIT A GENERATION (needs a session-context blob)", `<see RPCIDGenerate doc comment>`},
 	{RPCIDGenerationStatus, "generation status / telemetry", `[[["MEDIA_GENERATION",["<uuid>",[<sec>,<ns>],null,<env flags>]]]]`},
 	{RPCIDModelCatalog, "model catalog", `[]`},
@@ -1303,6 +1321,166 @@ func (c *Client) Credits(ctx context.Context, opts CallOptions) (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("batchexecute: the credits response carried no numeric balance")
+}
+
+// Project is one entry in the account's project list.
+//
+// Tagged snake_case because it is serialised straight out by the HTTP API, and
+// the rest of that surface is snake_case.
+type Project struct {
+	// ID is the project id — the same value the app puts in an editor URL, and
+	// the same one every generation call carries in its context block.
+	ID string `json:"id"`
+	// Modified is when the listing says the project last changed. Zero when the
+	// listing gave no timestamp, which it may not.
+	Modified time.Time `json:"modified"`
+	// Thumbnail is the project's poster. Empty for a project with no assets,
+	// which is how a fresh project looks.
+	Thumbnail string `json:"thumbnail,omitempty"`
+	// LastAssetID is the id the listing carries after the poster. Empty
+	// alongside an empty Thumbnail.
+	LastAssetID string `json:"last_asset_id,omitempty"`
+}
+
+// projectListArg is the argument for RPCIDProjectList, measured from a live call.
+//
+// `projects/*` is the resource pattern that selects the listing. The `21` was
+// constant across captures and is presumably a page size or a resource type; the
+// trailing [1] is a flag whose meaning is not established, and is carried
+// verbatim because dropping it was not tried and this call works.
+var projectListArg = []any{"projects/*", 21, nil, nil, nil, nil, []any{1}}
+
+// ProjectList returns the projects belonging to the account this client acts as.
+//
+// This is how a project id is learned without a browser. Before it, the only
+// route was to open an editor tab and read the id off the URL — there is still
+// no project-*create* RPC, but the listing means a run no longer has to navigate
+// anywhere to find out where it is.
+//
+// Ordering is the server's, which is most-recently-modified first; the caller
+// that wants "the project to use" can take the first entry rather than sorting.
+func (c *Client) ProjectList(ctx context.Context, opts CallOptions) ([]Project, error) {
+	frames, err := c.CallWith(ctx, RPCIDProjectList, projectListArg, opts)
+	if err != nil {
+		return nil, err
+	}
+	for _, frame := range frames {
+		var payload any
+		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+			continue
+		}
+		if projects := parseProjectList(payload); len(projects) > 0 {
+			return projects, nil
+		}
+	}
+	return nil, nil
+}
+
+// parseProjectList pulls the rows out of the listing response.
+//
+// The response is a list of `[id, detail]` pairs nested one level deep, and an
+// account with no projects answers with an empty list rather than an error — so
+// a caller must treat "no rows" as a valid answer and not as a failure.
+//
+// Rows are selected by shape rather than by position: the id is a uuid and the
+// detail is the array beside it. A row that does not look like that is skipped,
+// which is what keeps a wrapper or a count row from being reported as a project.
+func parseProjectList(payload any) []Project {
+	var projects []Project
+	for _, row := range asRows(payload) {
+		id := stringAt(row, 0)
+		if !looksLikeUUID(id) {
+			continue
+		}
+		project := Project{ID: id}
+		if detail, ok := row[1].([]any); ok {
+			project.Modified = timestampAt(detail, 2)
+			for _, entry := range detail {
+				s, ok := entry.(string)
+				if !ok {
+					continue
+				}
+				switch {
+				case project.Thumbnail == "" && strings.Contains(s, "googleusercontent.com"):
+					project.Thumbnail = s
+				case looksLikeUUID(s):
+					project.LastAssetID = s
+				}
+			}
+		}
+		projects = append(projects, project)
+	}
+	return projects
+}
+
+// asRows flattens the one array level the listing wraps its rows in, tolerating
+// the rows sitting directly at the top level as well.
+func asRows(payload any) [][]any {
+	top, ok := payload.([]any)
+	if !ok {
+		return nil
+	}
+	var rows [][]any
+	for _, entry := range top {
+		row, ok := entry.([]any)
+		if !ok {
+			continue
+		}
+		// A row is a pair whose first element is a string. Anything else is
+		// another wrapper, so descend one level and take its rows. The length
+		// check is not decoration: an account with no projects answers with an
+		// empty inner array, and indexing row[0] on it panics.
+		if len(row) > 0 {
+			if _, isRow := row[0].(string); isRow {
+				rows = append(rows, row)
+				continue
+			}
+		}
+		rows = append(rows, asRows(entry)...)
+	}
+	return rows
+}
+
+// timestampAt reads the `[<unix-seconds>, <nanoseconds>]` pair the listing uses
+// for timestamps, returning the zero time when it is absent or malformed.
+func timestampAt(row []any, i int) time.Time {
+	if i < 0 || i >= len(row) {
+		return time.Time{}
+	}
+	pair, ok := row[i].([]any)
+	if !ok || len(pair) < 2 {
+		return time.Time{}
+	}
+	seconds, okSec := pair[0].(float64)
+	nanos, okNanos := pair[1].(float64)
+	if !okSec || !okNanos || seconds <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(seconds), int64(nanos))
+}
+
+// looksLikeUUID reports whether a string has the 8-4-4-4-12 shape. It is used to
+// pick ids out of a mixed array, so it is deliberately a shape test and not a
+// parse: the ids here are not always well-formed and rejecting one would drop a
+// project.
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Profile is the identity of the account a client is acting as.

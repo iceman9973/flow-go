@@ -654,6 +654,29 @@ func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) 
 	return snapshot, nil
 }
 
+// ListProjects returns the projects belonging to the account the engine acts as.
+//
+// This is the browser-free route to a project id. It goes out over the same
+// transport every generation uses, so it needs cookies and nothing else — no
+// tab, no navigation, no editor URL to read.
+//
+// Ordered by the server, most recently modified first, which makes the first
+// entry the project the account was last working in.
+func (e *Engine) ListProjects(ctx context.Context) ([]batchexecute.Project, error) {
+	jar := e.bridge.Jar()
+	if jar == nil {
+		return nil, fmt.Errorf("engine: no cookies loaded")
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	client := e.newBatchexecuteClient(jar, e.hc)
+	client.SetAuthUser(e.AccountIndex())
+
+	return client.ProjectList(callCtx, batchexecute.CallOptions{SourcePath: "/"})
+}
+
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
 func (e *Engine) CaptchaToken(ctx context.Context, action string) (string, error) {
 	e.mu.RLock()
@@ -726,19 +749,20 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// "no connection" while a perfectly good one is attached.
 	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(), e.captchaPageURL, e.bridge.Current)
 
-	// Prefer the project the browser is actually sitting on over any configured
-	// default, which is a guess and can be stale. Asking the bridge to open the
-	// editor also primes the tab the reCAPTCHA broker needs, so this does double
-	// duty — but it is only worth doing when the caller did not already say.
+	// Read the browser identity before resolving the project, because the
+	// project listing goes out over the transport and every call this engine
+	// makes has to present the same identity.
+	browserFP := e.browserFingerprint(ctx)
+
+	// Prefer the account's own project list over navigating a browser to read an
+	// editor URL: both are live, and only one of them drives a tab. The browser
+	// remains the fallback for when the listing is rejected.
 	projectID, projectSource := chooseProjectID(e.opts.ProjectID, e.opts.DefaultProjectID,
+		func() string { return e.projectFromRPC(ctx, jar, index) },
 		func() string { return e.projectFromBrowser(ctx, index) })
 	if projectSource == projectSourceConfigured {
-		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); the browser was not asked", projectID)
+		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); no source was consulted", projectID)
 	}
-
-	// Read the browser identity once and keep it: the flowapi client and every
-	// batchexecute client built later both have to present the same one.
-	browserFP := e.browserFingerprint(ctx)
 
 	// The page's anti-CSRF token, read once for the same reason: every
 	// batchexecute client has to open with the same first request the browser
@@ -849,36 +873,47 @@ func (e *Engine) setError(err error) {
 const (
 	projectSourceExplicit   = "explicit"
 	projectSourceConfigured = "configured"
+	projectSourceRPC        = "rpc"
 	projectSourceBrowser    = "browser"
 	projectSourceNone       = "none"
 )
 
 // chooseProjectID picks the Flow project a boot runs against.
 //
-// Three sources, and the ranking is deliberate:
+// Four sources, and the ranking is deliberate:
 //
 //	explicit   — the caller named it. Outranks everything.
-//	configured — FLOW_PROJECT_ID. Also an instruction, and the reason this
-//	             function takes a callback: when one is set, the browser is
-//	             never asked, so a run does not have to open an editor tab just
-//	             to find out where it is. That navigation is the whole cost of
-//	             not knowing.
-//	browser    — the live page. The only source that cannot be stale, which is
-//	             why it is preferred over nothing, but it is discovery, not an
-//	             instruction, so it does not outrank a deliberate setting.
+//	configured — FLOW_PROJECT_ID. Also an instruction, which is why a set value
+//	             stops the search: neither callback runs.
+//	rpc        — the account's project list over the transport. Live truth, and
+//	             it costs an HTTP call rather than a tab navigation.
+//	browser    — the open editor's URL. Also live truth, but it is the only
+//	             source that has to drive a browser to answer.
 //
-// askBrowser is called at most once, and only when nothing was configured. It is
-// a callback rather than a value because asking has side effects — it opens a
-// tab — and those should not happen when the answer is already known.
+// The rpc source sits above the browser because the two are equally current and
+// only one of them navigates. The browser stays as the last resort rather than
+// being deleted: it is the only source that reports where the *user* is rather
+// than where the account has been, and it still works when the listing call is
+// rejected.
+//
+// askRPC and askBrowser are callbacks rather than values because both have side
+// effects — an HTTP call and a tab navigation — and neither should happen when
+// the answer is already known. askRPC runs first and askBrowser only if it comes
+// back empty.
 //
 // A project id that is wrong fails visibly rather than silently: a project
 // belongs to one signed-in account, so another account's id does not open.
-func chooseProjectID(explicit, configured string, askBrowser func() string) (id, source string) {
+func chooseProjectID(explicit, configured string, askRPC, askBrowser func() string) (id, source string) {
 	if explicit != "" {
 		return explicit, projectSourceExplicit
 	}
 	if configured != "" {
 		return configured, projectSourceConfigured
+	}
+	if askRPC != nil {
+		if id := askRPC(); id != "" {
+			return id, projectSourceRPC
+		}
 	}
 	if askBrowser != nil {
 		if id := askBrowser(); id != "" {
@@ -886,6 +921,44 @@ func chooseProjectID(explicit, configured string, askBrowser func() string) (id,
 		}
 	}
 	return "", projectSourceNone
+}
+
+// projectFromRPC reads the account's project list over the transport and returns
+// its most recent entry.
+//
+// Returns "" rather than an error when the listing fails or the account has no
+// projects, because this is one of several sources and a caller that has to
+// distinguish "failed" from "empty" would only re-report both as "try the next
+// one".
+func (e *Engine) projectFromRPC(ctx context.Context, jar *cookiejar.Jar, index int) string {
+	if jar == nil {
+		return ""
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	client := e.newBatchexecuteClient(jar, e.hc)
+	client.SetAuthUser(index)
+
+	projects, err := client.ProjectList(callCtx, batchexecute.CallOptions{
+		SourcePath: "/",
+	})
+	if err != nil {
+		log.Printf("engine: could not list projects over the transport (%v); trying the browser", err)
+		return ""
+	}
+	if len(projects) == 0 {
+		log.Printf("engine: the project listing is empty for this account")
+		return ""
+	}
+
+	// The listing is most-recently-modified first, so the first row is the
+	// project the account was last working in — the same one an editor tab would
+	// have been showing.
+	log.Printf("engine: %d project(s) listed over the transport; taking %s (modified %s)",
+		len(projects), projects[0].ID, projects[0].Modified.Format(time.RFC3339))
+	return projects[0].ID
 }
 
 // projectFromBrowser asks the extension to open a Flow project editor and reads

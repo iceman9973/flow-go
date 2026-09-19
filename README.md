@@ -134,6 +134,7 @@ popup has no editor by design, so clear `browserCdp.config` from
 | GET | `/v1/media` | Recent generated media |
 | GET | `/v1/accounts` | Tracked accounts |
 | GET | `/v1/accounts/credits` | Email, name and balance of every signed-in account (`?max=N`, default 4) |
+| GET | `/v1/projects` | The account's Flow projects, over the transport. `most_recent` is what a run picks when none is named |
 | GET | `/v1/accounts/affordable` | Which signed-in account would pay for a job (`?cost=N`) — read-only |
 | POST | `/v1/accounts/switch` | Act as another signed-in account (`{"index": N}`), and remember it |
 | POST | `/api/sync-cookies` | Push a cookie dump directly (extension fallback) |
@@ -455,6 +456,7 @@ flow-go serve                          # API + extension bridge
 flow-go generate --prompt "..." --duration 8 --quality 720p
 flow-go generate --prompt "..." --start-image photo.jpg   # image-to-video
 flow-go image --prompt "..." --model narwhal
+flow-go projects                       # the account's projects, over the transport
 flow-go stats                          # database statistics
 flow-go export stats.json              # full JSON export
 flow-go cookies                        # cookie and credential status
@@ -560,7 +562,7 @@ The settings that matter most:
 | `WS_PORT` / `HTTP_PORT` | Environment variables. Extension bridge and API ports. |
 | `ACCOUNT_INDEX` | Environment variable. Seeds which signed-in account to act as. Only a seed — once `/v1/accounts/switch` has been used, the stored index wins, so a deliberate choice survives a restart. |
 | `ACCOUNT_SCAN_LIMIT` | Environment variable, default 6. How many account indices are examined when looking for one that can pay. Chrome permits ten, but the scan costs a session, a profile and a balance read per index and runs on the request path. |
-| `FLOW_PROJECT_ID` | Environment variable. The project to generate into. Setting it stops the engine navigating a tab to discover one. Ranking: `--project-id`, then this, then the live page. |
+| `FLOW_PROJECT_ID` | Environment variable. The project to generate into. Setting it stops every search, including the listing call. Ranking: `--project-id`, then this, then `RPCIDProjectList`, then the open editor's URL. |
 | `FLOW_ACCESS_TOKEN` | Environment variable. Supply a bearer token directly, bypassing cookie minting. |
 | `FLOW_SESSION_REBUILD` | Environment variable. `off` disables the pure-Go session rebuild, leaving the raw upstream error visible. |
 
@@ -579,7 +581,6 @@ a cookie jar:
 | What | Why it cannot come from the API |
 | --- | --- |
 | reCAPTCHA token | The widget is rendered in the page. `flow.captcha` asks the page to run `grecaptcha.enterprise.execute`, which scores better than the HTTP provider |
-| Project id | There is no project-create RPC. The id is read off an open editor's URL |
 | `at` and `f.sid` | The anti-CSRF token and session id the app puts on every request. Page-only |
 | Current cookies | `__Secure-1PSIDTS` rotates on Google's schedule; the page always holds the live pair |
 
@@ -587,17 +588,48 @@ That is the whole reason a tab opens. It is also why "why does it need a browser
 if it calls an API" is the wrong question — the API call is the work, and the
 browser is what proves the call is allowed.
 
-**Two of the four are avoidable.** The project id can be configured
-(`FLOW_PROJECT_ID`, or `--project-id`), which removes the navigation that exists
-only to learn it. `at` and `f.sid` are already optional — without them the client
-primes for a token itself. Cookies and the reCAPTCHA token are not avoidable;
-they are the credentials.
+**Three of the four are now avoidable.** The project id used to be on this list,
+on the belief that no RPC could list projects. That belief was wrong and it was
+expensive: the id believed to be the listing (`WuwhI`) is the generation-status
+RPC, and it answers `null` to everything else. The real one is `UpteDb`, takes
+`["projects/*", 21, …]`, and returns the account's projects with timestamps —
+over the transport, with no tab involved. See "Where a project id comes from".
 
-Note that configuring a project does **not** stop the pre-submit navigation. That
-one is separate: `ensureProjectTab` runs before every generation so the reCAPTCHA
-widget has a page to render in, and it is the same call that makes the tab the
-broker needs. It navigates the tab already attached rather than opening a new
-one, so repeated switches do not accumulate tabs.
+`at` and `f.sid` are already optional — without them the client primes for a
+token itself. Cookies and the reCAPTCHA token are not avoidable; they are the
+credentials.
+
+Note that configuring or listing a project does **not** stop the pre-submit
+navigation. That one is separate: `ensureProjectTab` runs before every generation
+so the reCAPTCHA widget has a page to render in. It navigates the tab already
+attached rather than opening a new one, so repeated switches do not accumulate
+tabs.
+
+### Where a project id comes from
+
+Four sources, ranked. The first two are instructions; the last two are searches,
+and only one of those drives a browser.
+
+| Rank | Source | Costs |
+| --- | --- | --- |
+| 1 | `--project-id` | nothing |
+| 2 | `FLOW_PROJECT_ID` | nothing |
+| 3 | `RPCIDProjectList` (`UpteDb`) | one HTTP call |
+| 4 | the open editor's URL | a tab navigation |
+
+The listing is preferred over the browser because both are equally current and
+only one of them navigates. The browser is kept as the last resort rather than
+deleted: it is the only source that reports where the *user* is rather than where
+the account has been, and it still answers when the listing call is rejected.
+
+```
+engine: 2 project(s) listed over the transport; taking e5d6409a-… (modified 2026-07-12T18:11:04+05:30)
+```
+
+Rows are selected by shape rather than by offset, and a project with no assets
+carries no poster — which is why `Thumbnail` and `LastAssetID` are optional. An
+account with no projects answers with an empty list, not an error; that case
+panicked the parser once, so it is tested.
 
 ### Token caching
 

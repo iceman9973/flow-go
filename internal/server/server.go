@@ -1290,6 +1290,25 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 		return c.JSON(fiber.Map{"accounts": accounts})
 	})
 
+	// The account's projects, over the transport. This is the browser-free route
+	// to a project id: it needs cookies and nothing else.
+	app.Get("/v1/projects", func(c fiber.Ctx) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+
+		projects, err := eng.ListProjects(ctx)
+		if err != nil {
+			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"projects": projects,
+			"count":    len(projects),
+			// The listing is most-recently-modified first, so this is the
+			// project a run would pick when it has not been told one.
+			"most_recent": firstProjectID(projects),
+		})
+	})
+
 	// Switch which signed-in Google account the engine acts as.
 	//
 	// A browser can hold several accounts at once and they share one cookie jar,
@@ -1917,6 +1936,15 @@ func replacePlaceholder(value any, placeholder, with string) any {
 
 // statusFor maps an engine error onto an HTTP status. A not-ready engine is a
 // 503 rather than a 500: the caller should retry once the browser has synced.
+// firstProjectID names the project a run would pick from a listing, or "" when
+// the account has none.
+func firstProjectID(projects []batchexecute.Project) string {
+	if len(projects) == 0 {
+		return ""
+	}
+	return projects[0].ID
+}
+
 func statusFor(err error) int {
 	if err == nil {
 		return 200

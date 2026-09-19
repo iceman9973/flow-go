@@ -196,8 +196,19 @@ func TestEndpointConstants(t *testing.T) {
 	if Origin != "https://flow.google.com" {
 		t.Errorf("Origin changed: %s", Origin)
 	}
-	if RPCIDProjectList != "WuwhI" {
+	if RPCIDProjectList != "UpteDb" {
 		t.Errorf("RPCIDProjectList changed: %s", RPCIDProjectList)
+	}
+	// The project listing was recorded as WuwhI for a long time and that was
+	// wrong — WuwhI is the generation-status RPC and answers null to the
+	// listing's own payload. Pinning it separately keeps the two from being
+	// confused again, since they are one character apart in intent and nothing
+	// else in the code would notice a swap.
+	if RPCIDGenerationStatus != "WuwhI" {
+		t.Errorf("RPCIDGenerationStatus changed: %s", RPCIDGenerationStatus)
+	}
+	if RPCIDProjectList == RPCIDGenerationStatus {
+		t.Error("the project listing and the generation-status RPC share an id again")
 	}
 }
 

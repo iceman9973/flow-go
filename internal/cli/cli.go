@@ -43,6 +43,8 @@ func Run(args []string) int {
 		return runGenerate(args[1:])
 	case "image":
 		return runImage(args[1:])
+	case "projects":
+		return runProjects(args[1:])
 	case "stats":
 		return runStats(args[1:])
 	case "export":
@@ -79,6 +81,7 @@ COMMANDS
   serve                 Start the HTTP API and the Flow Go Bridge extension bridge
   generate              Generate a video
   image                 Generate an image
+  projects              List the account's Flow projects
   stats                 Print database statistics
   export [file]         Export statistics as JSON
   cookies               Show cookie and credential status
@@ -481,6 +484,79 @@ func bootstrap(ctx context.Context, a *app.App) error {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	return a.Engine.Bootstrap(ctx)
+}
+
+/* ------------------------------------------------------------------ *
+ * projects
+ * ------------------------------------------------------------------ */
+
+// runProjects lists the account's Flow projects over the transport.
+//
+// This is the browser-free way to a project id: no tab is opened and no editor
+// URL is read. It is also how a project id is obtained for FLOW_PROJECT_ID when
+// the browser is not running.
+func runProjects(args []string) int {
+	fs := flag.NewFlagSet("projects", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	asJSON := fs.Bool("json", false, "print raw JSON")
+	_ = fs.Parse(args)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	adopted := adoptSessionFor(ctx, &common)
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	if !adopted {
+		attachBridge(ctx, a)
+	}
+
+	if err := bootstrap(ctx, a); err != nil {
+		return fail(err)
+	}
+
+	projects, err := a.Engine.ListProjects(ctx)
+	if err != nil {
+		return fail(err)
+	}
+
+	if *asJSON {
+		printJSON(projects)
+		return 0
+	}
+
+	fmt.Println()
+	fmt.Println("  flow-go — projects")
+	fmt.Println("  " + strings.Repeat("-", 52))
+	if len(projects) == 0 {
+		fmt.Println("  no projects on this account")
+		fmt.Println()
+		return 0
+	}
+	for i, project := range projects {
+		marker := " "
+		if i == 0 {
+			// The listing is most-recently-modified first, and this is the one a
+			// run would pick when it has not been told which to use.
+			marker = "*"
+		}
+		modified := "unknown"
+		if !project.Modified.IsZero() {
+			modified = project.Modified.Format(time.RFC3339)
+		}
+		fmt.Printf("  %s %-40s %s\n", marker, project.ID, modified)
+	}
+	fmt.Println()
+	fmt.Println("  * is the project a run picks when none is named.")
+	fmt.Println("    Pin one with --project-id or FLOW_PROJECT_ID.")
+	fmt.Println()
+	return 0
 }
 
 /* ------------------------------------------------------------------ *

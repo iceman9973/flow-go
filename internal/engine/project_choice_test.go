@@ -2,16 +2,15 @@ package engine
 
 import "testing"
 
-// The ranking exists because the three sources are not interchangeable: two are
-// instructions and one is discovery, and the discovery step costs a navigation.
+// The ranking exists because the sources are not interchangeable: two are
+// instructions, two are discovery, and only one of the discovery routes drives a
+// browser.
 func TestChooseProjectIDRanksExplicitOverEverything(t *testing.T) {
-	asked := false
-	ask := func() string {
-		asked = true
-		return "from-browser"
-	}
+	rpcAsked, browserAsked := false, false
 
-	id, source := chooseProjectID("explicit-id", "configured-id", ask)
+	id, source := chooseProjectID("explicit-id", "configured-id",
+		func() string { rpcAsked = true; return "from-rpc" },
+		func() string { browserAsked = true; return "from-browser" })
 
 	if id != "explicit-id" {
 		t.Fatalf("id = %q, want the explicit one", id)
@@ -19,21 +18,19 @@ func TestChooseProjectIDRanksExplicitOverEverything(t *testing.T) {
 	if source != projectSourceExplicit {
 		t.Fatalf("source = %q, want %q", source, projectSourceExplicit)
 	}
-	if asked {
-		t.Fatal("the browser was asked even though the caller named a project")
+	if rpcAsked || browserAsked {
+		t.Fatal("a source was consulted even though the caller named a project")
 	}
 }
 
-// The point of FLOW_PROJECT_ID: a configured project means the engine never has
-// to open an editor tab to learn where it is.
-func TestChooseProjectIDSkipsTheBrowserWhenConfigured(t *testing.T) {
-	asked := false
-	ask := func() string {
-		asked = true
-		return "from-browser"
-	}
+// The point of FLOW_PROJECT_ID: a configured project means nothing is searched
+// for, so no tab is navigated.
+func TestChooseProjectIDSkipsEverySearchWhenConfigured(t *testing.T) {
+	rpcAsked, browserAsked := false, false
 
-	id, source := chooseProjectID("", "configured-id", ask)
+	id, source := chooseProjectID("", "configured-id",
+		func() string { rpcAsked = true; return "from-rpc" },
+		func() string { browserAsked = true; return "from-browser" })
 
 	if id != "configured-id" {
 		t.Fatalf("id = %q, want the configured one", id)
@@ -41,14 +38,37 @@ func TestChooseProjectIDSkipsTheBrowserWhenConfigured(t *testing.T) {
 	if source != projectSourceConfigured {
 		t.Fatalf("source = %q, want %q", source, projectSourceConfigured)
 	}
-	if asked {
-		t.Fatal("the browser was asked despite a configured project id")
+	if rpcAsked || browserAsked {
+		t.Fatal("a source was consulted despite a configured project id")
 	}
 }
 
-// With nothing configured, discovery is the only way left.
-func TestChooseProjectIDFallsBackToTheBrowser(t *testing.T) {
-	id, source := chooseProjectID("", "", func() string { return "from-browser" })
+// The listing is live truth and costs an HTTP call, so it is preferred over the
+// navigation — and the browser must not be reached once it has answered.
+func TestChooseProjectIDPrefersTheListingOverTheBrowser(t *testing.T) {
+	browserAsked := false
+
+	id, source := chooseProjectID("", "",
+		func() string { return "from-rpc" },
+		func() string { browserAsked = true; return "from-browser" })
+
+	if id != "from-rpc" {
+		t.Fatalf("id = %q, want the listing's answer", id)
+	}
+	if source != projectSourceRPC {
+		t.Fatalf("source = %q, want %q", source, projectSourceRPC)
+	}
+	if browserAsked {
+		t.Fatal("the browser was navigated even though the listing answered")
+	}
+}
+
+// A rejected listing still has to fall through, or a transport problem would
+// take the browser route away with it.
+func TestChooseProjectIDFallsBackToTheBrowserWhenTheListingFails(t *testing.T) {
+	id, source := chooseProjectID("", "",
+		func() string { return "" },
+		func() string { return "from-browser" })
 
 	if id != "from-browser" {
 		t.Fatalf("id = %q, want the browser's answer", id)
@@ -64,7 +84,7 @@ func TestChooseProjectIDReportsNothingWhenEverySourceIsEmpty(t *testing.T) {
 		"browser said no":   func() string { return "" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			id, source := chooseProjectID("", "", ask)
+			id, source := chooseProjectID("", "", func() string { return "" }, ask)
 
 			if id != "" {
 				t.Fatalf("id = %q, want empty", id)

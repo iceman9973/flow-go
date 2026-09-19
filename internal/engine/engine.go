@@ -698,6 +698,41 @@ func (e *Engine) CreateProject(ctx context.Context, label string) (batchexecute.
 	return client.CreateProject(callCtx, label)
 }
 
+// emptySubmissionHint explains the most likely cause of a video submission that
+// comes back empty.
+//
+// The old wording sent the reader to "the model key and the RPC it went to".
+// Those are worth ruling out — a wrong model or a wrong RPC id is also accepted
+// with an empty result — but they are the *less* common cause, and the message
+// named neither the captcha provider nor the fact that the provider is knowable.
+//
+// Measured, same server, same project, same prompt and model, only the provider
+// varied: a token from the page submitted and charged; a token from the HTTP
+// provider came back empty and charged nothing, twice out of two. The HTTP
+// provider speaks the Enterprise anchor/reload protocol with no browser, which
+// yields a lower-scoring assessment, and Flow answers an empty result rather
+// than an error — so this reads as a payload problem when it is an assessment
+// problem.
+func (e *Engine) emptySubmissionHint() string {
+	e.mu.RLock()
+	provider := e.captcha
+	e.mu.RUnlock()
+
+	name := "unknown"
+	if provider != nil {
+		name = provider.Name()
+	}
+
+	hint := fmt.Sprintf("The reCAPTCHA token came from %q. ", name)
+	if name == "http" {
+		return hint + "A token minted without a browser scores lower and Flow answers an " +
+			"empty result rather than an error, which is the usual cause here — attach the " +
+			"extension so the page can mint one. Otherwise check the model key and the RPC " +
+			"it went to."
+	}
+	return hint + "Also check the model key and the RPC it went to."
+}
+
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
 func (e *Engine) CaptchaToken(ctx context.Context, action string) (string, error) {
 	e.mu.RLock()
@@ -2272,11 +2307,12 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		if plan.Cost > 0 {
 			log.Printf("engine: nothing submitted for %s — it costs %d credits at %s and the "+
 				"account has %s, which was checked and covers it; so the balance is not the "+
-				"cause — check the model key and the RPC it went to",
-				model, plan.Cost, quality, balance)
+				"cause. %s",
+				model, plan.Cost, quality, balance, e.emptySubmissionHint())
 		} else {
 			log.Printf("engine: nothing submitted for %s at %s — the cost of that pair is not "+
-				"recorded, so the balance cannot be ruled in or out", model, quality)
+				"recorded, so the balance cannot be ruled in or out. %s",
+				model, quality, e.emptySubmissionHint())
 		}
 		return outcome, nil
 	}

@@ -734,7 +734,7 @@ file:    output/acct-460ddc37-2e6.jpg   89864 bytes   1376x768 JPEG
 | 158 cookies synced, 10 credential cookies | works |
 | Flow project discovered from the browser tab | works |
 | Flow editor tab opened and attached automatically | works |
-| reCAPTCHA token from the browser broker | works |
+| reCAPTCHA token from the browser broker | works — and for video it is **required**; see below |
 | 27 RPCs mapped, all returning real data | works |
 | **Credits** (`/v1/credits`) — matches the UI's balance exactly | **works** |
 | **Image generation + download** (`/v1/images/generations`) | **works** |
@@ -744,6 +744,41 @@ file:    output/acct-460ddc37-2e6.jpg   89864 bytes   1376x768 JPEG
 | **Video upscale** (`/v1/videos/upscale`) | **works** — 1280x720 -> 1920x1080, verified with ffprobe |
 
 No API key. No bearer token. No `aisandbox-pa.googleapis.com`.
+
+### The reCAPTCHA token is load-bearing for video
+
+The token can be minted two ways, and they are not equivalent.
+
+| Provider | Needs a browser | Video submission |
+| --- | --- | --- |
+| `flow.captcha` (page) | yes | **submitted** — media id returned, credits charged |
+| `http` (anchor/reload protocol) | no | **empty** — no media id, nothing charged |
+
+Measured as an A/B, same server, same project, same prompt, same model, only the
+provider varied. The HTTP provider also failed against a second, older project, so
+the project is not the variable. The earlier one success out of four attempts is
+not enough to call it flaky rather than broken — treat it as broken.
+
+This matters because the failure is **silent**. Flow accepts the request, answers
+`200`, returns an empty frame and charges nothing. There is no error to catch and
+no status to check, so it reads exactly like a wrong model key or a wrong RPC id —
+which is where the diagnostic used to send the reader. It now names the provider
+and says so:
+
+```
+engine: nothing submitted for abra_t2v_4s_360p — it costs 4 credits at 360p and the
+account has 31, which was checked and covers it; so the balance is not the cause.
+The reCAPTCHA token came from "http". A token minted without a browser scores lower
+and Flow answers an empty result rather than an error, which is the usual cause here
+— attach the extension so the page can mint one.
+```
+
+So `--captcha http` is a real option for images and for the read-only calls, and a
+trap for video. The HTTP provider is not fixable from here: it speaks the Enterprise
+anchor/reload protocol without a page, which yields a lower-scoring assessment, and
+raising that score means running a browser or a captcha-solving service. The browser
+dependency for video is genuine; the useful work is keeping it to *one* thing — a
+page that is already loaded — rather than chasing it away.
 
 ### Video
 

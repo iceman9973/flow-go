@@ -53,6 +53,12 @@ type Options struct {
 	// /v1/accounts/switch has been used, the stored index wins. A negative value
 	// is clamped to zero.
 	AccountIndex int
+	// AtToken and Fsid are the page tokens a browserless process cannot read for
+	// itself. A caller that has taken a SessionSnapshot from a process with a
+	// browser supplies them here, and they are used only when no bridge is
+	// attached — a live page is always the better source.
+	AtToken string
+	Fsid    string
 }
 
 // Engine is the running system.
@@ -589,6 +595,55 @@ func (e *Engine) RawCreditsRPC(ctx context.Context, authUser int) ([]json.RawMes
 	})
 }
 
+// SessionSnapshot is the browser-derived state one process hands to another.
+//
+// The browser is reachable through exactly one host — whichever process owns the
+// bridge port — and everything the engine needs from it is short-lived: the
+// cookies rotate, and the page tokens only exist in a loaded page. A process with
+// no browser can still work, but only against a copy, and a copy goes stale on
+// Google's schedule rather than on a timer anyone here controls.
+//
+// So the copy is taken on demand instead of on an interval: the process that has
+// the browser serves this, and the one that does not asks for it at start-up. That
+// leaves no window in which the copy is older than the run using it.
+type SessionSnapshot struct {
+	Cookies []cookiejar.Cookie `json:"cookies"`
+	// At is the page's anti-CSRF token and Fsid its `f.sid`. Both are page-only,
+	// so a browserless process cannot obtain them by any other route.
+	At   string `json:"at,omitempty"`
+	Fsid string `json:"fsid,omitempty"`
+	// ProjectID is the project the browser is sitting on. Carrying it means a
+	// caller does not have to be told one, which is the other thing that
+	// otherwise forces a browser.
+	ProjectID string `json:"project_id,omitempty"`
+	AccountID string `json:"account_id,omitempty"`
+	// Index is the `authuser` index the snapshot was taken for.
+	Index int `json:"account_index"`
+}
+
+// SessionSnapshot reads the current browser-derived state.
+func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) {
+	if !e.Ready() {
+		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+	}
+	jar := e.bridge.Jar()
+	if jar == nil {
+		return nil, fmt.Errorf("engine: no cookies loaded")
+	}
+
+	e.mu.RLock()
+	snapshot := &SessionSnapshot{
+		Cookies:   jar.Cookies(),
+		At:        e.atToken,
+		Fsid:      e.fsid,
+		ProjectID: e.projectID,
+		AccountID: e.accountID,
+		Index:     e.accountIndex,
+	}
+	e.mu.RUnlock()
+	return snapshot, nil
+}
+
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
 func (e *Engine) CaptchaToken(ctx context.Context, action string) (string, error) {
 	e.mu.RLock()
@@ -825,7 +880,10 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 // goes out as it always did. A generic extension leaves both behaviours intact.
 func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	if e.bridge == nil || !e.bridge.Connected() {
-		return "", ""
+		// No browser to read from, so fall back to whatever a SessionSnapshot
+		// supplied. A live page always wins over this — it is the same values,
+		// read from their source rather than relayed.
+		return e.opts.AtToken, e.opts.Fsid
 	}
 	client := e.bridge.Current()
 	if client == nil || !client.Connected() {

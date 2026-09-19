@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -124,6 +125,37 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			"credentials": jar.HasAuthCookies(),
 			"ready":       eng.Ready(),
 		})
+	})
+
+	// Hand the browser-derived session to a process that has no browser.
+	//
+	// The bridge port admits one host, and everything the engine takes from the
+	// browser is short-lived — the cookies rotate, and the page tokens exist only
+	// in a loaded page. So the process that has the browser serves this to the one
+	// that does not, on demand, rather than through a file snapshot that goes
+	// stale on Google's rotation schedule instead of on a timer anyone here
+	// controls. The CLI is the caller: it takes a snapshot at start-up and seeds
+	// itself from it, which leaves no window in which the copy is older than the
+	// run using it.
+	//
+	// Guarded by the bridge token. These are the account's credentials, and an
+	// unauthenticated localhost endpoint would hand them to any process on the
+	// machine — the exact threat the bridge token was added to close.
+	app.Get("/v1/session", func(c fiber.Ctx) error {
+		if !bridgeTokenMatches(c) {
+			return c.Status(401).JSON(fiber.Map{
+				"error": "the bridge token is required, as X-Bridge-Token or ?token=",
+			})
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		snapshot, err := eng.SessionSnapshot(ctx)
+		if err != nil {
+			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(snapshot)
 	})
 
 	// The account's real credit balance, read over batchexecute.
@@ -1820,6 +1852,37 @@ func shortID(id string) string {
 // time a capture is replayed, so the capture stores this instead and the
 // placeholder is swapped for a fresh token at call time.
 const captchaPlaceholder = "__CAPTCHA__"
+
+// bridgeTokenMatches reports whether the request carries the bridge token.
+//
+// The token is read from disk rather than from the bridge because the bridge does
+// not expose it. The file is where it lives, and both processes read the same one,
+// so a comparison against the file is a comparison against the same secret the
+// extension had to prove it held.
+//
+// The comparison is constant-time. This is a shared secret standing in front of the
+// account's cookies, and a byte-at-a-time compare leaks its prefix.
+func bridgeTokenMatches(c fiber.Ctx) bool {
+	raw, err := os.ReadFile(filepath.Join(config.DataDir(), "bridge-token"))
+	if err != nil {
+		return false
+	}
+	want := strings.TrimSpace(string(raw))
+	if want == "" {
+		return false
+	}
+
+	supplied := strings.TrimSpace(c.Get("X-Bridge-Token"))
+	if supplied == "" {
+		// Also accepted as a query parameter, so a shell can use it without
+		// quoting a header.
+		supplied = strings.TrimSpace(c.Query("token"))
+	}
+	if supplied == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(want), []byte(supplied)) == 1
+}
 
 // replacePlaceholder returns value with every string equal to placeholder
 // replaced by with, recursing through arrays and objects.

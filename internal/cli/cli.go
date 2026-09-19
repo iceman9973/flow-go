@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -126,6 +127,11 @@ type commonFlags struct {
 	captcha   string
 	db        string
 	email     string
+	// at and fsid are the page tokens taken from a running server's session, and
+	// are not flags: they are short-lived page state, not something a caller
+	// should be typing.
+	at   string
+	fsid string
 }
 
 func (c *commonFlags) bind(fs *flag.FlagSet) {
@@ -142,7 +148,84 @@ func (c *commonFlags) build() (*app.App, error) {
 		ProxyURL:    c.proxy,
 		CaptchaMode: c.captcha,
 		DBPath:      c.db,
+		AtToken:     c.at,
+		Fsid:        c.fsid,
 	})
+}
+
+// adoptRunningSession seeds this process from a server that has the browser.
+//
+// The bridge port admits exactly one host, and everything the engine takes from
+// the browser is short-lived: the cookies rotate, and the page tokens exist only
+// in a loaded page. A CLI running alongside the server therefore has two bad
+// options — no browser at all, or a cookie file that was last written whenever the
+// bridge happened to sync. This is the third: take a snapshot at start-up, so the
+// copy is never older than the run using it.
+//
+// Best-effort by design. A CLI with no server running is a supported case, and it
+// falls back to the persisted copy; the only cost of not asking is the staleness
+// that was already there.
+func adoptRunningSession(ctx context.Context) (projectID, at, fsid string, ok bool) {
+	raw, err := os.ReadFile(filepath.Join(config.DataDir(), "bridge-token"))
+	if err != nil {
+		return "", "", "", false
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", "", "", false
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/session", config.HTTPPort)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", "", "", false
+	}
+	req.Header.Set("X-Bridge-Token", token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", false
+	}
+
+	var snapshot struct {
+		Cookies   []cookiejar.Cookie `json:"cookies"`
+		At        string             `json:"at"`
+		Fsid      string             `json:"fsid"`
+		ProjectID string             `json:"project_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil || len(snapshot.Cookies) == 0 {
+		return "", "", "", false
+	}
+
+	// Persist where the engine looks for it, so the bootstrap below picks it up
+	// without needing a new path through the engine.
+	jar := cookiejar.FromCookies(snapshot.Cookies, "server session")
+	if err := jar.Save(filepath.Join(config.DataDir(), "cookies.json")); err != nil {
+		return "", "", "", false
+	}
+
+	fmt.Printf("  session          taken from the running server (%d cookies)\n", jar.Count())
+	return snapshot.ProjectID, snapshot.At, snapshot.Fsid, true
+}
+
+// adoptSessionFor fills in what a running server can supply, leaving anything the
+// caller set explicitly alone.
+func adoptSessionFor(ctx context.Context, common *commonFlags) {
+	projectID, at, fsid, ok := adoptRunningSession(ctx)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(common.projectID) == "" {
+		common.projectID = projectID
+	}
+	common.at, common.fsid = at, fsid
 }
 
 /* ------------------------------------------------------------------ *
@@ -213,6 +296,10 @@ func runGenerate(args []string) int {
 		return fail(fmt.Errorf("not implemented on the batchexecute transport: %s",
 			strings.Join(unsupported, ", ")))
 	}
+
+	// Seed from a running server before building, because the engine reads its
+	// cookies and page tokens at construction.
+	adoptSessionFor(context.Background(), &common)
 
 	a, err := common.build()
 	if err != nil {
@@ -301,6 +388,10 @@ func runImage(args []string) int {
 		return fail(fmt.Errorf("--count is not implemented on the batchexecute transport; " +
 			"submit twice for two images"))
 	}
+
+	// Seed from a running server before building, because the engine reads its
+	// cookies and page tokens at construction.
+	adoptSessionFor(context.Background(), &common)
 
 	a, err := common.build()
 	if err != nil {

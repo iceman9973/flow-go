@@ -52,6 +52,11 @@ type Config struct {
 	Targets       []string
 	CookieDomains []string
 	DBPath        string
+	// AtToken and Fsid are the page tokens to use when no browser is attached.
+	// A process that has taken a SessionSnapshot from one that has a browser
+	// supplies them; a live page always takes precedence.
+	AtToken string
+	Fsid    string
 }
 
 // App holds the assembled system.
@@ -99,6 +104,8 @@ func Build(cfg Config) (*App, error) {
 		ProxyURL:     cfg.ProxyURL,
 		CaptchaMode:  cfg.CaptchaMode,
 		AccountIndex: config.AccountIndex,
+		AtToken:      cfg.AtToken,
+		Fsid:         cfg.Fsid,
 	})
 	if err != nil {
 		_ = st.Close()

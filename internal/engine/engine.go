@@ -741,19 +741,35 @@ func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
 		}
 	}
 
-	// Fall back to the persisted copy so the engine keeps working with the
-	// browser closed. This is the point of syncing cookies in the first place.
-	path := filepath.Join(config.CookieDir(), "cookies.json")
-	jar, err := cookiejar.LoadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, "", fmt.Errorf(
-				"engine: no cookies available. Open the browser with the browser-Cdp extension "+
-					"loaded, or place a cookie dump at %s", path)
-		}
-		return nil, "", fmt.Errorf("engine: could not read %s: %w", path, err)
+	// Fall back to a persisted copy so the engine keeps working with the browser
+	// closed. This is the point of syncing cookies in the first place.
+	//
+	// Two locations, and they are **not the same file**. The bridge writes the jar
+	// it syncs into its own data directory; `CookieDir` is where an operator is
+	// told to drop a manual dump. Reading only the second one meant the fallback
+	// was whatever had been placed there by hand — which for a browser-driven
+	// setup is nothing — so the engine loaded a copy from hours earlier and every
+	// call answered 401. The synced file is tried first because it is the fresher
+	// of the two by construction.
+	candidates := []string{
+		filepath.Join(config.DataDir(), "cookies.json"),
+		filepath.Join(config.CookieDir(), "cookies.json"),
 	}
-	return jar, path, nil
+
+	var tried []string
+	for _, path := range candidates {
+		jar, err := cookiejar.LoadFile(path)
+		if err == nil {
+			return jar, path, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("engine: could not read %s: %w", path, err)
+		}
+		tried = append(tried, path)
+	}
+	return nil, "", fmt.Errorf(
+		"engine: no cookies available. Open the browser with the browser-Cdp extension "+
+			"loaded, or place a cookie dump at %s", strings.Join(tried, " or "))
 }
 
 func (e *Engine) setError(err error) {

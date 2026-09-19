@@ -915,8 +915,8 @@ fingerprint.
 
   | Composer mode | Model keys | RPC | Status |
   |---|---|---|---|
-  | Frames, first + last | `omni_flash_i2v_*_first_last*`, `veo_3_1_i2v_*_fl` | `nprQif` | **works** |
-  | Frames, first only | `abra_i2v_*`, `veo_3_1_i2v_*` (no `_fl`) | `eb1hJf` | **works** |
+  | Frames, first + last | `omni_flash_i2v_*_first_last*` | `nprQif` | **works** |
+  | Frames, first only | `abra_i2v_*` | `eb1hJf` | **works** |
   | Ingredients (existing asset) | `abra_edit` | `jIps6` | **works** — `POST /v1/videos/edit` |
   | Reference images | `abra_r2v_*` | `MZZa6b` | **works** — `POST /v1/videos/reference` |
 
@@ -997,20 +997,26 @@ fingerprint.
 
 ### The model catalog is the reference for what exists
 
-`HTrJv` returns **155 model keys**, and the naming carries the capability:
+`HTrJv` returns **159 model keys**. The naming carries the capability, and the keys
+fall into families — only some of which this engine uses:
 
 ```
-abra_t2v_4s / _6s / _8s / _10s          text to video, by duration
+abra_t2v_4s / _6s / _8s / _10s          text to video, by duration      ← used
 abra_t2v_8s_360p                        ... the _360p suffix is resolution
-veo_3_1_t2v_fast_portrait               ... _portrait IS the aspect ratio
-abra_i2v_*                              image to video, first frame only
-omni_flash_i2v_8s_first_last_360p       image to video, first + last
-veo_3_1_i2v_s_fast_4s_fl                ... _fl is the same thing
-abra_r2v_* / veo_3_1_r2v_*              reference images
+abra_i2v_*                              image to video, first frame only ← used
+omni_flash_i2v_8s_first_last_360p       image to video, first + last     ← used
+abra_r2v_*                              reference images
 abra_edit / abra_edit_360p              video edit
-veo_3_1_upsampler_1080p / _4k           upscalers
-veo_3_1_extend_* / _interpolation_*     extend and interpolate
+veo_3_1_upsampler_1080p / _4k           upscalers                       ← used
 ```
+
+**The engine selects from `abra_*` and `omni_flash_*` only.** The catalog also holds
+a large `veo_*` family — `veo_3_1_t2v_*`, `veo_3_1_i2v_*`, `veo_3_1_r2v_*`,
+`veo_3_1_extend_*`, `veo_3_1_interpolation_*` — with capabilities this engine does
+not implement (extend, interpolate, object insertion and removal, camera control)
+and, for some, an aspect pair via a `_portrait` suffix. None of those are wired up,
+and naming one outright is not a supported path. The only `veo_*` keys in use are
+the two upsamplers, which are a second pass rather than a generation model.
 
 **Resolution is the `_360p` suffix**, which is why the upscalers are separate keys
 rather than a parameter.
@@ -1033,17 +1039,21 @@ text-to-video against a 360p image-to-video and attributed the difference to the
 variable that was not responsible.)
 
 **The catalog says why.** `abra_i2v_*` has no aspect variants at all — only duration
-and `_360p`. The `veo_*` keys do: `veo_3_1_i2v_s_fast_4s` has
-`veo_3_1_i2v_s_fast_4s_portrait` beside it, so the **unsuffixed key is the landscape
-one**. A landscape image-to-video therefore needs a `veo_*` i2v model, named
-explicitly, rather than an `abra_*` one.
+and `_360p`. There is no `_portrait` and no `_landscape`, so within the family the
+aspect is not selectable, and none of the `abra_*` keys measured renders landscape
+from an image.
 
 There is no aspect parameter to reach for instead. `BatchVideoRequest` has no
 `Aspect` field, and the composer's 16:9 / 9:16 toggle does not reach the request
-either (below) — the model key is the only place the choice can be expressed.
+either (below) — the model key is the only place a choice could be expressed, and
+this family has nothing to express it with.
 
-The `veo_*` i2v keys have no `_360p` variant either, so the landscape option is a
-720p one and is priced as such.
+**`veo_*` keys are not used here.** The catalog does carry an aspect pair for them —
+`veo_3_1_i2v_s_fast_4s` beside `veo_3_1_i2v_s_fast_4s_portrait` — but the engine
+never selects a `veo_*` generation key, and naming one outright is not a supported
+path. The only `veo_*` keys the engine does use are the **upsamplers**
+(`veo_3_1_upsampler_1080p` / `_4k`), which are a second pass over a finished render
+rather than a generation model.
 
 #### The cheapest key exists and does not render
 
@@ -1073,8 +1083,9 @@ beats none — which for this key converts a request that would have worked at 7
 into seven minutes of polling and nothing at all, with no error to explain it. An
 unaffordable request is now refused immediately with the arithmetic.
 
-For the `veo_*` keys, **aspect ratio is a model key too** — `_portrait` against a
-landscape default. The `abra_*` and `omni_flash_*` keys have no `_portrait` variants.
+Neither the `abra_*` nor the `omni_flash_*` keys — the only families this engine
+selects from — carry an aspect variant. The catalog has a `_portrait` suffix on some
+`veo_*` keys, but those are not used here.
 
 #### The composer's aspect toggle does not reach the request at all
 
@@ -1121,18 +1132,20 @@ keys without `_portrait` are the obvious candidates, but nothing here uses them.
 Worth knowing before picking a model: `omni_flash` covers **only** first+last-frame
 image-to-video. Everything else is the `abra` family.
 
-| Capability | `omni_flash` | `abra` | `veo` |
-|---|---|---|---|
-| Text to video | — | `abra_t2v_*` | `veo_3_1_t2v_*` |
-| Image to video, first frame only | — | `abra_i2v_*` | `veo_3_1_i2v_*` |
-| Image to video, first + last | **`omni_flash_i2v_*_first_last*`** | — | `veo_3_1_i2v_*_fl` |
-| Reference images | — | `abra_r2v_*` | `veo_3_1_r2v_*` |
-| Video edit | — | `abra_edit` | — |
-| Upscaler | `omni_upsampler_360p` | — | `veo_3_1_upsampler_*` |
+| Capability | `omni_flash` | `abra` |
+|---|---|---|
+| Text to video | — | `abra_t2v_*` |
+| Image to video, first frame only | — | `abra_i2v_*` |
+| Image to video, first + last | **`omni_flash_i2v_*_first_last*`** | — |
+| Reference images | — | `abra_r2v_*` |
+| Video edit | — | `abra_edit` |
+| Upscaler | `omni_upsampler_360p` | — |
 
 **Nothing in this implementation uses a `veo` model.** Text-to-video is
-`abra_t2v_*` and image-to-video is `omni_flash_i2v_*_first_last_*`; the `veo_3_1_*`
-keys are listed here only so it is clear they are a separate family and not needed.
+`abra_t2v_*` and image-to-video is `abra_i2v_*` / `omni_flash_i2v_*_first_last_*`.
+The catalog holds a large `veo_*` family with capabilities this engine does not
+implement, and it is deliberately not selected from — see "The model catalog is the
+reference for what exists" above.
 
 The catalog is worth querying before guessing at any capability:
 

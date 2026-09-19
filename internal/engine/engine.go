@@ -1497,7 +1497,8 @@ func (e *Engine) UpsampleMedia(ctx context.Context, mediaID, aspect, resolution 
 // BatchVideoRequest is a caller-facing video request for the batchexecute path.
 type BatchVideoRequest struct {
 	Prompt string
-	// Model is the video key: abra_t2v_{4,6,8,10}s, or a veo_3_1_t2v_* variant.
+	// Model is the video key: abra_t2v_{4,6,8,10}s, or the image-conditioned
+	// equivalent.
 	Model string
 	// Duration is seconds; used to derive the model when Model is empty.
 	Duration int

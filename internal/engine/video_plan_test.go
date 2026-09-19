@@ -89,7 +89,7 @@ func TestDecideVideoPlanMultipliesByCount(t *testing.T) {
 // covers the durations the app offers, and a model named outright can sit
 // outside it — the cost table must not be the limit on what can be generated.
 func TestDecideVideoPlanAllowsAnUnrecordedCost(t *testing.T) {
-	plan := decideVideoPlan(7, 1, "veo_3_1_t2v_something", "720p", 0)
+	plan := decideVideoPlan(7, 1, "abra_t2v_7s", "720p", 0)
 
 	if !plan.Affordable() {
 		t.Fatalf("an unrecorded cost was treated as a refusal: %s", plan.Reason)

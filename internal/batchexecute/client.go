@@ -1515,8 +1515,8 @@ func ParseUploadedMediaID(frames []Frame) (mediaID, contentID string, err error)
 // GenerateVideoRequest describes a video generation submission.
 type GenerateVideoRequest struct {
 	ProjectID string
-	// Model is the video key: "abra_t2v_8s", "veo_3_1_t2v_fast_4s", or an
-	// image-conditioned key such as "omni_flash_i2v_8s_first_last_360p".
+	// Model is the video key: "abra_t2v_8s", or an image-conditioned key such as
+	// "abra_i2v_8s" or "omni_flash_i2v_8s_first_last_360p".
 	Model  string
 	Prompt string
 	// Count is how many variations to submit. Each becomes its own entry in the

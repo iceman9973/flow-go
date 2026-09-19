@@ -1015,6 +1015,36 @@ veo_3_1_extend_* / _interpolation_*     extend and interpolate
 **Resolution is the `_360p` suffix**, which is why the upscalers are separate keys
 rather than a parameter.
 
+#### Aspect is decided by the model family, not by the quality
+
+Measured, from one landscape source image (1376×768):
+
+| request | model | output |
+|---|---|---|
+| text-to-video, 720p | `abra_t2v_4s` | **1280×720** landscape |
+| image-to-video, 720p | `abra_i2v_4s` | **720×1280** portrait |
+| image-to-video, 360p | `abra_i2v_4s_360p` | **360×640** portrait |
+
+So `abra_*` **image-to-video renders portrait whatever the quality and whatever the
+source's shape** — the image conditioning does not carry the aspect across. `_360p`
+is a resolution change on top of that, not the thing causing it. (An earlier reading
+of this table blamed the quality suffix, which was wrong: it compared a 720p
+text-to-video against a 360p image-to-video and attributed the difference to the one
+variable that was not responsible.)
+
+**The catalog says why.** `abra_i2v_*` has no aspect variants at all — only duration
+and `_360p`. The `veo_*` keys do: `veo_3_1_i2v_s_fast_4s` has
+`veo_3_1_i2v_s_fast_4s_portrait` beside it, so the **unsuffixed key is the landscape
+one**. A landscape image-to-video therefore needs a `veo_*` i2v model, named
+explicitly, rather than an `abra_*` one.
+
+There is no aspect parameter to reach for instead. `BatchVideoRequest` has no
+`Aspect` field, and the composer's 16:9 / 9:16 toggle does not reach the request
+either (below) — the model key is the only place the choice can be expressed.
+
+The `veo_*` i2v keys have no `_360p` variant either, so the landscape option is a
+720p one and is priced as such.
+
 #### The cheapest key exists and does not render
 
 `abra_t2v_4s_360p` is in the catalog — all eight `abra_t2v_*` keys are, `_360p`

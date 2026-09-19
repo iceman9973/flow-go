@@ -78,8 +78,9 @@ origin.
    `VideoCosts[duration][quality] × count`. If it does not cover the render, the
    other signed-in accounts are scanned and the engine moves to the one with the
    most credits that can pay, then re-plans. Still short → **402** and nothing is
-   sent. 720p unaffordable but 360p affordable → the render is downgraded and the
-   response says so.
+   sent. An unaffordable request is **refused**, not quietly rendered at a cheaper
+   quality: a cheaper render is a different render than the one asked for, and for
+   `abra_t2v_4s_360p` it is no render at all.
 6. `conditionImageID` resolves any start/end image to its **content id** — the
    conditioning RPCs take the content id, not the media id.
 7. A reCAPTCHA token is minted. This is deliberately **after** the gate: a token is
@@ -268,9 +269,10 @@ with a regression test where the fix is behavioural.
 | 10 | `"no video URL … yet (still rendering?)"` was not wrapped as retryable, so the poll treated a still-rendering video as permanently failed and gave up after 10s | `ErrAssetNotReady` + `RetryableResolveError`, which covers both stages of a render | `TestRetryableResolveErrorCoversBothStagesOfARender` |
 | 11 | Every signed-in account was labelled with the first one's email, because the address came from the authuser-blind session endpoint | The address comes from the account-scoped `o30O0e` profile RPC | `TestFindProfileReadsIdentityFromItsTrueShape` |
 | 12 | The selected account index lived in memory only, so every restart reverted to index 0 — which is how a 1-credit account came to look like the only one | The index is written to the `settings` table and restored at construction | `TestSetSettingRoundTripsAndReplaces` |
-| 13 | Nothing checked whether an account could afford a render. The server accepts an uncovered submission and answers with no media, so an empty wallet presented as a broken request | A pre-flight gate refuses with **402** and the arithmetic, downgrades to 360p when that fits, and moves to another signed-in account when one can pay | `TestDecideVideoPlanRefusesWhenNothingFits`, `TestBestAffordableAccountPicksTheRichestThatCanPay` |
+| 13 | Nothing checked whether an account could afford a render. The server accepts an uncovered submission and answers with no media, so an empty wallet presented as a broken request | A pre-flight gate refuses with **402** and the arithmetic, and moves to another signed-in account when one can pay | `TestDecideVideoPlanRefusesWhenNothingFits`, `TestBestAffordableAccountPicksTheRichestThatCanPay` |
 | 14 | `Bootstrap` registered a worker on every account switch and removed none, so the pool accumulated accounts the engine could no longer route to and summed their balances as available | `pool.Retain(accountID)` before registering | `TestRetainDropsThePreviousAccount` |
-| 15 | An id was resolved from the project listing exactly once. An upload returns its ids **before** the listing carries the row — measured at about eight seconds — so conditioning on an upload that had just succeeded reported "not in the project listing" for an asset that was there by the time anyone looked | `awaitAsset` retries while the asset is missing, for a 30s window, and is used by both `conditionImageID` and the two `findAsset` callers. A failed listing call is still returned at once — waiting does not fix it | `TestAwaitAssetRetriesUntilTheListingCatchesUp`, `TestAwaitAssetReturnsAnErrorImmediately` |
+| 15 | The same gate **downgraded** to 360p when the balance would not cover 720p, on the reasoning that a cheaper render beats none. For `abra_t2v_4s_360p` it does not: that key accepts a submission, returns a media id and never produces an asset, so the downgrade turned a request that would have worked into seven minutes of polling and nothing, with no error to explain it | The downgrade is gone. An unaffordable request is refused immediately, and a caller who wants 360p asks for it | `TestDecideVideoPlanRefusesRatherThanDowngrading` |
+| 16 | An id was resolved from the project listing exactly once. An upload returns its ids **before** the listing carries the row — measured at about eight seconds — so conditioning on an upload that had just succeeded reported "not in the project listing" for an asset that was there by the time anyone looked | `awaitAsset` retries while the asset is missing, for a 30s window, and is used by both `conditionImageID` and the two `findAsset` callers. A failed listing call is still returned at once — waiting does not fix it | `TestAwaitAssetRetriesUntilTheListingCatchesUp`, `TestAwaitAssetReturnsAnErrorImmediately` |
 
 Defect 7 in the report was stated as "two of five phases produced dead code". Here
 the equivalent claim is load-bearing and verified: the browser participates only

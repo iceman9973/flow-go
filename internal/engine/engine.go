@@ -1525,19 +1525,16 @@ type BatchVideoOutcome struct {
 	Credits   int         `json:"credits_remaining"`
 	ElapsedS  float64     `json:"elapsed_seconds"`
 	Status    string      `json:"status"`
-	// Quality is the quality the render was actually submitted at. It is
-	// reported rather than assumed from the request because the two can differ:
-	// a request the balance could not cover at 720p is submitted at 360p
-	// instead, and a caller reading only its own request would conclude the
-	// wrong thing about what came back.
+	// Quality is the quality the render was submitted at, reported so a caller can
+	// confirm it got what it asked for. The engine does not substitute a different
+	// quality: an unaffordable request is refused rather than quietly rendered
+	// cheaper, because a cheaper render is a different render and — for at least one
+	// key — no render at all.
 	Quality string `json:"quality,omitempty"`
 	// CreditsCost is what the submission was expected to cost, per the cost
 	// table. It is the number the affordability check used, so a caller can see
 	// the budget the engine worked to rather than inferring it.
 	CreditsCost int `json:"credits_cost,omitempty"`
-	// QualityDowngraded says the requested quality was reduced to fit the
-	// balance. It is explicit so a lower-resolution result is never a surprise.
-	QualityDowngraded bool `json:"quality_downgraded,omitempty"`
 	// RawFrames carries the unparsed response frames, and only when the parse
 	// produced no media. An empty result is indistinguishable from a parser that
 	// missed a new shape unless the payload is visible, and this is the only
@@ -1564,8 +1561,6 @@ type videoPlan struct {
 	// to refuse.
 	Balance int
 	Known   bool
-	// Downgraded says the requested quality did not fit and a cheaper one does.
-	Downgraded bool
 	// Reason explains a refusal. It is empty when the plan is affordable, so a
 	// caller tests Reason rather than a separate flag.
 	Reason string
@@ -1646,19 +1641,19 @@ func decideVideoPlan(duration, count int, model, quality string, balance int) vi
 		return plan
 	}
 
-	// The account cannot pay for what was asked. 360p is the same render for
-	// less — the table records it at roughly half — so when the cheaper quality
-	// fits, serve it rather than refusing a request that can be met.
-	if quality != "360p" {
-		if cheap, ok := config.VideoCost(duration, "360p"); ok && balance >= cheap*count {
-			plan.Quality = "360p"
-			plan.Model = config.VideoModelQuality(model, "360p")
-			plan.Cost = cheap * count
-			plan.Downgraded = true
-			return plan
-		}
-	}
-
+	// Refuse. The request asked for this quality and the account cannot pay for
+	// it, so say so and stop.
+	//
+	// This used to downgrade to 360p when that fit, on the reasoning that a cheaper
+	// render is better than none. It is not: `abra_t2v_4s_360p` accepts a
+	// submission, returns a media id, and never produces an asset, so the downgrade
+	// converted a request that would have worked at 720p into seven minutes of
+	// polling and nothing at all — with no error to explain it. A refusal is
+	// immediate and actionable.
+	//
+	// The downgrade was also unnecessary. A caller who wants 360p sets
+	// `quality: "360p"`; silently substituting a different render than the one
+	// asked for is a different thing from serving the request.
 	plan.Reason = fmt.Sprintf(
 		"insufficient credits: %ds at %s costs %d (%d per render ×%d) and the account has %d",
 		duration, quality, plan.Cost, perRender, count, balance)
@@ -1944,9 +1939,8 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		AccountID:         e.AccountID(),
 		ProjectID:         projectID,
 		Model:             model,
-		Quality:           quality,
-		CreditsCost:       plan.Cost,
-		QualityDowngraded: plan.Downgraded,
+		Quality:     quality,
+		CreditsCost: plan.Cost,
 		Status:            "submitted",
 	}
 	for _, frame := range frames {

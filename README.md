@@ -201,9 +201,8 @@ GET /v1/accounts/affordable?cost=15
 
 If nothing can pay, the submission is refused with **402** and the arithmetic in the
 message, and nothing is sent — the server would otherwise accept it and answer with
-no media, which reads as a broken request rather than an empty wallet. When 720p
-does not fit but 360p does, the render is downgraded rather than refused, and the
-response says so (`quality`, `credits_cost`, `quality_downgraded`).
+no media, which reads as a broken request rather than an empty wallet. The engine
+does **not** substitute a cheaper quality: a caller who wants 360p asks for 360p.
 
 Switching re-bootstraps, because the session, the account row and the project all
 have to move together. Projects are per-account, so the engine opens
@@ -1027,11 +1026,11 @@ actually renders is 4s at 720p for 7 credits, not 4s at 360p for 4.** The cost
 table is still right about what each pair *costs*; it is the 360p text-to-video key
 that does not produce anything.
 
-Worth knowing because the cost gate downgrades 720p → 360p when the balance will not
-cover 720p. For **text-to-video** that downgrade turns a render that would have
-worked into one that produces nothing — which is worse than refusing. The downgrade
-is correct for image-to-video (`abra_i2v_4s_360p` renders fine, measured at 194s)
-and for the other durations, so it is specifically this key.
+This is also why the cost gate refuses rather than downgrading. It used to fall back
+to 360p when the balance would not cover 720p, on the reasoning that a cheaper render
+beats none — which for this key converts a request that would have worked at 720p
+into seven minutes of polling and nothing at all, with no error to explain it. An
+unaffordable request is now refused immediately with the arithmetic.
 
 For the `veo_*` keys, **aspect ratio is a model key too** — `_portrait` against a
 landscape default. The `abra_*` and `omni_flash_*` keys have no `_portrait` variants.

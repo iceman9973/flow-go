@@ -30,25 +30,32 @@ func TestDecideVideoPlanRefusesWhenNothingFits(t *testing.T) {
 	}
 }
 
-// 360p is the same render for roughly half, so an account that cannot afford
-// 720p should still be served rather than refused.
-func TestDecideVideoPlanDowngradesWhenTheCheaperQualityFits(t *testing.T) {
+// An account that cannot afford the quality it asked for is refused, not quietly
+// served a cheaper one.
+//
+// This used to downgrade to 360p when that fit. It is the wrong call for two
+// reasons. A cheaper render is a different render than the one requested, and for
+// at least one key it is no render at all — `abra_t2v_4s_360p` accepts a
+// submission, returns a media id, and never produces an asset, so the downgrade
+// turned a request that would have worked into seven minutes of polling and
+// nothing. A refusal is immediate and says what is missing.
+func TestDecideVideoPlanRefusesRatherThanDowngrading(t *testing.T) {
 	plan := decideVideoPlan(4, 1, "abra_t2v_4s", "720p", 4)
 
-	if !plan.Affordable() {
-		t.Fatalf("a 4-credit account was refused a 360p render it can pay for: %s", plan.Reason)
+	if plan.Affordable() {
+		t.Fatal("a 4-credit account was allowed to submit a 7-credit render")
 	}
-	if !plan.Downgraded {
-		t.Error("Downgraded = false, but the request was cut from 720p to 360p")
+	if plan.Quality != "720p" {
+		t.Errorf("Quality = %q; the plan must not substitute a cheaper quality", plan.Quality)
 	}
-	if plan.Quality != "360p" {
-		t.Errorf("Quality = %q, want 360p", plan.Quality)
+	if plan.Model != "abra_t2v_4s" {
+		t.Errorf("Model = %q; the plan must not rewrite the model key", plan.Model)
 	}
-	if plan.Model != "abra_t2v_4s_360p" {
-		t.Errorf("Model = %q, want abra_t2v_4s_360p", plan.Model)
+	if plan.Cost != 7 {
+		t.Errorf("Cost = %d, want 7 (4s at 720p, what was asked for)", plan.Cost)
 	}
-	if plan.Cost != 4 {
-		t.Errorf("Cost = %d, want 4 (4s at 360p)", plan.Cost)
+	if !strings.Contains(plan.Reason, "insufficient credits") {
+		t.Errorf("reason = %q", plan.Reason)
 	}
 }
 
@@ -59,9 +66,6 @@ func TestDecideVideoPlanAcceptsAnExactBalance(t *testing.T) {
 
 	if !plan.Affordable() {
 		t.Fatalf("an exactly-sufficient balance was refused: %s", plan.Reason)
-	}
-	if plan.Downgraded {
-		t.Error("Downgraded = true, but the balance covered the requested quality")
 	}
 	if plan.Cost != 15 {
 		t.Errorf("Cost = %d, want 15 (10s at 720p)", plan.Cost)
@@ -97,16 +101,16 @@ func TestDecideVideoPlanAllowsAnUnrecordedCost(t *testing.T) {
 
 // A 360p request on a broke account has nowhere cheaper to go, so it is refused
 // rather than downgraded to the quality it already asked for.
-func TestDecideVideoPlanDoesNotDowngradeBelow360p(t *testing.T) {
+func TestDecideVideoPlanRefusesAnUnaffordable360p(t *testing.T) {
 	plan := decideVideoPlan(4, 1, "abra_t2v_4s_360p", "360p", 3)
 
 	if plan.Affordable() {
 		t.Fatal("a 3-credit account was allowed to submit a 4-credit 360p render")
 	}
-	if plan.Downgraded {
-		t.Error("Downgraded = true, but 360p is already the cheapest quality")
-	}
 	if plan.Quality != "360p" {
 		t.Errorf("Quality = %q, want 360p unchanged", plan.Quality)
+	}
+	if plan.Cost != 4 {
+		t.Errorf("Cost = %d, want 4", plan.Cost)
 	}
 }

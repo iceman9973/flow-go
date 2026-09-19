@@ -171,8 +171,17 @@ address from it stamps every signed-in account with the first one's. That is wha
 this listing used to do — the three rows above were one address repeated three
 times, which reads as "these accounts share an email" rather than as a bug. The
 `o30O0e` profile RPC is account-scoped and is the only source that follows
-`authuser`; `session.Sku` is still read from the blind endpoint and is **not**
-trustworthy per account.
+`authuser`.
+
+**The tier has no per-account source, and the listing says so.** `sku` is still read
+from that same blind endpoint, so every row carries the default account's tier.
+There is no replacement to be had: the `nzlgx` credits payload is a flat array of
+numbers with no tier in it — `[[7,3,8,1,null,7]]`, measured per account — and the
+legacy aisandbox `/v1/credits` answers for a different signed-in account entirely.
+It is kept because it is still the tier of *an* account on this machine, but nothing
+branches on it per row. In particular the account-selection policy deliberately
+ignores free-tier preference: spending renewable credits before paid ones is the
+right policy and cannot be applied when every account looks the same tier.
 
 **The choice is remembered.** `/v1/accounts/switch` writes the index to the
 `settings` table, so a restart comes back on the account that was chosen rather
@@ -383,6 +392,7 @@ was wrong, so the only way through is to vary one thing at a time:
 | POST | `/v1/debug/events-raw` | Raw CDP events. `requestWillBeSentExtraInfo` is the only place the browser's *real* headers, Cookie included, are visible |
 | POST | `/v1/debug/image-upscale` | `SPrCad` over the Go transport, with the raw response body. Takes `header_overrides`, `header_order`, `tls_profile`, `protocol_racing`, `build_label`, `at_token`, `source_path`, `session_id`, `use_quic`, `drop_credentials` |
 | POST | `/v1/debug/video-upscale` | `p0UkFb` over the Go transport, returning the queued asset id |
+| GET | `/v1/debug/credits-rpc` | The raw **batchexecute** credits payload for one account (`?authuser=N`). Unlike `/v1/debug/credits-raw`, which hits the legacy endpoint and reports whichever account that credential belongs to, this uses the transport and `authuser` a real balance read uses — so it can be pointed at a specific account. It is how the tier question was settled: the payload is `[[7,3,8,1,null,7]]`, numbers only, no tier |
 | POST | `/v1/bridge/eval` | Evaluate an expression in the attached tab |
 | POST | `/v1/bridge/cdp` | Issue an arbitrary CDP command |
 

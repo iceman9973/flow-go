@@ -1262,6 +1262,25 @@ func ParseGeneratedMediaIDs(payload json.RawMessage) []string {
 	return ids
 }
 
+// CreditsFrames returns the raw credits response frames, unparsed.
+//
+// Diagnostics only. The parsed balance cannot answer whether the response carries
+// anything else — a tier, an allocation, a reset time — and the field names are
+// undocumented, so the only way to know is to look. It exists because the account
+// tier is read from a different endpoint that is `authuser`-blind, and whether this
+// one could replace it is a question about the payload, not about the balance.
+func (c *Client) CreditsFrames(ctx context.Context, opts CallOptions) ([]json.RawMessage, error) {
+	frames, err := c.CallWith(ctx, RPCIDCredits, nil, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]json.RawMessage, 0, len(frames))
+	for _, frame := range frames {
+		out = append(out, frame.Payload)
+	}
+	return out, nil
+}
+
 // Credits reads the account's Flow credit balance.
 //
 // Takes no argument, so it needs no project context.

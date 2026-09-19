@@ -492,6 +492,36 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 		return c.JSON(fiber.Map{"raw": json.RawMessage(raw)})
 	})
 
+	// The raw batchexecute credits response for one signed-in account.
+	//
+	// Distinct from /v1/debug/credits-raw, which calls the legacy aisandbox
+	// endpoint and reports whatever account that credential belongs to. This one
+	// uses the transport and the `authuser` a real balance read uses, so it can be
+	// pointed at a specific account — which is the only way to find out whether the
+	// response carries a tier, given the account tier is currently read from an
+	// endpoint that ignores `authuser`.
+	app.Get("/v1/debug/credits-rpc", func(c fiber.Ctx) error {
+		authUser := 0
+		if raw := strings.TrimSpace(c.Query("authuser")); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 0 {
+				return c.Status(400).JSON(fiber.Map{
+					"error": "authuser must be a non-negative integer",
+				})
+			}
+			authUser = n
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+
+		frames, err := eng.RawCreditsRPC(ctx, authUser)
+		if err != nil {
+			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{"authuser": authUser, "frames": frames})
+	})
+
 	// Resolve an image at a larger size over the batchexecute transport.
 	//
 	// The download menu's "2K / Upscaled" choice runs this before fetching the

@@ -323,7 +323,14 @@ What is still open, in order of effort:
    `PUBLIC_ERROR_UNUSUAL_ACTIVITY` regardless of TLS profile, so it runs in the
    page. This is a genuine, unexplained difference and the only operation that
    still needs the browser for more than credentials.
-2. **The image path has no affordability gate** (see Worker pool above).
-3. **`row.SKU` is still authuser-blind**, read from the same session endpoint that
-   made every account's email look alike. It is why the account-selection policy
-   deliberately ignores free-tier preference — it is not trustworthy per account.
+2. **`row.SKU` is authuser-blind, and there is no source that is not.** It is read
+   from the same session endpoint that made every account's email look alike, so
+   every row carries the default account's tier. Unlike the email this was not
+   fixable by switching source — both alternatives were checked and neither works:
+   the `nzlgx` credits payload is a flat array of numbers with no tier in it
+   (`[[7,3,8,1,null,7]]`, measured per account), and the legacy aisandbox
+   `/v1/credits` answers for a *different* signed-in account entirely. The field is
+   kept and documented as not-per-account rather than removed, and the
+   account-selection policy deliberately ignores free-tier preference because of it.
+   Spending renewable credits before paid ones is the right policy; it simply cannot
+   be applied when every account looks the same tier.

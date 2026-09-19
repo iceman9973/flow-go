@@ -355,9 +355,22 @@ type AccountCredits struct {
 	// Credits is nil when the balance could not be read. It used to be a plain
 	// int, so a failed read and a genuine zero were both reported as 0 — and
 	// adding the rows up produced a confident, wrong total.
-	Credits *int   `json:"credits"`
-	SKU     string `json:"sku,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Credits *int `json:"credits"`
+	// SKU is the subscription tier, and it is **not per-account**.
+	//
+	// It is read from the labs session endpoint, which answers for the default
+	// account whatever `authuser` says — the same blindness that made every row
+	// report the first account's email. Unlike the email there is no replacement:
+	// the `nzlgx` credits payload is a flat array of numbers with no tier in it
+	// (`[[7,3,8,1,null,7]]`), and the legacy aisandbox `/v1/credits` answers for a
+	// different signed-in account entirely.
+	//
+	// So every row carries the same value, and it belongs to whichever account the
+	// browser is showing. It is kept because it is still the tier of *an* account
+	// on this machine, but nothing should branch on it per row — which is why the
+	// account-selection policy ignores free-tier preference.
+	SKU   string `json:"sku,omitempty"`
+	Error string `json:"error,omitempty"`
 	// FallbackIndices is how many trailing indices were dropped because they
 	// repeated this row. `authuser` past the number of signed-in accounts falls
 	// back to the default, so a request for ten indices returns the default
@@ -545,6 +558,35 @@ func (e *Engine) RawCredits(ctx context.Context) (json.RawMessage, error) {
 		return nil, err
 	}
 	return json.RawMessage(result.Body), nil
+}
+
+// RawCreditsRPC returns the batchexecute credits response for one signed-in
+// account, unparsed.
+//
+// Distinct from RawCredits, which calls the **legacy aisandbox** endpoint and so
+// reports whatever account that credential belongs to — which the README records
+// as a different signed-in account from the one the app session uses. This one goes
+// over the same transport and the same `authuser` as a real balance read, so it can
+// be asked about a specific account.
+func (e *Engine) RawCreditsRPC(ctx context.Context, authUser int) ([]json.RawMessage, error) {
+	if !e.Ready() {
+		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+	}
+	jar := e.bridge.Jar()
+	if jar == nil {
+		return nil, fmt.Errorf("engine: no cookies loaded")
+	}
+
+	client := e.newBatchexecuteClient(jar, e.hc)
+	client.SetAuthUser(authUser)
+	// The seeded anti-CSRF token belongs to the account the page is showing, and
+	// sending it alongside a different `authuser` is answered with 400.
+	if authUser != 0 {
+		client.SeedToken("")
+	}
+	return client.CreditsFrames(ctx, batchexecute.CallOptions{
+		SourcePath: "/", BuildLabel: config.BuildLabel(),
+	})
 }
 
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
@@ -2786,17 +2828,17 @@ func (e *Engine) collectVideo(ctx context.Context, client *batchexecute.Client, 
 			if err != nil {
 				lastErr[mediaID] = err.Error()
 
-			// A render in flight fails this in two stages, and both are worth
-			// waiting for: first the asset is missing from the listing, then it
-			// appears while its URL is still being produced. Anything else — a
-			// media-detail call that answers nothing, a listing that moved, an id
-			// that never landed — is permanent, and polling it for the full
-			// timeout turns a ten-second failure into a seven-minute one.
-			if !batchexecute.RetryableResolveError(err) {
-				log.Printf("engine: giving up on %s — %v", shortID(mediaID), err)
-				delete(pending, mediaID)
-				failed = append(failed, mediaID)
-			}
+				// A render in flight fails this in two stages, and both are worth
+				// waiting for: first the asset is missing from the listing, then it
+				// appears while its URL is still being produced. Anything else — a
+				// media-detail call that answers nothing, a listing that moved, an id
+				// that never landed — is permanent, and polling it for the full
+				// timeout turns a ten-second failure into a seven-minute one.
+				if !batchexecute.RetryableResolveError(err) {
+					log.Printf("engine: giving up on %s — %v", shortID(mediaID), err)
+					delete(pending, mediaID)
+					failed = append(failed, mediaID)
+				}
 				continue
 			}
 			delete(pending, mediaID)

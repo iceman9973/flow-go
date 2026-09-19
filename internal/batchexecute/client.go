@@ -311,6 +311,29 @@ const (
 	// RPCIDMediaCatalog returns a large project-scoped asset catalog.
 	RPCIDMediaCatalog = "DTaVef"
 
+	// RPCIDProjectCreate creates a project and returns its id.
+	//
+	// The app never calls this, which is why it went unfound for so long: clicking
+	// New project mints a uuid in the page and navigates, with no request beside the
+	// click. The id it mints is accepted for generation, so the app gets away with
+	// never registering anything — but such a project is invisible to the listing.
+	//
+	// This call is what makes a project *visible*. Captured by instrumenting the
+	// page's fetch and XHR rather than polling the extension's event buffer, which
+	// rotates within seconds and lost the request every time.
+	//
+	// The argument, decoded from that capture:
+	//
+	//	["projects/*", [null, ["<label>"]], [null, 22]]
+	//
+	// `22` is the same constant the context block of every generation carries, and
+	// is likely a tool or resource type. The label is a display name — the app uses
+	// the local date and time it was created, and the listing shows it verbatim.
+	//
+	// The response is `[<project-id>, [<label>]]` — so the caller is told the id it
+	// has just been given, and does not have to re-list to find it.
+	RPCIDProjectCreate = "jHPbke"
+
 	// RPCIDProjectMeta returns project metadata.
 	RPCIDProjectMeta = "mrlkwd"
 
@@ -1331,6 +1354,9 @@ type Project struct {
 	// ID is the project id — the same value the app puts in an editor URL, and
 	// the same one every generation call carries in its context block.
 	ID string `json:"id"`
+	// Label is the project's display name. The app sets it to the local date and
+	// time of creation, and the project list shows it verbatim.
+	Label string `json:"label,omitempty"`
 	// Modified is when the listing says the project last changed. Zero when the
 	// listing gave no timestamp, which it may not.
 	Modified time.Time `json:"modified"`
@@ -1349,6 +1375,57 @@ type Project struct {
 // trailing [1] is a flag whose meaning is not established, and is carried
 // verbatim because dropping it was not tried and this call works.
 var projectListArg = []any{"projects/*", 21, nil, nil, nil, nil, []any{1}}
+
+// CreateProject creates a Flow project and returns it.
+//
+// This is the browser-free way to get a project that the app will also see. A
+// minted uuid works for generation but never appears in the listing; a project
+// made here does, because this is the call the listing is built from.
+//
+// The label is a display name and is shown as-is in the project list. An empty
+// label gets the app's own convention, the local date and time, so a project
+// created from a script is not conspicuous among ones created by hand.
+func (c *Client) CreateProject(ctx context.Context, label string) (Project, error) {
+	if strings.TrimSpace(label) == "" {
+		label = time.Now().Format("Jan 2 - 15:04")
+	}
+
+	arg := []any{"projects/*", []any{nil, []any{label}}, []any{nil, projectToolCode}}
+
+	frames, err := c.CallWith(ctx, RPCIDProjectCreate, arg, CallOptions{
+		// Captured from the app's own call, which is made from the home page
+		// rather than from inside a project — the project does not exist yet.
+		SourcePath: "/u/0/",
+	})
+	if err != nil {
+		return Project{}, err
+	}
+
+	for _, frame := range frames {
+		var payload any
+		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+			continue
+		}
+		row, ok := payload.([]any)
+		if !ok || len(row) == 0 {
+			continue
+		}
+		id, ok := row[0].(string)
+		if !ok || !looksLikeUUID(id) {
+			continue
+		}
+		project := Project{ID: id, Modified: time.Now()}
+		if detail, ok := row[1].([]any); ok {
+			project.Label = stringAt(detail, 0)
+		}
+		return project, nil
+	}
+	return Project{}, fmt.Errorf("batchexecute: the create response carried no project id")
+}
+
+// projectToolCode is the trailing constant in the create argument, and the same
+// `22` that every generation's context block carries at the same position.
+const projectToolCode = 22
 
 // ProjectList returns the projects belonging to the account this client acts as.
 //
@@ -1394,6 +1471,7 @@ func parseProjectList(payload any) []Project {
 		}
 		project := Project{ID: id}
 		if detail, ok := row[1].([]any); ok {
+			project.Label = stringAt(detail, 0)
 			project.Modified = timestampAt(detail, 2)
 			for _, entry := range detail {
 				s, ok := entry.(string)

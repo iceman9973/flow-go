@@ -490,16 +490,19 @@ func bootstrap(ctx context.Context, a *app.App) error {
  * projects
  * ------------------------------------------------------------------ */
 
-// runProjects lists the account's Flow projects over the transport.
+// runProjects lists the account's Flow projects over the transport, or creates
+// one.
 //
 // This is the browser-free way to a project id: no tab is opened and no editor
-// URL is read. It is also how a project id is obtained for FLOW_PROJECT_ID when
-// the browser is not running.
+// URL is read. `--new` goes further and is the browser-free way to *make* one —
+// it calls the RPC the app's New project button would have called.
 func runProjects(args []string) int {
 	fs := flag.NewFlagSet("projects", flag.ExitOnError)
 	var common commonFlags
 	common.bind(fs)
 	asJSON := fs.Bool("json", false, "print raw JSON")
+	create := fs.Bool("new", false, "create a project and print its id")
+	label := fs.String("label", "", "display name for --new (defaults to the date and time)")
 	_ = fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -521,6 +524,28 @@ func runProjects(args []string) int {
 		return fail(err)
 	}
 
+	if *create {
+		project, err := a.Engine.CreateProject(ctx, *label)
+		if err != nil {
+			return fail(err)
+		}
+		if *asJSON {
+			printJSON(project)
+			return 0
+		}
+		fmt.Println()
+		fmt.Println("  flow-go — project created")
+		fmt.Println("  " + strings.Repeat("-", 52))
+		fmt.Printf("  %-24s %s\n", "project", project.ID)
+		if project.Label != "" {
+			fmt.Printf("  %-24s %s\n", "label", project.Label)
+		}
+		fmt.Println()
+		fmt.Println("  Use it with --project-id, or set FLOW_PROJECT_ID.")
+		fmt.Println()
+		return 0
+	}
+
 	projects, err := a.Engine.ListProjects(ctx)
 	if err != nil {
 		return fail(err)
@@ -537,6 +562,8 @@ func runProjects(args []string) int {
 	if len(projects) == 0 {
 		fmt.Println("  no projects on this account")
 		fmt.Println()
+		fmt.Println("  Create one with: flow-go projects --new")
+		fmt.Println()
 		return 0
 	}
 	for i, project := range projects {
@@ -550,7 +577,7 @@ func runProjects(args []string) int {
 		if !project.Modified.IsZero() {
 			modified = project.Modified.Format(time.RFC3339)
 		}
-		fmt.Printf("  %s %-40s %s\n", marker, project.ID, modified)
+		fmt.Printf("  %s %-40s %-18s %s\n", marker, project.ID, project.Label, modified)
 	}
 	fmt.Println()
 	fmt.Println("  * is the project a run picks when none is named.")

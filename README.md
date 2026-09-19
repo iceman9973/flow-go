@@ -638,37 +638,45 @@ browser for the same reason a failed call does: neither can name a project. In
 that state *both* routes are empty, and the remedy is to create a project or set
 `FLOW_PROJECT_ID` — the browser is not a better source, it is the same source.
 
-### Creating a project, and why there is no RPC for it
+### Creating a project
 
-The long-standing note here was "there is no project-create RPC". That is still
-true, and now it is known *why*: the app does not call one. Clicking **New
-project** generates a uuid in the page and navigates to `/project/<uuid>`; no
-batchexecute request accompanies the click. The id is minted client-side.
+The standing note here was "there is no project-create RPC". That was wrong, and
+it stayed wrong because of *where* the search was done: clicking **New project**
+mints a uuid in the page and navigates to `/project/<uuid>`, with no request
+beside the click. Looking at the click, there was nothing to find.
 
-Which raises the question the id's absence implies — does the server care? It
-does not. A **never-before-seen uuid is accepted as a project id and the
-generation succeeds**:
+The call exists — `jHPbke` — and the app does not make it. It was captured by
+instrumenting the page's `fetch` and `XMLHttpRequest` rather than polling the
+extension's event buffer, which rotates within seconds and lost the request every
+time. The argument, decoded from that capture:
 
 ```
-POST /v1/debug/batchexecute-generate  {"project_id": "5a559e04-…", …}
-→ 200, an image, and a signed flow-content.google URL
+["projects/*", [null, ["<label>"]], [null, 22]]
 ```
 
-So `FLOW_PROJECT_ID` can be set to any uuid and generation works immediately.
-There is no registration step to miss.
+`22` is the same constant every generation's context block carries. The label is
+a display name — the app uses the local date and time — and the listing shows it
+verbatim. The response is `[<project-id>, [<label>]]`, so the id is handed back
+rather than having to be re-listed.
 
-**But such a project is invisible to the app.** It does not appear in `UpteDb`,
-and navigating a tab to it does not make it appear either — the two projects
-that do appear are the two created by the New-project button. A minted id is
-therefore usable but orphaned: good enough to generate into, not good enough to
-find again. Treat it as a way to unblock a browserless run, not as a substitute
-for creating a project in the app.
+```bash
+flow-go projects --new                     # create, and print the id
+flow-go projects --new --label "brief 3"   # with your own display name
+curl -X POST localhost:8200/v1/projects -d '{"label":"brief 3"}'
+```
 
-The registration call the button *does* make was not captured — the extension's
-event buffer is small and rotates within seconds, and a capture that caught one
-project's creation saw only `rpcids=jHPbke`, which is the lead if programmatic
-creation is ever wanted. Note that the event buffer is the obstacle here, not the
-app: the capture has to be armed and read within the same second as the click.
+**The server also accepts a uuid that has never existed.** A minted one works for
+generation immediately, with no registration step — verified with a freshly
+generated uuid, which returned 200 and a signed content URL. But such a project
+is **invisible to the app**: it never appears in the listing, and navigating a
+tab to it does not make it appear. That is the difference the create call makes,
+and the reason to prefer it over minting by hand.
+
+An empty listing is a real answer, not an error. Verified against the app itself:
+when `UpteDb` came back empty, `flow.google.com/u/0/` showed only "New project" —
+the two agree. In that state both the listing and the browser are empty, so
+`projects --new` is the way out; the browser is not a better source, it is the
+same source.
 
 ### Token caching
 

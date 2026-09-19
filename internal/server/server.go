@@ -1309,6 +1309,23 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 		})
 	})
 
+	// Create a project. Over the transport, so no browser and no click.
+	app.Post("/v1/projects", func(c fiber.Ctx) error {
+		var req struct {
+			Label string `json:"label"`
+		}
+		_ = c.Bind().JSON(&req)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		project, err := eng.CreateProject(ctx, req.Label)
+		if err != nil {
+			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.Status(201).JSON(fiber.Map{"project": project})
+	})
+
 	// Switch which signed-in Google account the engine acts as.
 	//
 	// A browser can hold several accounts at once and they share one cookie jar,

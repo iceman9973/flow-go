@@ -677,6 +677,27 @@ func (e *Engine) ListProjects(ctx context.Context) ([]batchexecute.Project, erro
 	return client.ProjectList(callCtx, batchexecute.CallOptions{SourcePath: "/"})
 }
 
+// CreateProject creates a Flow project and returns it.
+//
+// This is how a run gets a project that the app can also see, with no browser
+// involved. It matters more than it sounds: a uuid minted by hand is accepted
+// for generation but never appears in the listing, so before this the only way
+// to make a *findable* project was to click New project in the browser.
+func (e *Engine) CreateProject(ctx context.Context, label string) (batchexecute.Project, error) {
+	jar := e.bridge.Jar()
+	if jar == nil {
+		return batchexecute.Project{}, fmt.Errorf("engine: no cookies loaded")
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	client := e.newBatchexecuteClient(jar, e.hc)
+	client.SetAuthUser(e.AccountIndex())
+
+	return client.CreateProject(callCtx, label)
+}
+
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
 func (e *Engine) CaptchaToken(ctx context.Context, action string) (string, error) {
 	e.mu.RLock()

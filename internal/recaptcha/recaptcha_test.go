@@ -70,7 +70,7 @@ func TestNewBrokerKeepsTheResolver(t *testing.T) {
 // nil one, in every mode.
 func TestBuildFallsBackWithoutABroker(t *testing.T) {
 	for _, mode := range []string{"", "auto", "broker", "http"} {
-		p := Build(mode, nil, nil, nil, nil)
+		p := Build(mode, nil, nil, nil, nil, "")
 		if p == nil {
 			t.Errorf("mode %q: Build returned nil", mode)
 			continue
@@ -85,7 +85,7 @@ func TestBuildFallsBackWithoutABroker(t *testing.T) {
 // must actually include the broker, so the high-score path is not silently
 // dropped by the signature change.
 func TestBuildNamesTheBrokerWhenPresent(t *testing.T) {
-	p := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil)
+	p := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil, "")
 	if p == nil {
 		t.Fatal("Build returned nil")
 	}
@@ -106,7 +106,7 @@ func TestBuildNamesTheBrokerWhenPresent(t *testing.T) {
 // and that case still needs it.
 func TestAutoChainPrefersTheFlowOperation(t *testing.T) {
 	resolver := func() *cdp.Client { return nil }
-	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, resolver)
+	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, resolver, "")
 
 	chain, ok := built.(*Chain)
 	if !ok {
@@ -134,7 +134,7 @@ func TestAutoChainPrefersTheFlowOperation(t *testing.T) {
 // TestAutoChainOmitsTheFlowProviderWithoutAResolver keeps the old behaviour
 // reachable: a caller that cannot resolve a client gets the chain it had before.
 func TestAutoChainOmitsTheFlowProviderWithoutAResolver(t *testing.T) {
-	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil)
+	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil, "")
 
 	chain, ok := built.(*Chain)
 	if !ok {

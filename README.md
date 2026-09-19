@@ -751,19 +751,56 @@ The token can be minted two ways, and they are not equivalent.
 
 | Provider | Needs a browser | Video submission |
 | --- | --- | --- |
-| `flow.captcha` (page) | yes | **submitted** — media id returned, credits charged |
-| `http` (anchor/reload protocol) | no | **empty** — no media id, nothing charged |
+| `flow.captcha` (page) | yes | submitted — media id returned, credits charged |
+| `http` (anchor/reload protocol) | no | **works, once the client matches** |
 
-Measured as an A/B, same server, same project, same prompt, same model, only the
-provider varied. The HTTP provider also failed against a second, older project, so
-the project is not the variable. The earlier one success out of four attempts is
-not enough to call it flaky rather than broken — treat it as broken.
+Measured as a 2×2, same server, same project, same prompt, same model, one free
+image per cell — only the two provider constants varied:
 
-This matters because the failure is **silent**. Flow accepts the request, answers
-`200`, returns an empty frame and charges nothing. There is no error to catch and
-no status to check, so it reads exactly like a wrong model key or a wrong RPC id —
-which is where the diagnostic used to send the reader. It now names the provider
-and says so:
+| `co` (origin) | User agent | Result |
+| --- | --- | --- |
+| `labs.google` | Windows Chrome 124 | empty |
+| `flow.google.com` | Windows Chrome 124 | empty |
+| `labs.google` | **macOS Chrome 153** | **succeeded** |
+| `flow.google.com` | **macOS Chrome 153** | **succeeded** |
+
+**The user agent is the whole fix.** `recaptchaUA` was pinned to Windows Chrome
+124 while the client is macOS Chrome 153, so the provider asked reCAPTCHA for a
+token as a Windows machine and the engine spent it as a Mac. That is precisely
+what the fingerprint note below warns about — "a captcha-bearing call is checked
+against the client the reCAPTCHA assessment was made for" — and the provider was
+the one place the rule was not applied.
+
+The origin makes no difference and is set to `flow.google.com` only because that
+is where the app now is; it is derived from `recaptchaOrigin` so the two cannot
+drift apart, and pinned by a test so the experiment is not repeated.
+
+Verified with **no bridge attached and no browser tab involved**:
+
+```
+recaptcha: provider flow.captcha failed: recaptcha: no extension attached
+recaptcha: token acquired via http (2340 chars)
+engine: submitted 1 video(s) as abra_t2v_4s_360p in 40.2s
+status: "ready"        output/acct-9fc91947-c33.mp4   802,299 bytes
+```
+
+#### What does not work, and why it is worth knowing
+
+The page mints through `POST https://www.google.com/recaptcha/enterprise/clr?k=<siteKey>`
+with a 1908-byte protobuf body — field 1 is the site key, field 2 is 1864 bytes of
+opaque state. Two mints produce **byte-identical** bodies, so replay looks
+obviously viable.
+
+It is not. The response is empty, **including for the page itself**. The token is
+assembled in JS by `enterprise.js` from that challenge plus client-side signals;
+no request returns it. There is therefore no cookie to carry across and no request
+to replay — which is why the fix is to make the client match rather than to
+reproduce a payload.
+
+This matters because the failure is otherwise silent. Flow accepts the request,
+answers `200`, returns an empty frame and charges nothing. There is no error to
+catch and no status to check, so it reads exactly like a wrong model key or a
+wrong RPC id. The diagnostic now names the provider:
 
 ```
 engine: nothing submitted for abra_t2v_4s_360p — it costs 4 credits at 360p and the
@@ -772,13 +809,6 @@ The reCAPTCHA token came from "http". A token minted without a browser scores lo
 and Flow answers an empty result rather than an error, which is the usual cause here
 — attach the extension so the page can mint one.
 ```
-
-So `--captcha http` is a real option for images and for the read-only calls, and a
-trap for video. The HTTP provider is not fixable from here: it speaks the Enterprise
-anchor/reload protocol without a page, which yields a lower-scoring assessment, and
-raising that score means running a browser or a captcha-solving service. The browser
-dependency for video is genuine; the useful work is keeping it to *one* thing — a
-page that is already loaded — rather than chasing it away.
 
 ### Video
 

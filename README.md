@@ -571,39 +571,35 @@ The settings that matter most:
 ### What the browser is for, and what the API is for
 
 The generation itself never goes through the browser. Every RPC — submit, poll,
-media detail, credits, upscale — is a `POST` to batchexecute from the Go process,
-authenticated by `SAPISIDHASH` over cookies. The browser is not a proxy; it is a
-key holder.
+media detail, credits, project list, project create — is a `POST` to batchexecute
+from the Go process, authenticated by `SAPISIDHASH` over cookies. The browser is
+not a proxy; it is a key holder.
 
-Four things only exist in a loaded Flow editor page, and none can be minted from
-a cookie jar:
+What used to need a loaded page, and what still does:
 
-| What | Why it cannot come from the API |
+| What | State |
 | --- | --- |
-| reCAPTCHA token | The widget is rendered in the page. `flow.captcha` asks the page to run `grecaptcha.enterprise.execute`, which scores better than the HTTP provider |
-| `at` and `f.sid` | The anti-CSRF token and session id the app puts on every request. Page-only |
-| Current cookies | `__Secure-1PSIDTS` rotates on Google's schedule; the page always holds the live pair |
+| reCAPTCHA token | **avoidable** — the HTTP provider works once it presents the same client as the engine. See "The reCAPTCHA token is load-bearing for video" |
+| Project id | **avoidable** — listed and created over the transport |
+| `at` and `f.sid` | avoidable — without them the client primes for a token itself |
+| Current cookies | not avoidable, but a snapshot carries them across processes |
+| **Image upscale (`SPrCad`)** | **not avoidable** — the one call that still has to be made by the page |
 
-That is the whole reason a tab opens. It is also why "why does it need a browser
-if it calls an API" is the wrong question — the API call is the work, and the
-browser is what proves the call is allowed.
+So a browserless run can now create a project, generate an image, generate a video,
+poll it, resolve it and download it — all over the transport, with no tab involved
+and no extension attached. Verified: `acct-9fc91947-c33.mp4`, 802,299 bytes,
+`status: "ready"`, with `flow.captcha failed: no extension attached` in the log.
 
-**Three of the four are now avoidable.** The project id used to be on this list,
-on the belief that no RPC could list projects. That belief was wrong and it was
-expensive: the id believed to be the listing (`WuwhI`) is the generation-status
-RPC, and it answers `null` to everything else. The real one is `UpteDb`, takes
-`["projects/*", 21, …]`, and returns the account's projects with timestamps —
-over the transport, with no tab involved. See "Where a project id comes from".
+The one remaining dependency is image upscaling, which is documented under "The
+image upscale runs in the browser, deliberately" — it is a stricter check on that
+RPC rather than a missing credential, and it is not the fingerprint.
 
-`at` and `f.sid` are already optional — without them the client primes for a
-token itself. Cookies and the reCAPTCHA token are not avoidable; they are the
-credentials.
-
-Note that configuring or listing a project does **not** stop the pre-submit
-navigation. That one is separate: `ensureProjectTab` runs before every generation
-so the reCAPTCHA widget has a page to render in. It navigates the tab already
-attached rather than opening a new one, so repeated switches do not accumulate
-tabs.
+Note that `ensureProjectTab` still runs before every generation and navigates a
+tab when a bridge is attached. It is now belt-and-braces rather than a
+requirement: it keeps the higher-scoring page token in play when a browser is
+there, and a browserless run simply falls through to the HTTP provider. It
+navigates the tab already attached rather than opening a new one, so repeated
+switches do not accumulate tabs.
 
 ### Where a project id comes from
 
@@ -1089,12 +1085,20 @@ header order all produce the identical rejection. The full table is under "What 
 not done yet" below. Tellingly, the generation RPC over the same Go transport
 *does* succeed, so `SPrCad` applies a stricter client check than generation does.
 
+Confirmed again after the reCAPTCHA fix, because that fix changed exactly the kind
+of thing this list is about: the request now goes out under the browser's real
+identity — macOS Chrome 153, `sec-ch-ua` and all, echoed back in the response — and
+it is still rejected. `use_quic` makes no difference either. So this is not the
+fingerprint mismatch that was blocking the captcha, and it is not the transport
+version. It is a stricter check on this RPC specifically, and nothing the client
+can currently vary gets past it.
+
 So the request is made by the page, which is already required for the captcha
 broker. This is a real constraint, not a shortcut: **image upscaling needs the
-browser attached.** The Go-side implementation is kept in
-`internal/batchexecute/client.go` (`UpscaleImage`) and is correct as far as the
-protocol goes, but it will be rejected until the transport can match the browser's
-fingerprint.
+browser attached** — and as of the reCAPTCHA fix it is the *only* thing that does.
+The Go-side implementation is kept in `internal/batchexecute/client.go`
+(`UpscaleImage`) and is correct as far as the protocol goes, but it will be
+rejected until the transport can match whatever else this RPC checks.
 
 ### What is not done yet
 

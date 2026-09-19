@@ -216,12 +216,16 @@ upscales, and the engine routes video.
 
 Two consequences worth knowing:
 
-- `GenerateImage` and `UploadImage` pass `cost = 0`, and `Affordable` returns true
-  for `cost <= 0`. So the affordability check is effectively disabled on those
-  paths — a broke account is scheduled and then fails upstream. Only video has a
-  pre-flight gate.
-- `Worker.Affordable` treats an unknown balance as affordable, so even the pooled
-  paths will accept an account whose balance has not been read.
+- **Image generation is free**, which is why `GenerateImage` and `UploadImage` pass
+  `cost = 0` — that is deliberate, not a missing gate. Verified live: an image
+  render leaves the balance unchanged. The same `cost <= 0` shortcut is what makes
+  `Affordable` return true unconditionally on those paths, which is the correct
+  answer for a free operation. Only video has a pre-flight gate, because only video
+  costs anything.
+- `Worker.Affordable` treats an **unknown** balance as affordable, so a pooled path
+  will accept an account whose balance has simply not been read. For video that no
+  longer matters — the gate reads the balance itself — but it does mean the pool's
+  own affordability check is advisory rather than binding.
 
 `Bootstrap` calls `pool.Retain(accountID)` before registering, so a switch does not
 leave the previous account's worker behind. Without it the pool accumulates

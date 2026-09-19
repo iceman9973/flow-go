@@ -2366,9 +2366,23 @@ func (e *Engine) UpscaleViaBatch(ctx context.Context, req BatchUpscaleRequest) (
 	client := e.newBatchexecuteClient(jar, e.hc)
 
 	// The RPC needs the source asset's *content* id, which is not the media id
-	// the caller has. Resolve it from the project listing.
-	source, err := e.findAsset(ctx, client, projectID, req.MediaID)
-	if err != nil {
+	// the caller has. Resolve it from the project listing, retrying briefly: an
+	// asset that was just uploaded is not in the listing the moment the upload
+	// returns.
+	var source batchexecute.ProjectAsset
+	sourceFound := false
+	if _, err := awaitAsset(ctx, func() (bool, error) {
+		var resolveErr error
+		source, sourceFound, resolveErr = e.findAsset(ctx, client, projectID, req.MediaID)
+		return sourceFound, resolveErr
+	}); err != nil {
+		e.finishJob(jobID, "failed", nil, start, err)
+		return nil, err
+	}
+	if !sourceFound {
+		err := fmt.Errorf(
+			"engine: %s is not in the project listing, so its content id cannot be resolved",
+			req.MediaID)
 		e.finishJob(jobID, "failed", nil, start, err)
 		return nil, err
 	}
@@ -2489,6 +2503,46 @@ func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType,
 	return mediaID, contentID, nil
 }
 
+// assetResolveWindow bounds how long an id is retried while the project listing
+// catches up with a just-completed upload.
+//
+// An upload returns its ids before the listing carries the row — measured at about
+// eight seconds — so conditioning on an upload that had just succeeded reported
+// "not in the project listing" for an asset that was there by the time anyone
+// looked. The window is deliberately short: a genuinely absent id is still a client
+// error and should be reported as one rather than waited on.
+//
+// Both this and the interval are variables so a test can shrink them; thirty
+// seconds of real waiting in a unit test is not a test anyone runs.
+var (
+	assetResolveWindow   = 30 * time.Second
+	assetResolveInterval = 3 * time.Second
+)
+
+// awaitAsset retries resolve until it finds the asset or the window closes.
+//
+// Shared by both id-to-content-id paths, because either can be handed an id from an
+// upload that has not reached the listing yet. `resolve` reports whether it found
+// the asset; an error from it is returned at once, since a failed listing call is
+// not something waiting will fix.
+func awaitAsset(ctx context.Context, resolve func() (bool, error)) (bool, error) {
+	deadline := time.Now().Add(assetResolveWindow)
+	for {
+		found, err := resolve()
+		if err != nil || found {
+			return found, err
+		}
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		select {
+		case <-time.After(assetResolveInterval):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
 // conditionImageID resolves whatever the caller supplied into the id a generation
 // actually needs — the asset's *content* id.
 //
@@ -2496,6 +2550,9 @@ func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType,
 // startImage/endImage, and a submission carrying a media id instead is accepted
 // and returns an empty result. A caller who has just uploaded a file naturally
 // holds the media id, so both are accepted here and mapped.
+//
+// An id that is not in the listing yet is retried rather than rejected, for the
+// upload reason above.
 func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", nil
@@ -2510,21 +2567,34 @@ func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
 
-	assets, err := client.ProjectAssets(ctx, e.ProjectID())
+	resolved := ""
+	found, err := awaitAsset(ctx, func() (bool, error) {
+		assets, err := client.ProjectAssets(ctx, e.ProjectID())
+		if err != nil {
+			return false, err
+		}
+		for _, asset := range assets {
+			if asset.ContentID == id {
+				resolved = id // already a content id
+				return true, nil
+			}
+		}
+		for _, asset := range assets {
+			if asset.MediaID == id {
+				resolved = asset.ContentID
+				return true, nil
+			}
+		}
+		return false, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	for _, asset := range assets {
-		if asset.ContentID == id {
-			return id, nil // already a content id
-		}
+	if !found {
+		return "", fmt.Errorf(
+			"engine: %s is not in the project listing, so its content id cannot be resolved", id)
 	}
-	for _, asset := range assets {
-		if asset.MediaID == id {
-			return asset.ContentID, nil
-		}
-	}
-	return "", fmt.Errorf("engine: %s is not in the project listing, so its content id cannot be resolved", id)
+	return resolved, nil
 }
 
 // ResolveContentID looks up an asset's content id from its media id.
@@ -2549,9 +2619,19 @@ func (e *Engine) ResolveContentID(ctx context.Context, mediaID string) (string, 
 	}
 
 	client := e.newBatchexecuteClient(jar, e.hc)
-	asset, err := e.findAsset(ctx, client, projectID, mediaID)
-	if err != nil {
+
+	var asset batchexecute.ProjectAsset
+	found := false
+	if _, err := awaitAsset(ctx, func() (bool, error) {
+		var resolveErr error
+		asset, found, resolveErr = e.findAsset(ctx, client, projectID, mediaID)
+		return found, resolveErr
+	}); err != nil {
 		return "", err
+	}
+	if !found {
+		return "", fmt.Errorf(
+			"engine: %s is not in the project listing, so its content id cannot be resolved", mediaID)
 	}
 	return asset.ContentID, nil
 }
@@ -2564,35 +2644,38 @@ func (e *Engine) ResolveContentID(ctx context.Context, mediaID string) (string, 
 // it — and they are not interchangeable. Picking the first match hands back a
 // derived asset, which the upscale RPC answers with nothing at all, so the
 // original is preferred explicitly.
-func (e *Engine) findAsset(ctx context.Context, client *batchexecute.Client, projectID, mediaID string) (batchexecute.ProjectAsset, error) {
+//
+// `found` is separate from `err` so a caller can tell "this id is not in the
+// listing" — which is worth waiting on after an upload — from "the listing call
+// failed", which is not.
+func (e *Engine) findAsset(ctx context.Context, client *batchexecute.Client, projectID, mediaID string) (asset batchexecute.ProjectAsset, found bool, err error) {
 	assets, err := client.ProjectAssets(ctx, projectID)
 	if err != nil {
-		return batchexecute.ProjectAsset{}, err
+		return batchexecute.ProjectAsset{}, false, err
 	}
 
 	var first, unsuffixed *batchexecute.ProjectAsset
-	for i, asset := range assets {
-		if asset.MediaID != mediaID {
+	for i := range assets {
+		if assets[i].MediaID != mediaID {
 			continue
 		}
 		if first == nil {
 			first = &assets[i]
 		}
-		if asset.TypeCode == batchexecute.AssetTypeOriginal {
-			return asset, nil
+		if assets[i].TypeCode == batchexecute.AssetTypeOriginal {
+			return assets[i], true, nil
 		}
-		if unsuffixed == nil && !strings.HasSuffix(asset.ContentID, "_upsampled") {
+		if unsuffixed == nil && !strings.HasSuffix(assets[i].ContentID, "_upsampled") {
 			unsuffixed = &assets[i]
 		}
 	}
 	if unsuffixed != nil {
-		return *unsuffixed, nil
+		return *unsuffixed, true, nil
 	}
 	if first != nil {
-		return *first, nil
+		return *first, true, nil
 	}
-	return batchexecute.ProjectAsset{}, fmt.Errorf(
-		"engine: %s is not in the project listing, so its content id cannot be resolved", mediaID)
+	return batchexecute.ProjectAsset{}, false, nil
 }
 
 // waitForUpscaledVideo polls until the queued upscale is downloadable, and

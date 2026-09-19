@@ -278,7 +278,16 @@ The upload argument, captured from the app:
 ```
 
 The app stores the name with spaces replaced by underscores, and the response
-carries the ids in its first row: `[content-id, project, media-id, "CAE", ...]`.
+carries the ids in its first row: `[media-id, project, …, content-id, …]`.
+
+**An upload is not in the listing the moment it returns.** The call hands back its
+ids immediately, but the project listing takes several seconds to carry the row —
+measured at about eight. Conditioning on an id straight after the upload therefore
+reported "not in the project listing" for an asset that was in the listing by the
+time anyone looked. Id resolution now retries while the asset is missing, for a
+30-second window, so the upload-then-generate sequence works without a sleep in
+between. A genuinely absent id still fails, and it still fails as a client error
+rather than after a wait.
 
 ### The legacy upload does not help
 

@@ -284,10 +284,13 @@ carries the ids in its first row: `[media-id, project, …, content-id, …]`.
 ids immediately, but the project listing takes several seconds to carry the row —
 measured at about eight. Conditioning on an id straight after the upload therefore
 reported "not in the project listing" for an asset that was in the listing by the
-time anyone looked. Id resolution now retries while the asset is missing, for a
-30-second window, so the upload-then-generate sequence works without a sleep in
-between. A genuinely absent id still fails, and it still fails as a client error
-rather than after a wait.
+time anyone looked.
+
+Id resolution now retries while the asset is missing, for a 30-second window.
+Measured live: an id that is not in the listing takes **35s** to be refused, where
+it used to fail in under 3s — so the retry is doing the waiting rather than the
+caller. A genuinely absent id still fails, and still fails as a client error rather
+than as a timeout.
 
 ### The legacy upload does not help
 

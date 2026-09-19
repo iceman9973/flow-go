@@ -1,0 +1,80 @@
+[
+ {
+  "rpc": "nprQif",
+  "url": "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=nprQif&source-path=%2Fproject%2Fd86bc0b4-30dc-4a52-9f3d-cb90be0079ea&bl=boq_labs-ai-sandbox-frontend_20260917.09_p0&f.sid=-111716954115646904&hl=en-IN&_reqid=4486338&rt=c",
+  "shape": [
+   [
+    [
+     [
+      null,
+      null,
+      [
+       [
+        [
+         "a wooden boat with the word zqxjkv painted on its side"
+        ]
+       ]
+      ]
+     ],
+     "omni_flash_i2v_8s_first_last",
+     2,
+     null,
+     [
+      null,
+      "1edd7a7d-1f1d-46a6-ab58-767a0db9f104",
+      null,
+      null,
+      null,
+      [
+       null,
+       null,
+       1,
+       1
+      ]
+     ],
+     [
+      null,
+      "1c716b4b-06a0-4db0-89a5-e0efee6628fe",
+      null,
+      null,
+      null,
+      [
+       null,
+       null,
+       1,
+       1
+      ]
+     ],
+     [
+      null,
+      null,
+      null,
+      null,
+      "890C54DA-C17B-48E1-A03B-D139ACADC253",
+      "2E3BC3BC-7F89-4744-BB21-5E03EA4ECC80"
+     ]
+    ]
+   ],
+   [
+    null,
+    22,
+    null,
+    null,
+    null,
+    "d86bc0b4-30dc-4a52-9f3d-cb90be0079ea",
+    null,
+    null,
+    null,
+    null,
+    [
+     "<STR 2468>",
+     1
+    ]
+   ],
+   [
+    "E39118B3-3D1D-47F2-848A-E8771B54A4AB",
+    2
+   ]
+  ]
+ }
+]

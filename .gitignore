@@ -1,0 +1,19 @@
+# Build artifacts
+/flow-go
+/dist/
+*.exe
+*.test
+
+# macOS metadata
+.DS_Store
+
+# Runtime state — never commit these
+/data/
+/output/
+/cookies/
+.env
+config.env
+
+# Anything that looks like a credential dump
+cookies*.json
+*_export*.json

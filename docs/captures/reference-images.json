@@ -1,0 +1,80 @@
+{
+ "rpc": "MZZa6b",
+ "model": "abra_r2v_4s",
+ "note": "reference-image (r2v) submission, captured from the app's own traffic. request[0][0][1] is the reference-image list \u2014 four [null, id] pairs. The prompt sits at index 0, ahead of them, unlike the i2v shape which puts it at index 2. request[0][0][10] carries a zero-tailed constant, kept verbatim.",
+ "shape": [
+  [
+   [
+    [
+     null,
+     null,
+     [
+      [
+       [
+        "make video "
+       ]
+      ]
+     ]
+    ],
+    [
+     [
+      null,
+      "<UUID>"
+     ],
+     [
+      null,
+      "<UUID>"
+     ],
+     [
+      null,
+      "<UUID>"
+     ],
+     [
+      null,
+      "<UUID>"
+     ]
+    ],
+    "abra_r2v_4s",
+    2,
+    null,
+    [
+     null,
+     null,
+     null,
+     null,
+     "<UUID>",
+     "<UUID>"
+    ],
+    null,
+    null,
+    null,
+    null,
+    [
+     [
+      "d351dd3c-0a12-1522-0000-000000000000"
+     ]
+    ]
+   ]
+  ],
+  [
+   null,
+   22,
+   null,
+   null,
+   null,
+   "<UUID>",
+   null,
+   null,
+   null,
+   null,
+   [
+    "<STR 2468>",
+    1
+   ]
+  ],
+  [
+   "<UUID>",
+   2
+  ]
+ ]
+}

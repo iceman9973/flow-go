@@ -1,0 +1,733 @@
+// Package cli implements the flow-go command line.
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/flow-go/internal/app"
+	"github.com/kodelyx/flow-go/internal/auth"
+	"github.com/kodelyx/flow-go/internal/batchexecute"
+	"github.com/kodelyx/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/internal/engine"
+	"github.com/kodelyx/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/internal/httpx"
+)
+
+// Version is the build version.
+const Version = "0.1.0"
+
+// Run dispatches a command. Returns a process exit code.
+func Run(args []string) int {
+	config.LoadEnv()
+
+	if len(args) == 0 {
+		fmt.Print(usage())
+		return 0
+	}
+
+	switch args[0] {
+	case "serve", "server":
+		return runServe(args[1:])
+	case "generate", "video":
+		return runGenerate(args[1:])
+	case "image":
+		return runImage(args[1:])
+	case "stats":
+		return runStats(args[1:])
+	case "export":
+		return runExport(args[1:])
+	case "cookies":
+		return runCookies(args[1:])
+	case "session-refresh":
+		return runSessionRefresh(args[1:])
+	case "batchexecute":
+		return runBatchExecute(args[1:])
+	case "version", "--version", "-v":
+		fmt.Printf("flow-go %s\n", Version)
+		return 0
+	case "help", "--help", "-h":
+		fmt.Print(usage())
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", args[0], usage())
+		return 2
+	}
+}
+
+func usage() string {
+	return `flow-go — Google Flow generation engine
+
+The browser supplies cookies and base information. Everything else — access
+tokens, project resolution, generation, polling, upscaling, downloads, storage —
+happens here, in Go. No generation request travels through a browser.
+
+USAGE
+  flow-go <command> [flags]
+
+COMMANDS
+  serve                 Start the HTTP API and the browser-Cdp extension bridge
+  generate              Generate a video
+  image                 Generate an image
+  stats                 Print database statistics
+  export [file]         Export statistics as JSON
+  cookies               Show cookie and credential status
+  version               Print the version
+
+COMMON FLAGS
+  --project-id          Flow project ID (default: resolved from the session)
+  --proxy               Route upstream traffic through one exit IP
+  --captcha             reCAPTCHA strategy: auto | broker | http | off
+  --db                  Database path
+
+GENERATE FLAGS
+  --prompt              Prompt text (required)
+  --aspect              landscape | portrait            (default landscape)
+  --duration            4 | 6 | 8 | 10                 (default 10)
+  --count               1..4                           (default 1)
+  --resolution          "" | 720p | 1080p | 4k
+  --start-image         Local image path or media ID
+  --end-image           Local image path or media ID
+  --reference           Repeatable; local path or media ID
+  --no-download         Skip writing the result to output/
+  --seed                Explicit seed for a reproducible take
+
+EXAMPLES
+  flow-go serve
+  flow-go generate --prompt "a paper boat on a river" --duration 8 --resolution 1080p
+  flow-go generate --prompt "slow push in" --start-image ./frame.png
+  flow-go image --prompt "a single red paper boat" --aspect square
+  flow-go stats
+`
+}
+
+/* ------------------------------------------------------------------ *
+ * Flags
+ * ------------------------------------------------------------------ */
+
+type commonFlags struct {
+	projectID string
+	proxy     string
+	captcha   string
+	db        string
+	email     string
+}
+
+func (c *commonFlags) bind(fs *flag.FlagSet) {
+	fs.StringVar(&c.projectID, "project-id", "", "Flow project ID")
+	fs.StringVar(&c.proxy, "proxy", "", "proxy URL for upstream traffic")
+	fs.StringVar(&c.captcha, "captcha", "auto", "reCAPTCHA strategy: auto|broker|http|off")
+	fs.StringVar(&c.db, "db", "", "database path")
+	fs.StringVar(&c.email, "email", "", "account email, used as the OAuth login hint")
+}
+
+func (c *commonFlags) build() (*app.App, error) {
+	return app.Build(app.Config{
+		ProjectID:   c.projectID,
+		ProxyURL:    c.proxy,
+		CaptchaMode: c.captcha,
+		DBPath:      c.db,
+	})
+}
+
+/* ------------------------------------------------------------------ *
+ * serve
+ * ------------------------------------------------------------------ */
+
+func runServe(args []string) int {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	port := fs.Int("port", config.HTTPPort, "HTTP API port")
+	_ = fs.Parse(args)
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("flow-go %s\n", Version)
+	fmt.Printf("  API            http://127.0.0.1:%d\n", *port)
+	fmt.Printf("  extension      ws://127.0.0.1:%d  (load ../browser-Cdp/extension/ in Chrome)\n", config.WSPort)
+	fmt.Printf("  database       %s\n", a.Store.Path())
+	fmt.Printf("  output         %s\n", config.OutputDir())
+	fmt.Println()
+	fmt.Println("Waiting for the browser-Cdp extension to connect...")
+
+	if err := a.Serve(ctx, *port); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * generate
+ * ------------------------------------------------------------------ */
+
+func runGenerate(args []string) int {
+	fs := flag.NewFlagSet("generate", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	prompt := fs.String("prompt", "", "prompt text")
+	aspect := fs.String("aspect", "landscape", "landscape or portrait")
+	duration := fs.Int("duration", config.DefaultDuration, "4, 6, 8, or 10")
+	count := fs.Int("count", 1, "number of variations")
+	resolution := fs.String("resolution", "", "720p, 1080p, or 4k")
+	startImage := fs.String("start-image", "", "local image path or media ID")
+	endImage := fs.String("end-image", "", "local image path or media ID")
+	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
+	seed := fs.Int64("seed", 0, "explicit seed")
+	var references stringList
+	fs.Var(&references, "reference", "reference image path or media ID (repeatable)")
+	_ = fs.Parse(args)
+
+	if *prompt == "" {
+		return fail(fmt.Errorf("--prompt is required"))
+	}
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := bootstrap(ctx, a); err != nil {
+		return fail(err)
+	}
+
+	req := engine.VideoRequest{
+		Prompt:          *prompt,
+		Aspect:          *aspect,
+		Duration:        *duration,
+		Count:           *count,
+		Resolution:      *resolution,
+		StartImage:      *startImage,
+		EndImage:        *endImage,
+		ReferenceImages: references,
+		Download:        !*noDownload,
+	}
+	if *seed != 0 {
+		req.Seed = seed
+	}
+
+	fmt.Printf("generating %d video(s) at %ds, %s", req.Count, req.Duration, req.Aspect)
+	if req.Resolution != "" {
+		fmt.Printf(", upscaled to %s", req.Resolution)
+	}
+	fmt.Println()
+
+	outcome, err := a.Engine.GenerateVideo(ctx, req)
+	if err != nil {
+		return fail(err)
+	}
+	printJSON(outcome)
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * image
+ * ------------------------------------------------------------------ */
+
+func runImage(args []string) int {
+	fs := flag.NewFlagSet("image", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	prompt := fs.String("prompt", "", "prompt text")
+	aspect := fs.String("aspect", "landscape", "landscape, 4x3, square, 3x4, portrait")
+	count := fs.Int("count", 1, "number of variations")
+	model := fs.String("model", "", "harbor_seal, narwhal, or gem_pix_2")
+	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
+	seed := fs.Int64("seed", 0, "explicit seed")
+	_ = fs.Parse(args)
+
+	if *prompt == "" {
+		return fail(fmt.Errorf("--prompt is required"))
+	}
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := bootstrap(ctx, a); err != nil {
+		return fail(err)
+	}
+
+	req := engine.ImageRequest{
+		Prompt:   *prompt,
+		Aspect:   *aspect,
+		Count:    *count,
+		Model:    *model,
+		Download: !*noDownload,
+	}
+	if *seed != 0 {
+		req.Seed = seed
+	}
+
+	outcome, err := a.Engine.GenerateImage(ctx, req)
+	if err != nil {
+		return fail(err)
+	}
+	printJSON(outcome)
+	return 0
+}
+
+// bootstrap makes sure the engine has a token. CLI commands have no extension
+// bridge, so they run entirely from the persisted cookie file.
+func bootstrap(ctx context.Context, a *app.App) error {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	return a.Engine.Bootstrap(ctx)
+}
+
+/* ------------------------------------------------------------------ *
+ * stats
+ * ------------------------------------------------------------------ */
+
+func runStats(args []string) int {
+	fs := flag.NewFlagSet("stats", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	asJSON := fs.Bool("json", false, "print raw JSON")
+	_ = fs.Parse(args)
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	stats, err := a.Store.Stats()
+	if err != nil {
+		return fail(err)
+	}
+
+	if *asJSON {
+		printJSON(stats)
+		return 0
+	}
+
+	fmt.Println()
+	fmt.Println("  flow-go — system statistics")
+	fmt.Println("  " + strings.Repeat("-", 52))
+	fmt.Printf("  %-24s %s\n", "database", stats.DatabaseFile)
+	fmt.Printf("  %-24s %s\n", "engine", stats.Engine)
+	fmt.Printf("  %-24s %d\n", "generations", stats.TotalGenerations)
+	fmt.Printf("  %-24s %d succeeded / %d failed / %d in flight\n",
+		"  breakdown", stats.Succeeded, stats.Failed, stats.InFlight)
+	fmt.Printf("  %-24s %d video / %d image\n", "  by kind", stats.VideosGenerated, stats.ImagesGenerated)
+	fmt.Printf("  %-24s %d\n", "media files", stats.TotalMedia)
+	fmt.Printf("  %-24s %s\n", "media size", humanBytes(stats.MediaBytes))
+	fmt.Printf("  %-24s %d\n", "upstream requests", stats.TotalRequests)
+	fmt.Printf("  %-24s %d\n", "credits spent", stats.CreditsSpent)
+	fmt.Printf("  %-24s %.0f ms\n", "average duration", stats.AvgElapsedMS)
+	fmt.Printf("  %-24s %d (%d active)\n", "tracked accounts", stats.TrackedAccounts, stats.ActiveAccounts)
+	if stats.FirstGeneration != nil && stats.LastGeneration != nil {
+		fmt.Printf("  %-24s %s .. %s\n", "activity window",
+			stats.FirstGeneration.Format(time.RFC3339), stats.LastGeneration.Format(time.RFC3339))
+	}
+	fmt.Println()
+	fmt.Println("  Every figure above is an aggregate over the rows actually present.")
+	fmt.Println()
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * export
+ * ------------------------------------------------------------------ */
+
+func runExport(args []string) int {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	_ = fs.Parse(args)
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	stats, err := a.Store.Stats()
+	if err != nil {
+		return fail(err)
+	}
+	accounts, _ := a.Store.ListAccounts()
+	generations, _ := a.Store.RecentGenerations(500)
+	media, _ := a.Store.RecentMedia(500)
+
+	payload := map[string]any{
+		"exported_at": time.Now().UTC().Format(time.RFC3339),
+		"stats":       stats,
+		"accounts":    accounts,
+		"generations": generations,
+		"media":       media,
+	}
+
+	target := ""
+	if fs.NArg() > 0 {
+		target = fs.Arg(0)
+	}
+	if target == "" {
+		target = filepath.Join(config.DataDir(), "export.json")
+	}
+
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fail(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fail(err)
+	}
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		return fail(err)
+	}
+
+	fmt.Printf("exported to %s\n", target)
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * cookies
+ * ------------------------------------------------------------------ */
+
+func runCookies(args []string) int {
+	fs := flag.NewFlagSet("cookies", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	showNames := fs.Bool("names", false, "list cookie names (values are never printed)")
+	_ = fs.Parse(args)
+
+	path := filepath.Join(config.CookieDir(), "cookies.json")
+	jar, err := cookiejar.LoadFile(path)
+	if err != nil {
+		fmt.Printf("  no cookies at %s\n", path)
+		fmt.Println()
+		fmt.Println("  Options:")
+		fmt.Println("    1. Load ../browser-Cdp/extension/ in Chrome and run `flow-go serve`; the extension")
+		fmt.Println("       hands over cookies automatically.")
+		fmt.Println("    2. POST a cookie dump to /api/sync-cookies.")
+		fmt.Println("    3. Write a JSON array of cookies to that path yourself.")
+		return 1
+	}
+
+	fmt.Println()
+	fmt.Printf("  %-24s %s\n", "cookie file", path)
+	fmt.Printf("  %-24s %d\n", "cookies", jar.Count())
+	fmt.Printf("  %-24s %s\n", "has credentials", yesNo(jar.HasAuthCookies()))
+	fmt.Printf("  %-24s %s\n", "jar hash", short(jar.Hash()))
+
+	if expiry, ok := jar.EarliestExpiry(); ok {
+		fmt.Printf("  %-24s %s\n", "earliest expiry", expiry.Format(time.RFC3339))
+		if time.Now().After(expiry) {
+			fmt.Println()
+			fmt.Println("  The credential cookies have expired. Re-sync from the browser.")
+		}
+	} else {
+		fmt.Printf("  %-24s %s\n", "earliest expiry", "session cookies only")
+	}
+
+	if *showNames {
+		fmt.Println()
+		fmt.Println("  cookie names:")
+		for _, name := range jar.Names() {
+			fmt.Printf("    %s\n", name)
+		}
+	}
+	fmt.Println()
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * session-refresh
+ * ------------------------------------------------------------------ */
+
+// runSessionRefresh rebuilds the Labs session cookie from the Google cookies
+// using the NextAuth + OAuth handshake, then reports whether the resulting token
+// is accepted by the generation API.
+//
+// This is the diagnostic for the failure mode where the session endpoint returns
+// a token but flags ACCESS_TOKEN_REFRESH_NEEDED, and the generation API then
+// rejects it with 401.
+func runSessionRefresh(args []string) int {
+	fs := flag.NewFlagSet("session-refresh", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	verify := fs.Bool("verify", true, "check the new token against the Flow API")
+	_ = fs.Parse(args)
+
+	path := filepath.Join(config.CookieDir(), "cookies.json")
+	jar, err := cookiejar.LoadFile(path)
+	if err != nil {
+		return fail(fmt.Errorf("could not read %s: %w", path, err))
+	}
+
+	fmt.Printf("  cookies        %d\n", jar.Count())
+	fmt.Printf("  credentials    %s\n", yesNo(jar.HasAuthCookies()))
+
+	hc, err := httpx.New(
+		httpx.WithTimeout(time.Duration(config.RequestTimeout)*time.Second),
+		httpx.WithProxy(common.proxy),
+	)
+	if err != nil {
+		return fail(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	fmt.Println("  rebuilding the Labs session from the Google cookies...")
+	rebuilt, err := auth.RefreshSessionToken(ctx, jar, hc, common.email)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n  session rebuild failed: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  new session token  %d chars\n", len(rebuilt))
+
+	newJar := auth.WithSessionToken(jar, rebuilt)
+	if err := newJar.Save(path); err != nil {
+		return fail(fmt.Errorf("could not save the rebuilt cookies: %w", err))
+	}
+	fmt.Printf("  written to     %s\n", path)
+
+	if !*verify {
+		return 0
+	}
+
+	// Mint a token from the rebuilt session and see whether the generation API
+	// accepts it. Without this the command would report success on a token that
+	// still gets rejected.
+	provider := auth.NewProvider(newJar, hc)
+	session, err := provider.ForceRefresh(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n  could not mint a token from the rebuilt session: %v\n", err)
+		return 1
+	}
+	fmt.Printf("  minted token   %d chars", len(session.AccessToken))
+	if session.Email != "" {
+		fmt.Printf(" for %s", session.Email)
+	}
+	fmt.Println()
+	if session.UpstreamError != "" {
+		fmt.Printf("  upstream says  %s\n", session.UpstreamError)
+	}
+
+	client := flowapi.New(provider, hc, flowapi.Options{AccountID: "verify"})
+	if _, _, err := client.Credits(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "\n  the Flow API still rejects the token: %v\n", err)
+		fmt.Fprintln(os.Stderr, "  The session cookie was rebuilt, but the account may need to sign in again in the browser.")
+		return 1
+	}
+
+	fmt.Println("  Flow API       token accepted")
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * batchexecute
+ * ------------------------------------------------------------------ */
+
+// runBatchExecute issues one batchexecute RPC and prints the response.
+//
+// This is the transport the current Flow app uses. Running it against a known
+// RPC id is the fastest way to tell whether cookie authentication is working,
+// independently of any generation logic.
+func runBatchExecute(args []string) int {
+	fs := flag.NewFlagSet("batchexecute", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	rpc := fs.String("rpc", batchexecute.RPCIDProjectList, "RPC id to invoke")
+	payload := fs.String("payload", "", "JSON argument for the RPC")
+	sourcePath := fs.String("source-path", "/project", "app route the call is made from")
+	buildLabel := fs.String("bl", "", "build label (the app's bl parameter)")
+	sessionID := fs.String("f-sid", "", "session id (the app's f.sid parameter)")
+	out := fs.String("out", "", "write the raw frames to this file instead of printing them")
+	list := fs.Bool("list", false, "list the discovered RPC ids and exit")
+	_ = fs.Parse(args)
+
+	if *list {
+		fmt.Println()
+		fmt.Println("  Discovered Flow RPC ids (all verified live against a signed-in account):")
+		fmt.Println()
+		fmt.Printf("  %-9s %-42s %s\n", "ID", "PURPOSE", "PAYLOAD")
+		fmt.Printf("  %-9s %-42s %s\n", "---", "-------", "-------")
+		for _, entry := range batchexecute.KnownRPCs {
+			fmt.Printf("  %-9s %-42s %s\n", entry.ID, entry.Name, entry.Payload)
+		}
+		fmt.Println()
+		fmt.Println("  Example:")
+		fmt.Println("    flow-go batchexecute --rpc HTrJv --payload '[]' \\")
+		fmt.Println("      --source-path /project/<project-id> \\")
+		fmt.Println("      --bl boq_labs-ai-sandbox-frontend_20260917.00_p0")
+		fmt.Println()
+		return 0
+	}
+
+	path := filepath.Join(config.CookieDir(), "cookies.json")
+	jar, err := cookiejar.LoadFile(path)
+	if err != nil {
+		return fail(fmt.Errorf("could not read %s: %w", path, err))
+	}
+
+	hc, err := httpx.New(
+		httpx.WithTimeout(time.Duration(config.RequestTimeout)*time.Second),
+		httpx.WithProxy(common.proxy),
+	)
+	if err != nil {
+		return fail(err)
+	}
+
+	client := batchexecute.New(jar, hc)
+
+	if client.SAPISID() == "" {
+		fmt.Fprintln(os.Stderr, "  no SAPISID cookie found — re-sync cookies from a signed-in browser")
+		return 1
+	}
+	auth, err := client.Authorization()
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Printf("  origin      %s\n", batchexecute.Origin)
+	fmt.Printf("  rpc         %s\n", *rpc)
+	fmt.Printf("  auth        %s\n", short(auth))
+
+	var arg any
+	if *payload != "" {
+		if err := json.Unmarshal([]byte(*payload), &arg); err != nil {
+			return fail(fmt.Errorf("--payload is not valid JSON: %w", err))
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	frames, err := client.CallWith(ctx, *rpc, arg, batchexecute.CallOptions{
+		SourcePath: *sourcePath,
+		BuildLabel: *buildLabel,
+		SessionID:  *sessionID,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n  %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  frames      %d\n\n", len(frames))
+
+	if *out != "" {
+		var buf strings.Builder
+		for i, frame := range frames {
+			fmt.Fprintf(&buf, "# frame %d (rpc %s)\n", i+1, frame.RPCID)
+			var pretty any
+			if err := json.Unmarshal(frame.Payload, &pretty); err == nil {
+				data, _ := json.MarshalIndent(pretty, "", "  ")
+				buf.Write(data)
+			} else {
+				buf.Write(frame.Payload)
+			}
+			buf.WriteString("\n\n")
+		}
+		if err := os.WriteFile(*out, []byte(buf.String()), 0o644); err != nil {
+			return fail(err)
+		}
+		fmt.Printf("  written to  %s (%d bytes)\n", *out, buf.Len())
+		return 0
+	}
+
+	for i, frame := range frames {
+		fmt.Printf("  --- frame %d (rpc %s) ---\n", i+1, frame.RPCID)
+		if len(frame.Payload) == 0 {
+			fmt.Println("  (empty payload)")
+			continue
+		}
+		var pretty any
+		if err := json.Unmarshal(frame.Payload, &pretty); err == nil {
+			data, _ := json.MarshalIndent(pretty, "  ", "  ")
+			fmt.Printf("  %s\n", truncateOutput(string(data), 1500))
+		} else {
+			fmt.Printf("  %s\n", truncateOutput(string(frame.Payload), 1500))
+		}
+	}
+	return 0
+}
+
+func truncateOutput(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + "\n  ... (truncated)"
+}
+
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
+func printJSON(value any) {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "could not render output: %v\n", err)
+		return
+	}
+	fmt.Println(string(data))
+}
+
+func fail(err error) int {
+	fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	return 1
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "yes"
+	}
+	return "no"
+}
+
+func short(hash string) string {
+	if len(hash) <= 16 {
+		return hash
+	}
+	return hash[:16]
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for value := n / unit; value >= unit; value /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}

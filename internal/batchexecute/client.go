@@ -369,7 +369,7 @@ var KnownRPCs = []struct {
 	{RPCIDMediaCatalog, "project asset catalog", `[1]`},
 	{RPCIDProjectMeta, "project metadata", `["<project-id>"]`},
 	{RPCIDAssets, "project assets", `[]`},
-	{RPCIDFlags, "feature flags", `[16]`},
+	{RPCIDFlags, "feature flags", `[14]`},
 	{RPCIDCapabilities, "capabilities", `[22]`},
 	{RPCIDExperiments, "experiment config", `[[4,8,5,6,9]]`},
 	{RPCIDMisc1, "misc query", `[]`},

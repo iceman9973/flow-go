@@ -638,6 +638,38 @@ browser for the same reason a failed call does: neither can name a project. In
 that state *both* routes are empty, and the remedy is to create a project or set
 `FLOW_PROJECT_ID` — the browser is not a better source, it is the same source.
 
+### Creating a project, and why there is no RPC for it
+
+The long-standing note here was "there is no project-create RPC". That is still
+true, and now it is known *why*: the app does not call one. Clicking **New
+project** generates a uuid in the page and navigates to `/project/<uuid>`; no
+batchexecute request accompanies the click. The id is minted client-side.
+
+Which raises the question the id's absence implies — does the server care? It
+does not. A **never-before-seen uuid is accepted as a project id and the
+generation succeeds**:
+
+```
+POST /v1/debug/batchexecute-generate  {"project_id": "5a559e04-…", …}
+→ 200, an image, and a signed flow-content.google URL
+```
+
+So `FLOW_PROJECT_ID` can be set to any uuid and generation works immediately.
+There is no registration step to miss.
+
+**But such a project is invisible to the app.** It does not appear in `UpteDb`,
+and navigating a tab to it does not make it appear either — the two projects
+that do appear are the two created by the New-project button. A minted id is
+therefore usable but orphaned: good enough to generate into, not good enough to
+find again. Treat it as a way to unblock a browserless run, not as a substitute
+for creating a project in the app.
+
+The registration call the button *does* make was not captured — the extension's
+event buffer is small and rotates within seconds, and a capture that caught one
+project's creation saw only `rpcids=jHPbke`, which is the lead if programmatic
+creation is ever wanted. Note that the event buffer is the obstacle here, not the
+app: the capture has to be armed and read within the same second as the click.
+
 ### Token caching
 
 A minted token is keyed on a hash of the cookie jar and carries a local TTL. New

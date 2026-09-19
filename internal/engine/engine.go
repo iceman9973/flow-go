@@ -1935,13 +1935,13 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 
 	outcome := &BatchVideoOutcome{
-		JobID:             jobID,
-		AccountID:         e.AccountID(),
-		ProjectID:         projectID,
-		Model:             model,
+		JobID:       jobID,
+		AccountID:   e.AccountID(),
+		ProjectID:   projectID,
+		Model:       model,
 		Quality:     quality,
 		CreditsCost: plan.Cost,
-		Status:            "submitted",
+		Status:      "submitted",
 	}
 	for _, frame := range frames {
 		outcome.MediaIDs = append(outcome.MediaIDs, batchexecute.ParseGeneratedMediaIDs(frame.Payload)...)

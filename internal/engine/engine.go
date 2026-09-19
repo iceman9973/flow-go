@@ -69,6 +69,16 @@ type Options struct {
 	// attached — a live page is always the better source.
 	AtToken string
 	Fsid    string
+	// Fingerprint is the browser identity to present when no bridge is attached,
+	// taken from a SessionSnapshot for the same reason as AtToken and Fsid.
+	//
+	// It is not decoration. A reCAPTCHA-bearing call is checked against the
+	// client the assessment was made for, so a process that mints a token and
+	// then presents a generic Chrome profile is rejected as unusual activity —
+	// which reads as a captcha failure but is a fingerprint mismatch. Without
+	// this, a browserless run can mint a perfectly good token and still have it
+	// thrown away, and the only clue is an empty result.
+	Fingerprint *flowapi.BrowserFingerprint
 }
 
 // Engine is the running system.
@@ -629,6 +639,14 @@ type SessionSnapshot struct {
 	AccountID string `json:"account_id,omitempty"`
 	// Index is the `authuser` index the snapshot was taken for.
 	Index int `json:"account_index"`
+	// Fingerprint is the browser identity the snapshot was taken under.
+	//
+	// Carried for the same reason as At and Fsid, and it was the missing one:
+	// the page tokens alone are not enough for a captcha-bearing call, because
+	// the assessment is checked against the client that made it. A browserless
+	// process that presents a generic Chrome profile has its token rejected, and
+	// the rejection is silent.
+	Fingerprint *flowapi.BrowserFingerprint `json:"fingerprint,omitempty"`
 }
 
 // SessionSnapshot reads the current browser-derived state.
@@ -650,7 +668,15 @@ func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) 
 		AccountID: e.accountID,
 		Index:     e.accountIndex,
 	}
+	fingerprint := e.fingerprint
 	e.mu.RUnlock()
+
+	// Read outside the lock: reading the bridge can block, and holding the
+	// engine lock across it would stall every other caller.
+	if fingerprint == nil {
+		fingerprint = e.browserFingerprint(ctx)
+	}
+	snapshot.Fingerprint = fingerprint
 	return snapshot, nil
 }
 
@@ -1109,6 +1135,15 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 
 func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerprint {
 	if e.bridge == nil || !e.bridge.Connected() {
+		// No browser to read from, so fall back to whatever a SessionSnapshot
+		// supplied. A generic Chrome profile is the last resort and is the one
+		// thing a captcha-bearing call cannot use, so it is worth carrying the
+		// real one across processes rather than leaving it at nil.
+		if e.opts.Fingerprint != nil {
+			log.Printf("engine: adopting the fingerprint from the session snapshot — %s",
+				truncate(e.opts.Fingerprint.UserAgent, 70))
+			return e.opts.Fingerprint
+		}
 		return nil
 	}
 

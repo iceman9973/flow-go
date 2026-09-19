@@ -91,21 +91,27 @@ COMMON FLAGS
 
 GENERATE FLAGS
   --prompt              Prompt text (required)
-  --aspect              landscape | portrait            (default landscape)
   --duration            4 | 6 | 8 | 10                 (default 10)
+  --quality             360p | 720p                    (default 720p)
   --count               1..4                           (default 1)
-  --resolution          "" | 720p | 1080p | 4k
-  --start-image         Local image path or media ID
+  --start-image         Local image path or media ID; makes it image-to-video
   --end-image           Local image path or media ID
-  --reference           Repeatable; local path or media ID
   --no-download         Skip writing the result to output/
-  --seed                Explicit seed for a reproducible take
+
+  --aspect, --resolution, --reference and --seed exist on the legacy aisandbox
+  transport and not on the batchexecute one. Asking for one is an error naming
+  it, rather than a flag that is accepted and then ignored.
+
+IMAGE FLAGS
+  --prompt              Prompt text (required)
+  --model               harbor_seal | narwhal | gem_pix_2
+  --no-download         Skip writing the result to output/
 
 EXAMPLES
   flow-go serve
-  flow-go generate --prompt "a paper boat on a river" --duration 8 --resolution 1080p
-  flow-go generate --prompt "slow push in" --start-image ./frame.png
-  flow-go image --prompt "a single red paper boat" --aspect square
+  flow-go generate --prompt "a paper boat on a river" --duration 8
+  flow-go generate --prompt "slow push in" --start-image ./frame.png --quality 360p
+  flow-go image --prompt "a single red paper boat"
   flow-go stats
 `
 }
@@ -182,20 +188,30 @@ func runGenerate(args []string) int {
 	var common commonFlags
 	common.bind(fs)
 	prompt := fs.String("prompt", "", "prompt text")
-	aspect := fs.String("aspect", "landscape", "landscape or portrait")
 	duration := fs.Int("duration", config.DefaultDuration, "4, 6, 8, or 10")
+	quality := fs.String("quality", "720p", "360p or 720p")
 	count := fs.Int("count", 1, "number of variations")
-	resolution := fs.String("resolution", "", "720p, 1080p, or 4k")
 	startImage := fs.String("start-image", "", "local image path or media ID")
 	endImage := fs.String("end-image", "", "local image path or media ID")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
-	seed := fs.Int64("seed", 0, "explicit seed")
+	// These four exist on the legacy aisandbox transport and not on the
+	// batchexecute one, which is the only one that works. They are still
+	// declared so that asking for one is an error naming it, rather than a flag
+	// the parser accepts and the engine silently ignores — which is the failure
+	// this codebase keeps recording.
+	aspect := fs.String("aspect", "", "not implemented on the batchexecute transport")
+	resolution := fs.String("resolution", "", "not implemented on the batchexecute transport")
+	seed := fs.Int64("seed", 0, "not implemented on the batchexecute transport")
 	var references stringList
-	fs.Var(&references, "reference", "reference image path or media ID (repeatable)")
+	fs.Var(&references, "reference", "not implemented on the batchexecute transport")
 	_ = fs.Parse(args)
 
 	if *prompt == "" {
 		return fail(fmt.Errorf("--prompt is required"))
+	}
+	if unsupported := unsupportedGenerateFlags(*aspect, *resolution, *seed, references); len(unsupported) > 0 {
+		return fail(fmt.Errorf("not implemented on the batchexecute transport: %s",
+			strings.Join(unsupported, ", ")))
 	}
 
 	a, err := common.build()
@@ -211,33 +227,47 @@ func runGenerate(args []string) int {
 		return fail(err)
 	}
 
-	req := engine.VideoRequest{
-		Prompt:          *prompt,
-		Aspect:          *aspect,
-		Duration:        *duration,
-		Count:           *count,
-		Resolution:      *resolution,
-		StartImage:      *startImage,
-		EndImage:        *endImage,
-		ReferenceImages: references,
-		Download:        !*noDownload,
-	}
-	if *seed != 0 {
-		req.Seed = seed
-	}
+	fmt.Printf("generating %d video(s) at %ds, %s\n", *count, *duration, *quality)
 
-	fmt.Printf("generating %d video(s) at %ds, %s", req.Count, req.Duration, req.Aspect)
-	if req.Resolution != "" {
-		fmt.Printf(", upscaled to %s", req.Resolution)
-	}
-	fmt.Println()
-
-	outcome, err := a.Engine.GenerateVideo(ctx, req)
+	// The batchexecute path, which is the one the app uses and the only one that
+	// works. This used to call GenerateVideo, whose aisandbox REST surface is
+	// legacy and cannot work at all — so the CLI was broken while the HTTP API,
+	// which had already moved, was fine.
+	outcome, err := a.Engine.GenerateVideoViaBatch(ctx, engine.BatchVideoRequest{
+		Prompt:     *prompt,
+		Duration:   *duration,
+		Quality:    *quality,
+		Count:      *count,
+		StartImage: *startImage,
+		EndImage:   *endImage,
+		Wait:       !*noDownload,
+		Download:   !*noDownload,
+	})
 	if err != nil {
 		return fail(err)
 	}
 	printJSON(outcome)
 	return 0
+}
+
+// unsupportedGenerateFlags names the generate flags the batchexecute transport
+// does not implement, so asking for one fails with its name instead of being
+// quietly dropped.
+func unsupportedGenerateFlags(aspect, resolution string, seed int64, references []string) []string {
+	var out []string
+	if strings.TrimSpace(aspect) != "" {
+		out = append(out, "--aspect")
+	}
+	if strings.TrimSpace(resolution) != "" {
+		out = append(out, "--resolution")
+	}
+	if seed != 0 {
+		out = append(out, "--seed")
+	}
+	if len(references) > 0 {
+		out = append(out, "--reference")
+	}
+	return out
 }
 
 /* ------------------------------------------------------------------ *
@@ -249,15 +279,27 @@ func runImage(args []string) int {
 	var common commonFlags
 	common.bind(fs)
 	prompt := fs.String("prompt", "", "prompt text")
-	aspect := fs.String("aspect", "landscape", "landscape, 4x3, square, 3x4, portrait")
 	count := fs.Int("count", 1, "number of variations")
 	model := fs.String("model", "", "harbor_seal, narwhal, or gem_pix_2")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
-	seed := fs.Int64("seed", 0, "explicit seed")
+	// Not implemented on the batchexecute transport; declared so asking for one
+	// is an error naming it rather than a silently ignored flag.
+	aspect := fs.String("aspect", "", "not implemented on the batchexecute transport")
+	seed := fs.Int64("seed", 0, "not implemented on the batchexecute transport")
 	_ = fs.Parse(args)
 
 	if *prompt == "" {
 		return fail(fmt.Errorf("--prompt is required"))
+	}
+	if unsupported := unsupportedGenerateFlags(*aspect, "", *seed, nil); len(unsupported) > 0 {
+		return fail(fmt.Errorf("not implemented on the batchexecute transport: %s",
+			strings.Join(unsupported, ", ")))
+	}
+	if *count != 1 {
+		// The image RPC takes one prompt and returns one asset. Saying so is
+		// better than accepting the flag and returning a single image.
+		return fail(fmt.Errorf("--count is not implemented on the batchexecute transport; " +
+			"submit twice for two images"))
 	}
 
 	a, err := common.build()
@@ -273,18 +315,12 @@ func runImage(args []string) int {
 		return fail(err)
 	}
 
-	req := engine.ImageRequest{
+	// The batchexecute path, which is the one the HTTP API already uses.
+	outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 		Prompt:   *prompt,
-		Aspect:   *aspect,
-		Count:    *count,
 		Model:    *model,
 		Download: !*noDownload,
-	}
-	if *seed != 0 {
-		req.Seed = seed
-	}
-
-	outcome, err := a.Engine.GenerateImage(ctx, req)
+	})
 	if err != nil {
 		return fail(err)
 	}

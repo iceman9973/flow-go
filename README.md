@@ -452,15 +452,60 @@ Aspects: `landscape`, `4x3`, `square`, `3x4`, `portrait`. Models:
 
 ```bash
 flow-go serve                          # API + extension bridge
-flow-go generate --prompt "..." --duration 8 --resolution 1080p
-flow-go image --prompt "..." --aspect square
+flow-go generate --prompt "..." --duration 8 --quality 720p
+flow-go generate --prompt "..." --start-image photo.jpg   # image-to-video
+flow-go image --prompt "..." --model narwhal
 flow-go stats                          # database statistics
 flow-go export stats.json              # full JSON export
 flow-go cookies                        # cookie and credential status
 ```
 
+Aspect is not a flag. It follows the model family, and the family follows the
+conditioning: text-to-video renders landscape, image-to-video renders portrait,
+at both qualities. `--aspect`, `--resolution`, `--seed` and `--reference` are
+declared so the error names them, and are rejected rather than silently ignored —
+a request that looks accepted and renders the wrong shape is worse than a refusal.
+
 `flow-go cookies` never prints a cookie value — only counts, names on request,
-and whether credentials are present.
+and whether credentials are present. It reads the same two candidates the engine
+does, in the same order (`data/cookies.json` first, then `cookies/cookies.json`),
+and names the one it did *not* use. An old copy sitting beside a fresh one is the
+first thing to check when a run behaves like it is holding yesterday's session,
+so the command says which file a run would actually load.
+
+### Where a run gets its session
+
+The browser is reachable through exactly one host, because the bridge port admits
+one. That leaves three cases, and a run picks whichever applies:
+
+| Situation | What happens |
+| --- | --- |
+| A server is running | The CLI asks it for a session snapshot and persists that, so its copy is never older than the run using it |
+| Nothing is listening on the port | The CLI listens itself. The extension connects to *it*, and cookies are read from the live page |
+| No browser either | Falls back to the persisted copy, which decays on Google's schedule |
+
+The middle row is the one that does not decay, and it is verified end to end —
+server stopped, no `--project-id`, nothing but the prompt:
+
+```
+bridge: listening for a browser extension on ws://127.0.0.1:9222 (token required)
+cdp: extension connected from 127.0.0.1:64619 (authenticated=true)
+bridge: extension offers 19 operations including the Flow surface — using the narrow calls
+bridge: synced 17 cookies (10 credential cookies, 0 unrelated dropped)
+  bridge           extension attached, cookies read live
+engine: using Flow project e5d6409a-…, read from https://flow.google.com/u/0/project/…
+engine: seeded the batchexecute anti-CSRF token from the page (42 chars)
+engine: adopted the page's f.sid (19 chars)
+engine: ready — account acct-0f68addbf5a1, 17 cookies (flow-go-extension)
+recaptcha: token acquired via flow.captcha (2510 chars)
+```
+
+Two extensions dial the same port, so both may connect; the bridge prefers the
+narrow Flow one and the line above shows it doing so. The generic one connects
+first and is used only until the Flow extension arrives. Note the account id:
+it is derived from the cookie set, and the rotating `__Secure-1PSIDTS` changes it,
+so a live read and a file read can legitimately produce different ids for the
+same signed-in user.
 
 ## The two extensions
 

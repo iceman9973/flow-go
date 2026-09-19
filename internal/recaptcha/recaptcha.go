@@ -8,7 +8,7 @@
 //
 // Three strategies are provided, in increasing order of effort:
 //
-//	BrokerProvider — asks the browser-Cdp extension to run the site's own
+//	BrokerProvider — asks the attached extension to run the site's own
 //	                 grecaptcha.enterprise.execute() in a signed-in tab. Highest
 //	                 score, since it runs in a real page.
 //	HTTPProvider   — speaks the reCAPTCHA Enterprise anchor/reload protocol over
@@ -314,7 +314,7 @@ func (p *HTTPProvider) releaseVersion(ctx context.Context) (string, error) {
 // after the provider is built, and the editor URL depends on it.
 type PageURLResolver func() string
 
-// BrokerProvider asks the browser-Cdp extension to run the page's own
+// BrokerProvider asks the attached extension to run the page's own
 // grecaptcha.enterprise.execute(). This is the highest-scoring strategy, because
 // it runs in a real signed-in page with the account's own fingerprint.
 type BrokerProvider struct {

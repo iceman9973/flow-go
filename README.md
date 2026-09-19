@@ -560,10 +560,44 @@ The settings that matter most:
 | `WS_PORT` / `HTTP_PORT` | Environment variables. Extension bridge and API ports. |
 | `ACCOUNT_INDEX` | Environment variable. Seeds which signed-in account to act as. Only a seed — once `/v1/accounts/switch` has been used, the stored index wins, so a deliberate choice survives a restart. |
 | `ACCOUNT_SCAN_LIMIT` | Environment variable, default 6. How many account indices are examined when looking for one that can pay. Chrome permits ten, but the scan costs a session, a profile and a balance read per index and runs on the request path. |
+| `FLOW_PROJECT_ID` | Environment variable. The project to generate into. Setting it stops the engine navigating a tab to discover one. Ranking: `--project-id`, then this, then the live page. |
 | `FLOW_ACCESS_TOKEN` | Environment variable. Supply a bearer token directly, bypassing cookie minting. |
 | `FLOW_SESSION_REBUILD` | Environment variable. `off` disables the pure-Go session rebuild, leaving the raw upstream error visible. |
 
 ## Design notes
+
+### What the browser is for, and what the API is for
+
+The generation itself never goes through the browser. Every RPC — submit, poll,
+media detail, credits, upscale — is a `POST` to batchexecute from the Go process,
+authenticated by `SAPISIDHASH` over cookies. The browser is not a proxy; it is a
+key holder.
+
+Four things only exist in a loaded Flow editor page, and none can be minted from
+a cookie jar:
+
+| What | Why it cannot come from the API |
+| --- | --- |
+| reCAPTCHA token | The widget is rendered in the page. `flow.captcha` asks the page to run `grecaptcha.enterprise.execute`, which scores better than the HTTP provider |
+| Project id | There is no project-create RPC. The id is read off an open editor's URL |
+| `at` and `f.sid` | The anti-CSRF token and session id the app puts on every request. Page-only |
+| Current cookies | `__Secure-1PSIDTS` rotates on Google's schedule; the page always holds the live pair |
+
+That is the whole reason a tab opens. It is also why "why does it need a browser
+if it calls an API" is the wrong question — the API call is the work, and the
+browser is what proves the call is allowed.
+
+**Two of the four are avoidable.** The project id can be configured
+(`FLOW_PROJECT_ID`, or `--project-id`), which removes the navigation that exists
+only to learn it. `at` and `f.sid` are already optional — without them the client
+primes for a token itself. Cookies and the reCAPTCHA token are not avoidable;
+they are the credentials.
+
+Note that configuring a project does **not** stop the pre-submit navigation. That
+one is separate: `ensureProjectTab` runs before every generation so the reCAPTCHA
+widget has a page to render in, and it is the same call that makes the tab the
+broker needs. It navigates the tab already attached rather than opening a new
+one, so repeated switches do not accumulate tabs.
 
 ### Token caching
 

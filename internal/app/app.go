@@ -17,8 +17,8 @@ import (
 	"github.com/kodelyx/flow-go/internal/store"
 )
 
-// DefaultTargets is what the browser-Cdp extension is allowed to attach to, and
-// the first entry is the URL it opens when it has no tab.
+// DefaultTargets is what the bridge is allowed to attach to, and the first entry
+// is the URL it opens when it has no tab.
 //
 // Both hosts are listed because Labs redirects: `labs.google/fx/tools/flow` is
 // the canonical entry point, but it lands on `flow.google.com`. An allowlist
@@ -106,6 +106,9 @@ func Build(cfg Config) (*App, error) {
 		AccountIndex: config.AccountIndex,
 		AtToken:      cfg.AtToken,
 		Fsid:         cfg.Fsid,
+		// The env value is a default, not an instruction, so it ranks below the
+		// browser. An explicit cfg.ProjectID still outranks both.
+		DefaultProjectID: config.ProjectID,
 	})
 	if err != nil {
 		_ = st.Close()

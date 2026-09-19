@@ -76,7 +76,7 @@ USAGE
   flow-go <command> [flags]
 
 COMMANDS
-  serve                 Start the HTTP API and the browser-Cdp extension bridge
+  serve                 Start the HTTP API and the Flow Go Bridge extension bridge
   generate              Generate a video
   image                 Generate an image
   stats                 Print database statistics
@@ -294,11 +294,11 @@ func runServe(args []string) int {
 
 	fmt.Printf("flow-go %s\n", Version)
 	fmt.Printf("  API            http://127.0.0.1:%d\n", *port)
-	fmt.Printf("  extension      ws://127.0.0.1:%d  (load ../browser-Cdp/extension/ in Chrome)\n", config.WSPort)
+	fmt.Printf("  extension      ws://127.0.0.1:%d  (load flow-go/flow-go-extension/ in Chrome)\n", config.WSPort)
 	fmt.Printf("  database       %s\n", a.Store.Path())
 	fmt.Printf("  output         %s\n", config.OutputDir())
 	fmt.Println()
-	fmt.Println("Waiting for the browser-Cdp extension to connect...")
+	fmt.Println("Waiting for the Flow Go Bridge extension to connect...")
 
 	if err := a.Serve(ctx, *port); err != nil {
 		return fail(err)

@@ -389,6 +389,17 @@ var (
 // not undone by the next restart.
 var AccountIndex = envInt("ACCOUNT_INDEX", 0)
 
+// ProjectID is a Flow project to generate into, for runs that should not have to
+// discover one from a browser.
+//
+// There is no project-create RPC, so the only way to *learn* a project id is to
+// read it off an open editor's URL. Naming one here removes that step: the
+// engine never has to navigate anywhere to find out where it is.
+//
+// Empty by default, and deliberately ranked below a live browser — see
+// engine.Options.DefaultProjectID for why.
+var ProjectID = envOr("FLOW_PROJECT_ID", "")
+
 // AccountScanLimit bounds how many signed-in account indices are examined when
 // looking for one that can pay for a job.
 //

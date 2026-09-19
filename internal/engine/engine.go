@@ -39,9 +39,19 @@ import (
 
 // Options configures the engine.
 type Options struct {
-	// ProjectID is the Flow project to generate into. Empty resolves from the
-	// session, then from config.DefaultProject.
+	// ProjectID is the Flow project to generate into. This is the caller's
+	// explicit choice and outranks every other source. Empty means "work it
+	// out", which asks the browser and then falls back to DefaultProjectID.
 	ProjectID string
+	// DefaultProjectID is used only when the caller named no project and the
+	// browser could not supply one. It exists so a browserless run can skip
+	// project discovery entirely: with a project id configured, the engine never
+	// has to open an editor tab just to learn which project it is in.
+	//
+	// It deliberately ranks *below* the browser. A remembered id goes stale — a
+	// project belongs to one signed-in account, and one from another account
+	// does not open — so a live page is the better answer whenever there is one.
+	DefaultProjectID string
 	// ProxyURL routes all of this account's traffic through one exit IP.
 	ProxyURL string
 	// CaptchaMode selects the reCAPTCHA strategy: auto, broker, http, or off.
@@ -716,13 +726,14 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// "no connection" while a perfectly good one is attached.
 	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(), e.captchaPageURL, e.bridge.Current)
 
-	// Prefer the project the browser is actually sitting on over the built-in
-	// default, which is a stale ID inherited from the Python engine's config.
-	// Asking the bridge to open the editor also primes the tab the reCAPTCHA
-	// broker needs, so this does double duty.
-	projectID := e.opts.ProjectID
-	if projectID == "" {
-		projectID = e.projectFromBrowser(ctx, index)
+	// Prefer the project the browser is actually sitting on over any configured
+	// default, which is a guess and can be stale. Asking the bridge to open the
+	// editor also primes the tab the reCAPTCHA broker needs, so this does double
+	// duty — but it is only worth doing when the caller did not already say.
+	projectID, projectSource := chooseProjectID(e.opts.ProjectID, e.opts.DefaultProjectID,
+		func() string { return e.projectFromBrowser(ctx, index) })
+	if projectSource == projectSourceConfigured {
+		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); the browser was not asked", projectID)
 	}
 
 	// Read the browser identity once and keep it: the flowapi client and every
@@ -834,6 +845,49 @@ func (e *Engine) setError(err error) {
 	e.mu.Unlock()
 }
 
+// Where a boot's project id came from.
+const (
+	projectSourceExplicit   = "explicit"
+	projectSourceConfigured = "configured"
+	projectSourceBrowser    = "browser"
+	projectSourceNone       = "none"
+)
+
+// chooseProjectID picks the Flow project a boot runs against.
+//
+// Three sources, and the ranking is deliberate:
+//
+//	explicit   — the caller named it. Outranks everything.
+//	configured — FLOW_PROJECT_ID. Also an instruction, and the reason this
+//	             function takes a callback: when one is set, the browser is
+//	             never asked, so a run does not have to open an editor tab just
+//	             to find out where it is. That navigation is the whole cost of
+//	             not knowing.
+//	browser    — the live page. The only source that cannot be stale, which is
+//	             why it is preferred over nothing, but it is discovery, not an
+//	             instruction, so it does not outrank a deliberate setting.
+//
+// askBrowser is called at most once, and only when nothing was configured. It is
+// a callback rather than a value because asking has side effects — it opens a
+// tab — and those should not happen when the answer is already known.
+//
+// A project id that is wrong fails visibly rather than silently: a project
+// belongs to one signed-in account, so another account's id does not open.
+func chooseProjectID(explicit, configured string, askBrowser func() string) (id, source string) {
+	if explicit != "" {
+		return explicit, projectSourceExplicit
+	}
+	if configured != "" {
+		return configured, projectSourceConfigured
+	}
+	if askBrowser != nil {
+		if id := askBrowser(); id != "" {
+			return id, projectSourceBrowser
+		}
+	}
+	return "", projectSourceNone
+}
+
 // projectFromBrowser asks the extension to open a Flow project editor and reads
 // the project ID off the resulting URL. Returns "" when the browser cannot help,
 // in which case the caller falls back to the configured default.
@@ -855,8 +909,8 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 		// sends the reader looking for the wrong problem — which is the same
 		// failure this codebase keeps recording.
 		log.Printf("engine: no Flow project could be determined from the browser (%v). "+
-			"The engine will start with no project, and a generation will fail until one "+
-			"is set: open a project in the browser once, or pass FLOW_PROJECT_ID", err)
+			"Falling back to the configured project, if there is one; otherwise open a "+
+			"project in the browser once, or set FLOW_PROJECT_ID", err)
 		return ""
 	}
 

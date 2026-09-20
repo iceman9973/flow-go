@@ -63,7 +63,7 @@ otherwise. The browser identity is read once and persisted to
 ## Checklist to run it
 
 1. Chrome, signed in to the Google account that has Flow access.
-2. **The Flow Go Bridge extension loaded** — `flow-go/flow-go-extension/`. That is
+2. **The Flow Go Bridge extension loaded** — `extension/`. That is
    the narrow one and the one this backend is built against: Flow hosts only, no
    `debugger` permission, and a fixed list of operations. The generic extension in
    the [Browser-cdp](https://github.com/kodelyx/Browser-cdp) repo also works and is

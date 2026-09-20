@@ -327,7 +327,7 @@ func runServe(args []string) int {
 
 	fmt.Printf("flow-go %s\n", Version)
 	fmt.Printf("  API            http://127.0.0.1:%d\n", *port)
-	fmt.Printf("  extension      ws://127.0.0.1:%d  (load flow-go/flow-go-extension/ in Chrome)\n", config.WSPort)
+	fmt.Printf("  extension      ws://127.0.0.1:%d  (load extension/ in Chrome)\n", config.WSPort)
 	fmt.Printf("  database       %s\n", a.Store.Path())
 	fmt.Printf("  output         %s\n", config.OutputDir())
 	fmt.Println()
@@ -759,7 +759,7 @@ func runCookies(args []string) int {
 		fmt.Printf("  no cookies at %s\n", strings.Join(candidates, " or "))
 		fmt.Println()
 		fmt.Println("  Options:")
-		fmt.Println("    1. Load flow-go/flow-go-extension/ in the browser and run `flow-go serve`;")
+		fmt.Println("    1. Load extension/ in the browser and run `flow-go serve`;")
 		fmt.Println("       the extension hands over cookies automatically.")
 		fmt.Println("    2. POST a cookie dump to /api/sync-cookies.")
 		fmt.Println("    3. Write a JSON array of cookies to one of those paths yourself.")

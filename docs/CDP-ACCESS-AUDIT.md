@@ -16,7 +16,7 @@
 >
 > **Two extensions, not one.** This audits the **generic** one
 > (`browser-Cdp/extension/`, `chrome.debugger`, `<all_urls>`). flow-go also ships its own
-> narrow bridge (`flow-go/flow-go-extension/`) which has **no** `debugger` permission, is
+> narrow bridge (`extension/`) which has **no** `debugger` permission, is
 > limited to Google hosts, and exposes a fixed list of Flow operations instead of
 > arbitrary CDP. Both dial `ws://127.0.0.1:9222`; the backend tells them apart by the
 > `ops` list the extension reports on `ping`, and prefers the narrow one when both are

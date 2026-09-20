@@ -1002,7 +1002,7 @@ func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
 	}
 	return nil, "", fmt.Errorf(
 		"engine: no cookies available. Open the browser with the Flow Go Bridge "+
-			"extension (flow-go/flow-go-extension) loaded, or place a cookie dump at %s",
+			"extension (extension/) loaded, or place a cookie dump at %s",
 		strings.Join(tried, " or "))
 }
 

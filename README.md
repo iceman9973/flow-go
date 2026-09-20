@@ -39,8 +39,8 @@ tokens and a reCAPTCHA token — and does the rest in Go.
 # 1. Build
 go build -o flow-go .
 
-# 2. Load flow-go-extension/ as an unpacked extension
-#    chrome://extensions -> Developer mode -> Load unpacked -> select flow-go-extension/
+# 2. Load extension/ as an unpacked extension
+#    chrome://extensions -> Developer mode -> Load unpacked -> select extension/
 #    (Optionally also load the generic extension — clone github.com/kodelyx/Browser-cdp
 #     and load its extension/ directory; see "The two extensions".)
 
@@ -509,7 +509,7 @@ same signed-in user.
 They are **separate projects** and neither is a subset of the other. Loading both is
 fine and is the normal debugging setup.
 
-| | `flow-go-extension/` | `Browser-cdp/extension/` |
+| | `extension/` | `Browser-cdp/extension/` |
 | --- | --- | --- |
 | Chrome name | **Flow Go Bridge** | **browser-Cdp** |
 | Belongs to | this repo | the [Browser-cdp](https://github.com/kodelyx/Browser-cdp) repo |
@@ -525,7 +525,7 @@ the default mints over the transport and never asks for it. Arbitrary CDP is a
 debugging convenience, not a requirement, and the narrow extension is the one that
 cannot be talked into driving an unrelated site.
 
-Load it as unpacked from `flow-go/flow-go-extension/`. The generic one is worth
+Load it as unpacked from `extension/`. The generic one is worth
 loading too when you need `cdp.evaluate` to see what a page actually looks like; it
 connects to the same backend.
 
@@ -1414,7 +1414,7 @@ are listed and created over it, and generation never travels through the page. S
 ```
 flow-go/
 ├── main.go                     entry point
-├── flow-go-extension/          the narrow Flow bridge (this repo's extension)
+├── extension/                  the narrow Flow bridge (this repo's extension)
 ├── internal/
 │   ├── app/                    assembly and lifecycle
 │   ├── auth/                   Labs session → access token

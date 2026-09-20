@@ -789,6 +789,10 @@ No API key. No bearer token. No `aisandbox-pa.googleapis.com`.
 
 ### The reCAPTCHA token: server-side works, and a cache made it look broken
 
+> **See [`docs/RECAPTCHA.md`](docs/RECAPTCHA.md)** for the full account — the mint
+> exchange, the failure signature to recognise, a checklist for an empty
+> generation, and everything already ruled out so it is not re-tested.
+
 > **Correction, twice over.** An earlier revision claimed the user agent was the
 > fix; that did not reproduce and was retracted. The retraction then claimed the
 > HTTP provider was inherently intermittent and the page token was the only

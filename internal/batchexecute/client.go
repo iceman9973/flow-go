@@ -1214,7 +1214,7 @@ func buildVideoArgument(req GenerateVideoRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		captchaPair(req.CaptchaToken),
+		[]any{req.CaptchaToken, 1},
 	}
 
 	return []any{
@@ -1239,7 +1239,7 @@ func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		captchaPair(req.CaptchaToken),
+		[]any{req.CaptchaToken, 1},
 	}
 
 	request := []any{
@@ -1725,7 +1725,7 @@ func (c *Client) UploadMedia(ctx context.Context, req UploadMediaRequest) (media
 	arg := []any{
 		[]any{
 			nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-			captchaPair(req.CaptchaToken),
+			[]any{req.CaptchaToken, 1},
 		},
 		base64.StdEncoding.EncodeToString(req.Data),
 		req.MimeType,
@@ -1900,7 +1900,7 @@ func buildEditArgument(req EditVideoRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		captchaPair(req.CaptchaToken),
+		[]any{req.CaptchaToken, 1},
 	}
 
 	return []any{
@@ -2014,7 +2014,7 @@ func buildReferenceArgument(req ReferenceVideoRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		captchaPair(req.CaptchaToken),
+		[]any{req.CaptchaToken, 1},
 	}
 
 	return []any{
@@ -2262,16 +2262,22 @@ func upscaleArgs(req ImageUpscaleRequest, resolution int, contextBlock []any) ([
 	return []any{mediaID, resolution, contextBlock}, sourcePath
 }
 
-// captchaPair is the [token, timestamp] pair the app puts in the context block.
+// captchaPair is the [token, second] pair the app puts in the context block.
 //
-// The second element is a millisecond clock reading, not a constant. This sent a
-// literal 1 for a long time — a value that decodes to 1970 — while the app sends
-// the time the request was made, and a token paired with a timestamp that cannot
-// be right is exactly the shape a forged request has.
+// The two RPC families disagree about the second element, and the captured
+// requests are unambiguous about it:
 //
-// Taken from the app's own SPrCad request, captured through the page:
+//	generation  [...,["0cAFcWeA…",1]]              — a literal 1
+//	upscale     [...,["0cAFcWeA…",1789878183099]]  — a millisecond clock reading
 //
-//	[...,["0cAFcWeA…",1789878183099]]
+// So this helper is for the upscale calls only. Everything else keeps the
+// literal, and the capture-pinned tests in this package assert exactly that:
+// a blanket change to a timestamp made four of them fail with
+// "captcha flag at [7][10][1] = 1789878411129, want 1".
+//
+// The upscale path had been sending 1 as well. A token paired with a timestamp
+// that decodes to 1970 is the shape a forged request has, and this RPC is the
+// one that answers PUBLIC_ERROR_UNUSUAL_ACTIVITY.
 func captchaPair(token string) []any {
 	return []any{token, time.Now().UnixMilli()}
 }

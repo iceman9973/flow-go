@@ -1706,7 +1706,7 @@ func helpText() string {
 	return `flow-go — Google Flow generation engine
 
 The browser supplies cookies and base information. Everything else — access
-tokens, project resolution, generation, polling, upscaling, downloads, storage —
+tokens, project resolution, generation, polling, downloads, storage —
 happens in this process. No generation request travels through a browser.
 
 ENDPOINTS

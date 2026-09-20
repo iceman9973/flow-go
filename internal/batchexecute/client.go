@@ -2143,12 +2143,13 @@ func isNonEmptyString(value any) bool {
 }
 
 // AssetTypeOriginal marks a row that is the asset as it was generated. Other
-// codes ("CAI", "CAM") mark derived assets — an upscale, a variant — which share
-// the same media id and are not interchangeable for the upscale RPC.
+// codes ("CAI", "CAM") mark derived assets — a variant, or an upscale — which share
+// the same media id and are not interchangeable.
 //
-// The meaning is inferred from behaviour rather than documentation: for the same
-// media id, SPrCad returns an image for the CAE row and returns nothing at all
-// for the CAI one.
+// The meaning is inferred from behaviour rather than documentation: for one media
+// id the CAE row answers with image data and the CAI row answers with nothing.
+// That was established through the image-upscale RPC, since removed, but
+// ResolveContentID and MediaDetail still depend on it.
 const AssetTypeOriginal = "CAE"
 
 // ProjectAsset is one entry from a project listing.

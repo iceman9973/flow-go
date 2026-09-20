@@ -71,7 +71,7 @@ func usage() string {
 	return `flow-go — Google Flow generation engine
 
 The browser supplies cookies and base information. Everything else — access
-tokens, project resolution, generation, polling, upscaling, downloads, storage —
+tokens, project resolution, generation, polling, downloads, storage —
 happens here, in Go. No generation request travels through a browser.
 
 USAGE

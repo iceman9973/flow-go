@@ -385,7 +385,7 @@ The path is reachable on demand rather than only when a session happens to expir
 which is how it was verified:
 
 ```
-batchexecute: SPrCad returned 401; refreshing the session and retrying
+batchexecute: as29s returned 401; refreshing the session and retrying
 bridge: attached to https://flow.google.com/project/… for a session refresh
 ```
 
@@ -1392,8 +1392,8 @@ regression test where the fix is behavioural.
 
 ### What the browser is still needed for
 
-Cookies, a signed-in Flow editor tab for the reCAPTCHA broker, and the one
-in-page call `SPrCad` needs. Generation itself never travels through it. See
+Cookies. That is the whole list: the captcha is minted over the transport, projects
+are listed and created over it, and generation never travels through the page. See
 `docs/WHAT-WE-NEED-FROM-THE-BROWSER.md`.
 
 ## Layout

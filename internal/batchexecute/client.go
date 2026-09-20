@@ -35,7 +35,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/internal/httpx"
 )
 

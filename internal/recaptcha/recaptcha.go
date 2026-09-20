@@ -35,7 +35,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kodelyx/cdp-control/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
 	"github.com/kodelyx/flow-go/internal/httpx"
 )
 

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kodelyx/cdp-control/cdp"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
 )
 
 // TestGotoRecaptchaPageIsANoOpWithoutAURL pins the optional part of the fix.

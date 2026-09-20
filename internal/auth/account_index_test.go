@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/internal/httpx"
 )
 

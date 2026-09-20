@@ -26,8 +26,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kodelyx/cdp-control/bridge"
-	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/internal/auth"
 	"github.com/kodelyx/flow-go/internal/batchexecute"
 	"github.com/kodelyx/flow-go/internal/config"

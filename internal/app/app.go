@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/kodelyx/cdp-control/bridge"
+	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
 	"github.com/kodelyx/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/internal/flowapi"

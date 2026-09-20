@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kodelyx/cdp-control/cookiejar"
+	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/internal/app"
 	"github.com/kodelyx/flow-go/internal/auth"
 	"github.com/kodelyx/flow-go/internal/batchexecute"

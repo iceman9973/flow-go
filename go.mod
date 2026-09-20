@@ -26,7 +26,7 @@ require (
 	github.com/gofiber/schema v1.8.3 // indirect
 	github.com/gofiber/utils/v2 v2.4.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
-	github.com/kodelyx/cdp-control v0.0.0
+	github.com/kodelyx/Browser-cdp/cdp-control v0.0.0-20260920054928-9aaab4e4a4f7
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
@@ -46,4 +46,9 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 )
 
-replace github.com/kodelyx/cdp-control => ../browser-Cdp/cdp-control
+// browser-Cdp used to be reachable only through a replace pointing at a sibling
+// checkout, because its declared module path matched no repository. It now declares
+// the path Go derives from where the code lives and is fetched like anything else.
+// To work against a local checkout instead, add for the duration:
+//
+//	replace github.com/kodelyx/Browser-cdp/cdp-control => ../browser-Cdp/cdp-control

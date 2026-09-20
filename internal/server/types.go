@@ -52,14 +52,6 @@ type ImageGenerationRequest struct {
 	Download     *bool    `json:"download,omitempty"`
 }
 
-// UpscaleRequest is the body of POST /v1/videos/upscale.
-type UpscaleRequest struct {
-	MediaID    string `json:"media_id"`
-	Aspect     string `json:"aspect"`
-	Resolution string `json:"resolution"`
-	Download   *bool  `json:"download,omitempty"`
-}
-
 // VideoEditRequest is the body of POST /v1/videos/edit.
 //
 // Source is the asset to edit — a media id or a content id; a media id is
@@ -86,19 +78,6 @@ type VideoReferenceRequest struct {
 	ProjectID  string   `json:"project_id,omitempty"`
 	Wait       *bool    `json:"wait,omitempty"`
 	Download   *bool    `json:"download,omitempty"`
-}
-
-// ImageUpscaleRequest is the body of POST /v1/images/upscale.
-//
-// Resolution is the download menu's own label: "1K", "2K" or "4K". The menu
-// calls the last two "Upscaled"; 1K is the size the image was generated at.
-type ImageUpscaleRequest struct {
-	MediaID   string `json:"media_id"`
-	ContentID string `json:"content_id"`
-	ProjectID string `json:"project_id"`
-	// Resolution is "1K", "2K" or "4K". Empty means "2K".
-	Resolution string `json:"resolution,omitempty"`
-	Download   *bool  `json:"download,omitempty"`
 }
 
 // CookieSyncRequest is the body of POST /api/sync-cookies, the fallback used

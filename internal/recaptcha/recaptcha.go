@@ -23,6 +23,7 @@ package recaptcha
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -32,7 +33,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/kodelyx/cdp-control/cdp"
@@ -53,16 +53,31 @@ const DefaultSiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
 
 // Enterprise endpoints and the origin the token is scoped to.
 const (
-	recaptchaBase   = "https://www.google.com/recaptcha/enterprise"
-	recaptchaOrigin = "https://labs.google"
-	// recaptchaCO is the base64-encoded origin ("https://labs.google:443") the
-	// widget expects. The trailing dot is part of the value, not a typo.
-	recaptchaCO = "aHR0cHM6Ly9sYWJzLmdvb2dsZTo0NDM."
+	// recaptchaBase is a var rather than a const so a test can point it at a
+	// local server. Without that, exercising the anchor/reload exchange means
+	// talking to Google, which is neither hermetic nor free.
+	// recaptchaOrigin is the site the widget is embedded in. The token is scoped
+	// to it, so a wrong value is a mismatch the assessment can see.
+	//
+	// This said "https://labs.google" and the app has since moved to
+	// flow.google.com — the same move that retired the legacy REST surface. The
+	// stale value survived because nothing here compared it against where the
+	// requests actually go.
+	recaptchaOrigin = "https://flow.google.com"
 	// recaptchaUA is pinned to a real Chrome build. The widget scores the request
 	// fingerprint, so a generic UA measurably lowers the score.
 	recaptchaUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+var recaptchaBase = "https://www.google.com/recaptcha/enterprise"
+
+// recaptchaCO is the base64-encoded origin the widget expects, derived from
+// recaptchaOrigin so the two cannot drift apart again.
+//
+// The trailing dot is part of the observed value rather than a typo, and is kept
+// because it was captured that way.
+var recaptchaCO = base64.RawURLEncoding.EncodeToString([]byte(recaptchaOrigin+":443")) + "."
 
 // minTokenLength is what a real Enterprise token looks like. Anything shorter is
 // a placeholder or a failure page, and submitting one is worse than submitting
@@ -121,14 +136,10 @@ func (EmptyProvider) Name() string { return "empty" }
 
 // HTTPProvider speaks the reCAPTCHA Enterprise anchor/reload protocol directly.
 type HTTPProvider struct {
-	hc       *httpx.Client
-	siteKey  string
-	origin   string
-	cacheTTL time.Duration
-
-	mu     sync.Mutex
-	token  string
-	expiry time.Time
+	hc        *httpx.Client
+	siteKey   string
+	origin    string
+	userAgent string
 }
 
 // NewHTTP builds an HTTP provider.
@@ -146,36 +157,45 @@ func NewHTTP(hc *httpx.Client, siteKey, origin string) *HTTPProvider {
 		hc:      hc,
 		siteKey: siteKey,
 		origin:  origin,
-		// Enterprise tokens are short-lived; two minutes is comfortably inside
-		// their validity window and still removes the per-call round trip when a
-		// batch is submitted.
-		cacheTTL: 2 * time.Minute,
+		// The pinned default, replaced by WithUserAgent when the caller knows the
+		// real client — which a process with a browser, or one that took a
+		// fingerprint from a process that had one, always does.
+		userAgent: recaptchaUA,
 	}
 }
 
 // Name identifies the provider in logs.
 func (p *HTTPProvider) Name() string { return "http" }
 
-// Token returns a token, using a short-lived cache.
+// WithUserAgent sets the client this provider claims to be.
+//
+// The widget scores the client that asks for a token, and the token is then
+// checked against the client that spends it — so a provider that declares one
+// machine and hands the token to a process presenting another is a mismatch the
+// assessment can see. An empty value leaves the pinned default in place, which is
+// what a caller with no browser to read from has to accept.
+func (p *HTTPProvider) WithUserAgent(userAgent string) *HTTPProvider {
+	if strings.TrimSpace(userAgent) != "" {
+		p.userAgent = userAgent
+	}
+	return p
+}
+
+// Token returns a fresh token.
+//
+// It used to cache one for two minutes, on the reasoning that Enterprise tokens
+// are short-lived and a batch should not pay for a round trip per item. That
+// reasoning is wrong in the way that matters: **a reCAPTCHA token is
+// single-use**. It is verified once, and any later call that presents the same
+// one is rejected — silently, with an empty frame rather than an error, which is
+// why this survived so long.
+//
+// The cache made every generation after the first inside a two-minute window
+// fail. It was only ever survivable because a CLI run is a fresh process, so the
+// command line accidentally minted a new token every time; a server, which is
+// where this was meant to be used, did not.
 func (p *HTTPProvider) Token(ctx context.Context, action string) (string, error) {
-	p.mu.Lock()
-	if p.token != "" && time.Now().Before(p.expiry) {
-		tok := p.token
-		p.mu.Unlock()
-		return tok, nil
-	}
-	p.mu.Unlock()
-
-	tok, err := p.fetch(ctx, action)
-	if err != nil {
-		return "", err
-	}
-
-	p.mu.Lock()
-	p.token = tok
-	p.expiry = time.Now().Add(p.cacheTTL)
-	p.mu.Unlock()
-	return tok, nil
+	return p.fetch(ctx, action)
 }
 
 func (p *HTTPProvider) fetch(ctx context.Context, action string) (string, error) {
@@ -203,7 +223,7 @@ func (p *HTTPProvider) fetch(ctx context.Context, action string) (string, error)
 		Method: "GET",
 		URL:    anchorURL,
 		Headers: map[string]string{
-			"User-Agent":      recaptchaUA,
+			"User-Agent":      p.userAgent,
 			"Accept-Language": "en-US,en;q=0.9",
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Referer":         p.origin + "/",
@@ -245,7 +265,7 @@ func (p *HTTPProvider) fetch(ctx context.Context, action string) (string, error)
 		URL:    reloadURL,
 		Body:   []byte(form.Encode()),
 		Headers: map[string]string{
-			"User-Agent":      recaptchaUA,
+			"User-Agent":      p.userAgent,
 			"Accept-Language": "en-US,en;q=0.9",
 			"Content-Type":    "application/x-www-form-urlencoded",
 			"Accept":          "*/*",
@@ -282,7 +302,7 @@ func (p *HTTPProvider) releaseVersion(ctx context.Context) (string, error) {
 		Method: "GET",
 		URL:    recaptchaBase + ".js?render=" + p.siteKey,
 		Headers: map[string]string{
-			"User-Agent":      recaptchaUA,
+			"User-Agent":      p.userAgent,
 			"Accept-Language": "en-US,en;q=0.9",
 			"Accept":          "*/*",
 			"Referer":         p.origin + "/",
@@ -571,21 +591,16 @@ func (p *FlowProvider) Token(ctx context.Context, action string) (string, error)
 //
 // current resolves the attached extension at call time. It may be nil, and a
 // provider built from it fails cleanly rather than minting nothing.
-func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client) Provider {
+func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client, userAgent string) Provider {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "off", "none", "empty":
 		return EmptyProvider{}
 	case "http":
-		return NewChain(NewHTTP(hc, "", ""), EmptyProvider{})
+		return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 	case "broker":
-		if broker == nil {
-			return NewChain(NewHTTP(hc, "", ""), EmptyProvider{})
-		}
-		return NewChain(NewBroker(broker, "", pageURL), EmptyProvider{})
-	default: // "auto"
-		// The Flow operation goes first because it is the one that works with the
-		// extension this backend prefers. The broker follows for the case where a
-		// generic bridge is what is attached.
+		// The explicit opt-in to the browser. Kept because it is the only path
+		// that scores from a real page, and because a caller who asks for it
+		// should get it rather than a silent fallback to the transport.
 		providers := make([]Provider, 0, 4)
 		if current != nil {
 			providers = append(providers, NewFlow(current))
@@ -593,8 +608,20 @@ func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLRes
 		if broker != nil {
 			providers = append(providers, NewBroker(broker, "", pageURL))
 		}
-		providers = append(providers, NewHTTP(hc, "", ""), EmptyProvider{})
+		providers = append(providers, NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 		return NewChain(providers...)
+	default: // "auto"
+		// The transport, and only the transport.
+		//
+		// This used to try `flow.captcha` and the broker first, on the belief
+		// that a page-minted token scored better. It does, and it was also the
+		// reason a browser had to be attached and a tab had to be sitting on a
+		// Flow project for every generation. The HTTP provider turns out to be
+		// sufficient — the real defect was that it reused a single-use token —
+		// so the browser is no longer asked for anything on this path.
+		//
+		// Anyone who wants the page token can still have it: `--captcha broker`.
+		return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/kodelyx/cdp-control/bridge"
 	"github.com/kodelyx/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/internal/engine"
+	"github.com/kodelyx/flow-go/internal/flowapi"
 	"github.com/kodelyx/flow-go/internal/server"
 	"github.com/kodelyx/flow-go/internal/store"
 )
@@ -57,6 +58,11 @@ type Config struct {
 	// supplies them; a live page always takes precedence.
 	AtToken string
 	Fsid    string
+	// Fingerprint is the browser identity to present when no browser is attached,
+	// taken from the same snapshot. A captcha-bearing call is checked against the
+	// client its token was minted for, so a process without this presents a
+	// generic profile and has its token silently discarded.
+	Fingerprint *flowapi.BrowserFingerprint
 }
 
 // App holds the assembled system.
@@ -106,6 +112,7 @@ func Build(cfg Config) (*App, error) {
 		AccountIndex: config.AccountIndex,
 		AtToken:      cfg.AtToken,
 		Fsid:         cfg.Fsid,
+		Fingerprint:  cfg.Fingerprint,
 		// The env value is a default, not an instruction, so it ranks below the
 		// browser. An explicit cfg.ProjectID still outranks both.
 		DefaultProjectID: config.ProjectID,

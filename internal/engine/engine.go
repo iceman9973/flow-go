@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,16 @@ type Options struct {
 	// attached — a live page is always the better source.
 	AtToken string
 	Fsid    string
+	// Fingerprint is the browser identity to present when no bridge is attached,
+	// taken from a SessionSnapshot for the same reason as AtToken and Fsid.
+	//
+	// It is not decoration. A reCAPTCHA-bearing call is checked against the
+	// client the assessment was made for, so a process that mints a token and
+	// then presents a generic Chrome profile is rejected as unusual activity —
+	// which reads as a captcha failure but is a fingerprint mismatch. Without
+	// this, a browserless run can mint a perfectly good token and still have it
+	// thrown away, and the only clue is an empty result.
+	Fingerprint *flowapi.BrowserFingerprint
 }
 
 // Engine is the running system.
@@ -121,6 +132,59 @@ func (e *Engine) BearerPathAvailable() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.hasSession
+}
+
+// CompetingExtensions reports the narrow (Flow-capable) extensions attached at
+// once, sorted by address.
+//
+// More than one is a configuration the engine cannot serve coherently, and it is
+// easy to walk into: load the extension in a second Chrome profile and both
+// profiles are now attached, each signed into a different Google account.
+//
+// The bridge holds one cookie jar and `Current()` is whichever client connected
+// last, so the account and the project move under a process that has already
+// built its client. That is worse than an error — calls succeed and report the
+// wrong account — which is why this is worth naming rather than tolerating.
+//
+// Surface() is used rather than a probe: it is a cached answer, so a health check
+// does not pay a round trip to ask.
+func (e *Engine) CompetingExtensions() []string {
+	if e.bridge == nil {
+		return nil
+	}
+	var narrow []string
+	for addr, client := range e.bridge.Clients() {
+		if client != nil && client.Surface().FlowOperations {
+			narrow = append(narrow, addr)
+		}
+	}
+	sort.Strings(narrow)
+	return narrow
+}
+
+// warnOnCompetingExtensions says so once, loudly, when more than one narrow
+// extension is attached.
+func (e *Engine) warnOnCompetingExtensions() {
+	narrow := e.CompetingExtensions()
+	if len(narrow) < 2 {
+		return
+	}
+
+	current := ""
+	if client := e.bridge.Current(); client != nil {
+		for _, addr := range narrow {
+			if e.bridge.Clients()[addr] == client {
+				current = addr
+				break
+			}
+		}
+	}
+
+	log.Printf("engine: %d Flow extensions are attached at once (%s). The bridge holds "+
+		"one cookie jar and uses whichever connected last, so the account and the project "+
+		"will move under this process — results will look right and belong to the other "+
+		"account. Close the extension, or the Flow tab, in every browser profile but one. "+
+		"Using %s.", len(narrow), strings.Join(narrow, ", "), current)
 }
 
 // Fingerprint returns the browser identity adopted at start-up, or nil when the
@@ -629,6 +693,14 @@ type SessionSnapshot struct {
 	AccountID string `json:"account_id,omitempty"`
 	// Index is the `authuser` index the snapshot was taken for.
 	Index int `json:"account_index"`
+	// Fingerprint is the browser identity the snapshot was taken under.
+	//
+	// Carried for the same reason as At and Fsid, and it was the missing one:
+	// the page tokens alone are not enough for a captcha-bearing call, because
+	// the assessment is checked against the client that made it. A browserless
+	// process that presents a generic Chrome profile has its token rejected, and
+	// the rejection is silent.
+	Fingerprint *flowapi.BrowserFingerprint `json:"fingerprint,omitempty"`
 }
 
 // SessionSnapshot reads the current browser-derived state.
@@ -650,7 +722,15 @@ func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) 
 		AccountID: e.accountID,
 		Index:     e.accountIndex,
 	}
+	fingerprint := e.fingerprint
 	e.mu.RUnlock()
+
+	// Read outside the lock: reading the bridge can block, and holding the
+	// engine lock across it would stall every other caller.
+	if fingerprint == nil {
+		fingerprint = e.browserFingerprint(ctx)
+	}
+	snapshot.Fingerprint = fingerprint
 	return snapshot, nil
 }
 
@@ -701,18 +781,15 @@ func (e *Engine) CreateProject(ctx context.Context, label string) (batchexecute.
 // emptySubmissionHint explains the most likely cause of a video submission that
 // comes back empty.
 //
-// The old wording sent the reader to "the model key and the RPC it went to".
-// Those are worth ruling out — a wrong model or a wrong RPC id is also accepted
-// with an empty result — but they are the *less* common cause, and the message
-// named neither the captcha provider nor the fact that the provider is knowable.
+// The old wording sent the reader to "the model key and the RPC it went to", and
+// a later revision told them to attach the extension so the page could mint a
+// token. Both were wrong, and the second was actively misleading: the transport
+// mints a perfectly good token, and the thing that made it look broken was that
+// the provider reused one.
 //
-// Measured, same server, same project, same prompt and model, only the provider
-// varied: a token from the page submitted and charged; a token from the HTTP
-// provider came back empty and charged nothing, twice out of two. The HTTP
-// provider speaks the Enterprise anchor/reload protocol with no browser, which
-// yields a lower-scoring assessment, and Flow answers an empty result rather
-// than an error — so this reads as a payload problem when it is an assessment
-// problem.
+// An empty frame means Flow accepted the request and did nothing, so the causes
+// are all of that shape — something about the request was understood and
+// declined, silently.
 func (e *Engine) emptySubmissionHint() string {
 	e.mu.RLock()
 	provider := e.captcha
@@ -723,14 +800,12 @@ func (e *Engine) emptySubmissionHint() string {
 		name = provider.Name()
 	}
 
-	hint := fmt.Sprintf("The reCAPTCHA token came from %q. ", name)
-	if name == "http" {
-		return hint + "A token minted without a browser scores lower and Flow answers an " +
-			"empty result rather than an error, which is the usual cause here — attach the " +
-			"extension so the page can mint one. Otherwise check the model key and the RPC " +
-			"it went to."
-	}
-	return hint + "Also check the model key and the RPC it went to."
+	// Ordered by how often each has been the answer.
+	return fmt.Sprintf("The reCAPTCHA token came from %q. A token is single-use, so a "+
+		"reused or cached one produces exactly this — Flow verifies it once and answers "+
+		"an empty frame on every later call. Check next that the project exists on the "+
+		"account in use: generating into a project that is not there is accepted the same "+
+		"silent way. Only then suspect the model key and the RPC it went to.", name)
 }
 
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
@@ -800,15 +875,22 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 		}
 	}
 
+	// Read the browser identity first, because two things below depend on it:
+	// the captcha provider presents it when it mints a token, and every call
+	// this engine makes has to present the same identity as the token's.
+	browserFP := e.browserFingerprint(ctx)
+
 	// The resolver, not a resolved client: whichever extension is attached can
 	// change after this point, and a provider holding a captured client reports
 	// "no connection" while a perfectly good one is attached.
-	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(), e.captchaPageURL, e.bridge.Current)
-
-	// Read the browser identity before resolving the project, because the
-	// project listing goes out over the transport and every call this engine
-	// makes has to present the same identity.
-	browserFP := e.browserFingerprint(ctx)
+	//
+	// The user agent goes in because the widget scores the client that asks for a
+	// token, and a token minted under one client and spent under another is the
+	// mismatch this engine's own notes warn about. It was pinned to a Windows
+	// build while the browser here is macOS, so the HTTP provider declared a
+	// different machine than the one the generation call came from.
+	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(),
+		e.captchaPageURL, e.bridge.Current, userAgentOf(browserFP))
 
 	// Prefer the account's own project list over navigating a browser to read an
 	// editor URL: both are live, and only one of them drives a tab. The browser
@@ -869,6 +951,11 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	log.Printf("engine: ready — account %s, %d cookies (%s), project %s, captcha %s",
 		accountID, jar.Count(), source,
 		projectID, captchaProvider.Name())
+
+	// Last, so every extension that is going to connect has. A second narrow
+	// extension makes everything above provisional, and the operator needs to
+	// know before they read a result rather than after.
+	e.warnOnCompetingExtensions()
 
 	return nil
 }
@@ -979,6 +1066,14 @@ func chooseProjectID(explicit, configured string, askRPC, askBrowser func() stri
 	return "", projectSourceNone
 }
 
+// userAgentOf reads the user agent out of a fingerprint that may be nil.
+func userAgentOf(fp *flowapi.BrowserFingerprint) string {
+	if fp == nil {
+		return ""
+	}
+	return fp.UserAgent
+}
+
 // projectFromRPC reads the account's project list over the transport and returns
 // its most recent entry.
 //
@@ -1055,19 +1150,71 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 // can present it. Returns nil when the browser cannot be reached, in which case
 // the client falls back to a generic Chrome profile — fine for read-only calls,
 // but generation requests will be rejected as unusual activity.
+// pageTokensFile is where the page's anti-CSRF token and session id are kept
+// between runs, beside the cookie cache and for the same reason: a process with
+// no browser has to present the same opening request the page would have made.
+func pageTokensFile() string {
+	return filepath.Join(config.DataDir(), "page-tokens.json")
+}
+
+// pageTokenSet is the pair of page-only values every batchexecute request
+// carries, in the shape they are persisted.
+type pageTokenSet struct {
+	At   string `json:"at,omitempty"`
+	Fsid string `json:"fsid,omitempty"`
+}
+
+func savePageTokens(tokens pageTokenSet) {
+	if tokens.At == "" && tokens.Fsid == "" {
+		return
+	}
+	data, err := json.MarshalIndent(tokens, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(pageTokensFile(), data, 0o600); err != nil {
+		log.Printf("engine: could not persist the page tokens: %v", err)
+	}
+}
+
+func loadPageTokens() pageTokenSet {
+	data, err := os.ReadFile(pageTokensFile())
+	if err != nil {
+		return pageTokenSet{}
+	}
+	var tokens pageTokenSet
+	if err := json.Unmarshal(data, &tokens); err != nil {
+		return pageTokenSet{}
+	}
+	return tokens
+}
+
 // pageTokens reads the two values the app puts on every batchexecute request:
 // the anti-CSRF token it sends in the body, and the session id it sends in the
 // query string. Only the page has either.
 //
-// Both are optional. Without the token the client primes for one, which is what
-// it did before the extension could answer this; without the session id the call
-// goes out as it always did. A generic extension leaves both behaviours intact.
+// Both are optional in principle — without the token the client primes for one,
+// which is what it did before the extension could answer this; without the
+// session id the call goes out as it always did. In practice the priming path is
+// not a substitute for a captcha-bearing generation: a browserless run that had
+// the fingerprint and the cookies but neither of these came back empty, and the
+// same run with both from a session snapshot succeeded. So they are persisted
+// alongside the fingerprint rather than left to be re-derived.
 func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	if e.bridge == nil || !e.bridge.Connected() {
-		// No browser to read from, so fall back to whatever a SessionSnapshot
-		// supplied. A live page always wins over this — it is the same values,
-		// read from their source rather than relayed.
-		return e.opts.AtToken, e.opts.Fsid
+		// No browser to read from. A SessionSnapshot is the best source, because
+		// whoever supplied it is running right now.
+		if e.opts.AtToken != "" || e.opts.Fsid != "" {
+			return e.opts.AtToken, e.opts.Fsid
+		}
+		// Then the persisted copy, which is what lets a run with no browser at
+		// all present the same opening request the page would have.
+		if persisted := loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
+			log.Printf("engine: adopting the persisted page tokens (at %d chars, f.sid %d chars)",
+				len(persisted.At), len(persisted.Fsid))
+			return persisted.At, persisted.Fsid
+		}
+		return "", ""
 	}
 	client := e.bridge.Current()
 	if client == nil || !client.Connected() {
@@ -1093,6 +1240,9 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 		return "", ""
 	}
 
+	// Persist so the next run does not need this page.
+	savePageTokens(pageTokenSet{At: out.At, Fsid: out.Fsid})
+
 	if out.At == "" {
 		log.Printf("engine: the page did not carry an anti-CSRF token; " +
 			"batchexecute will prime for one instead")
@@ -1107,8 +1257,65 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	return out.At, out.Fsid
 }
 
+// fingerprintFile is where the browser identity is kept between runs, beside the
+// cookie cache for the same reason: a process with no browser has to be able to
+// present the client its token was minted for, and a session snapshot is only
+// available while another process is running to hand one over.
+func fingerprintFile() string {
+	return filepath.Join(config.DataDir(), "fingerprint.json")
+}
+
+// saveFingerprint persists the browser identity, best-effort.
+func saveFingerprint(fp *flowapi.BrowserFingerprint) {
+	if fp == nil || fp.UserAgent == "" {
+		return
+	}
+	data, err := json.MarshalIndent(fp, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(fingerprintFile(), data, 0o600); err != nil {
+		log.Printf("engine: could not persist the fingerprint: %v", err)
+	}
+}
+
+// loadFingerprint reads a previously persisted browser identity.
+func loadFingerprint() *flowapi.BrowserFingerprint {
+	data, err := os.ReadFile(fingerprintFile())
+	if err != nil {
+		return nil
+	}
+	var fp flowapi.BrowserFingerprint
+	if err := json.Unmarshal(data, &fp); err != nil || fp.UserAgent == "" {
+		return nil
+	}
+	return &fp
+}
+
 func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerprint {
 	if e.bridge == nil || !e.bridge.Connected() {
+		// No browser to read from. A SessionSnapshot is the best source, because
+		// whoever supplied it is running right now.
+		if e.opts.Fingerprint != nil {
+			log.Printf("engine: adopting the fingerprint from the session snapshot — %s",
+				truncate(e.opts.Fingerprint.UserAgent, 70))
+			return e.opts.Fingerprint
+		}
+
+		// Then the persisted copy, which is what makes a standalone run possible
+		// at all. Without it the provider falls back to its pinned user agent,
+		// which is a *different machine* from this one — and a captcha token
+		// minted under one client and spent under another is rejected with no
+		// error at all, just an empty result.
+		if fp := loadFingerprint(); fp != nil {
+			log.Printf("engine: adopting the persisted fingerprint — %s",
+				truncate(fp.UserAgent, 70))
+			return fp
+		}
+
+		log.Printf("engine: no browser, no snapshot and no persisted fingerprint; " +
+			"a captcha-bearing call will present the pinned default and is likely to " +
+			"come back empty. Run once with the browser attached to record one")
 		return nil
 	}
 
@@ -1122,14 +1329,18 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 		return nil
 	}
 
-	log.Printf("engine: adopting the browser fingerprint — %s", truncate(fp.UserAgent, 70))
-	return &flowapi.BrowserFingerprint{
+	adopted := &flowapi.BrowserFingerprint{
 		UserAgent: fp.UserAgent,
 		Language:  fp.Language,
 		SecChUa:   fp.Brands,
 		Platform:  fp.PlatformFull,
 		Mobile:    fp.Mobile,
 	}
+	// Persist it so the next run does not need this browser at all.
+	saveFingerprint(adopted)
+
+	log.Printf("engine: adopting the browser fingerprint — %s", truncate(fp.UserAgent, 70))
+	return adopted
 }
 
 func truncate(value string, max int) string {
@@ -1137,6 +1348,15 @@ func truncate(value string, max int) string {
 		return value
 	}
 	return value[:max] + "..."
+}
+
+// captchaNeedsPage reports whether the configured captcha mode asks the browser
+// for its token rather than minting one over the transport.
+//
+// Only `broker` does. The default mints server-side, which is why a generation
+// no longer has to have a Flow tab open anywhere.
+func (e *Engine) captchaNeedsPage() bool {
+	return strings.EqualFold(strings.TrimSpace(e.opts.CaptchaMode), "broker")
 }
 
 // ensureProjectTab makes sure the browser is on a Flow editor before a
@@ -1276,9 +1496,16 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 
 	cost := config.CreditsPerVideo[req.Duration] * req.Count
 
-	// The generation call needs a reCAPTCHA token, and the widget only exists in
-	// the Flow editor. Make sure the browser is on one before submitting.
-	e.ensureProjectTab(ctx)
+	// The widget only exists in a Flow editor, so the browser has to be sitting
+	// on one before a page-minted token can be asked for.
+	//
+	// This used to run unconditionally, which meant every generation navigated a
+	// tab whether or not the token needed a page. The default chain mints over
+	// the transport and needs nothing from the browser, so the navigation is now
+	// tied to the mode that actually wants it.
+	if e.captchaNeedsPage() {
+		e.ensureProjectTab(ctx)
+	}
 
 	var outcome *flowapi.VideoResult
 	var accountID string
@@ -1663,94 +1890,6 @@ func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOut
 /* ------------------------------------------------------------------ *
  * Upscaling
  * ------------------------------------------------------------------ */
-
-// UpsampleOutcome is the result of an upscale pass.
-type UpsampleOutcome struct {
-	JobID      string      `json:"job_id"`
-	Account    string      `json:"account_id"`
-	SourceID   string      `json:"source_media_id"`
-	MediaIDs   []string    `json:"media_ids"`
-	Resolution string      `json:"resolution"`
-	Files      []MediaFile `json:"files,omitempty"`
-	ElapsedS   float64     `json:"elapsed_seconds"`
-	Status     string      `json:"status"`
-}
-
-// UpsampleMedia renders an already-generated video at a higher resolution.
-//
-// This is the same second pass the Flow UI's high-resolution download performs:
-// Flow generates at 720p and an upsampler model produces the larger render.
-// 1080p is free; 4k costs credits.
-func (e *Engine) UpsampleMedia(ctx context.Context, mediaID, aspect, resolution string, download bool) (*UpsampleOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
-	}
-	if strings.TrimSpace(mediaID) == "" {
-		return nil, fmt.Errorf("engine: media_id is required")
-	}
-
-	tier, err := flowapi.NormalizeResolution(resolution)
-	if err != nil {
-		return nil, err
-	}
-	if tier == "" {
-		return nil, fmt.Errorf("engine: 720p needs no upscale pass; Flow already generates at 720p")
-	}
-
-	jobID := uuid.NewString()
-	start := time.Now()
-
-	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:  jobID,
-		Kind:   "upsample",
-		Prompt: "upscale " + mediaID,
-		Model:  config.UpsampleModels[tier],
-		Aspect: aspect,
-		Count:  1,
-		Status: "submitted",
-	})
-	if err != nil {
-		log.Printf("engine: could not record the job: %v", err)
-	}
-
-	ids, err := e.upsample(ctx, []string{mediaID}, aspect, tier, nil)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, err
-	}
-
-	outcome := &UpsampleOutcome{
-		JobID:      jobID,
-		SourceID:   mediaID,
-		MediaIDs:   ids,
-		Resolution: tier,
-		Status:     "submitted",
-	}
-
-	for _, id := range ids {
-		status, waitErr := e.waitFor(ctx, id)
-		if waitErr != nil {
-			log.Printf("engine: upsampled %s did not finish: %v", shortID(id), waitErr)
-			continue
-		}
-		if status.Succeeded() {
-			outcome.Status = "succeeded"
-		}
-	}
-
-	if download {
-		files, dlErr := e.downloadAll(ctx, ids, "video", tier, "upscale "+mediaID, rowID)
-		if dlErr != nil {
-			log.Printf("engine: upscale download problem: %v", dlErr)
-		}
-		outcome.Files = files
-	}
-
-	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
-
-	return outcome, nil
-}
 
 // BatchVideoRequest is a caller-facing video request for the batchexecute path.
 type BatchVideoRequest struct {
@@ -2605,170 +2744,6 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	return outcome, nil
 }
 
-// BatchUpscaleRequest asks for a higher-resolution render of a finished video.
-type BatchUpscaleRequest struct {
-	// MediaID is the source video's media id.
-	MediaID string
-	// Resolution is "1080p" or "4k".
-	Resolution string
-	ProjectID  string
-	// Wait polls until the upscaled asset is downloadable.
-	Wait bool
-	// Download writes the result to output/.
-	Download bool
-}
-
-// UpscaleViaBatch renders a finished video at a higher resolution.
-//
-// This is the same pass the Flow download menu offers as "1080p / Upscaled". 4K
-// is listed as paid and requires an upgraded plan; the request is identical apart
-// from the model key.
-//
-// The flow is submit-then-poll, and both halves matter:
-//
-//  1. `p0UkFb` is submitted with the source asset's *content* id (not its media
-//     id) and replies with the id of the render it queued, `<content-id>_upsampled`.
-//  2. That id is polled for in the project listing until it appears, then
-//     resolved to a URL and downloaded.
-//
-// The reply to step 1 carries no URL, which is why this RPC was previously read as
-// "accepted but produces nothing". It is an acknowledgement, not a result.
-func (e *Engine) UpscaleViaBatch(ctx context.Context, req BatchUpscaleRequest) (*BatchVideoOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
-	}
-	if strings.TrimSpace(req.MediaID) == "" {
-		return nil, fmt.Errorf("engine: a source media id is required")
-	}
-
-	model := batchexecute.UpscaleModel1080p
-	switch strings.ToLower(strings.TrimSpace(req.Resolution)) {
-	case "", "1080p", "1080", "fhd":
-		model = batchexecute.UpscaleModel1080p
-	case "4k", "2160p", "uhd":
-		model = batchexecute.UpscaleModel4K
-	default:
-		return nil, fmt.Errorf("engine: unsupported resolution %q; use 1080p or 4k", req.Resolution)
-	}
-
-	projectID := req.ProjectID
-	if projectID == "" {
-		projectID = e.ProjectID()
-	}
-	if projectID == "" {
-		return nil, fmt.Errorf("engine: no project id resolved")
-	}
-
-	jobID := uuid.NewString()
-	start := time.Now()
-
-	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:  jobID,
-		Kind:   "upsample",
-		Prompt: "upscale " + req.MediaID,
-		Model:  model,
-		Count:  1,
-		Status: "submitted",
-	})
-	if err != nil {
-		log.Printf("engine: could not record the job: %v", err)
-	}
-
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
-	jar := e.bridge.Jar()
-	if jar == nil {
-		err := fmt.Errorf("engine: no cookies loaded")
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, err
-	}
-
-	client := e.newBatchexecuteClient(jar, e.hc)
-
-	// The RPC needs the source asset's *content* id, which is not the media id
-	// the caller has. Resolve it from the project listing, retrying briefly: an
-	// asset that was just uploaded is not in the listing the moment the upload
-	// returns.
-	var source batchexecute.ProjectAsset
-	sourceFound := false
-	if _, err := awaitAsset(ctx, func() (bool, error) {
-		var resolveErr error
-		source, sourceFound, resolveErr = e.findAsset(ctx, client, projectID, req.MediaID)
-		return sourceFound, resolveErr
-	}); err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, err
-	}
-	if !sourceFound {
-		err := fmt.Errorf(
-			"engine: %s is not in the project listing, so its content id cannot be resolved",
-			req.MediaID)
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, err
-	}
-
-	frames, err := client.Upscale(ctx, batchexecute.UpscaleRequest{
-		ProjectID:    projectID,
-		ContentID:    source.ContentID,
-		MediaID:      source.MediaID,
-		Model:        model,
-		CaptchaToken: captcha,
-	}, batchexecute.CallOptions{
-		SourcePath: "/project/" + projectID + "/edit/" + source.MediaID,
-		BuildLabel: config.BuildLabel(),
-	})
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, err
-	}
-
-	// The submission names the render it just queued, so there is no need to diff
-	// the listing — we know exactly which asset to wait for. It is an id for a
-	// render that does not exist yet.
-	upscaledContentID, err := batchexecute.ParseUpscaledAssetID(frames)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
-		return nil, err
-	}
-
-	outcome := &BatchVideoOutcome{
-		JobID:     jobID,
-		AccountID: e.AccountID(),
-		ProjectID: projectID,
-		Model:     model,
-		Status:    "submitted",
-	}
-
-	if req.Wait || req.Download {
-		if url, ok := e.waitForUpscaledVideo(ctx, client, projectID, source.MediaID, upscaledContentID); ok {
-			outcome.MediaIDs = []string{upscaledContentID}
-			outcome.URLs = []string{url}
-			if req.Download {
-				file, dlErr := e.downloadGenerated(ctx, batchexecute.GeneratedMedia{
-					MediaID: upscaledContentID, URL: url, Kind: "video",
-				}, "video", "upscale "+req.MediaID, rowID)
-				if dlErr != nil {
-					log.Printf("engine: could not save the upscaled video: %v", dlErr)
-				} else {
-					outcome.Files = []MediaFile{file}
-				}
-			}
-			outcome.Status = "ready"
-		}
-	}
-
-	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
-
-	log.Printf("engine: upscale of %s to %s finished as %s in %.1fs",
-		shortID(req.MediaID), req.Resolution, outcome.Status, outcome.ElapsedS)
-	return outcome, nil
-}
-
 // LabsAccessToken mints (or returns a cached) Labs access token.
 //
 // Diagnostics only: it exists so the legacy aisandbox REST surface can be probed
@@ -3000,39 +2975,6 @@ func (e *Engine) findAsset(ctx context.Context, client *batchexecute.Client, pro
 		return *first, true, nil
 	}
 	return batchexecute.ProjectAsset{}, false, nil
-}
-
-// waitForUpscaledVideo polls until the queued upscale is downloadable, and
-// returns its URL.
-//
-// It resolves the URL from the *upscaled* content id, not the media id. An asset
-// and its upscales share one media id, so a media-id lookup returns whichever row
-// comes first — the original — and hands back the source video as if it were the
-// result. The content id is what distinguishes them.
-func (e *Engine) waitForUpscaledVideo(ctx context.Context, client *batchexecute.Client,
-	projectID, mediaID, contentID string) (string, bool) {
-
-	deadline := time.Now().Add(time.Duration(config.PollTimeout) * time.Second)
-	interval := time.Duration(config.PollInterval) * time.Second
-
-	for time.Now().Before(deadline) {
-		media, err := client.MediaDetail(ctx, projectID, mediaID, contentID)
-		if err == nil {
-			for _, item := range media {
-				if item.Kind == "video" && item.URL != "" {
-					return item.URL, true
-				}
-			}
-		}
-
-		select {
-		case <-time.After(interval):
-		case <-ctx.Done():
-			return "", false
-		}
-	}
-	log.Printf("engine: the upscaled asset %s was not downloadable when the wait expired", contentID)
-	return "", false
 }
 
 // waitForNewVideo polls the project listing until a video that was not there

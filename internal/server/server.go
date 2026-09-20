@@ -64,7 +64,12 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			// call.
 			"bearer_path_available": eng.BearerPathAvailable(),
 			"bridge":                br.Status(),
-			"error":                 eng.LastError(),
+			// More than one is a configuration the engine cannot serve
+			// coherently: the bridge holds one cookie jar, so two signed-in
+			// profiles take turns owning it and calls report the wrong account.
+			// Empty is the normal case.
+			"flow_extensions": eng.CompetingExtensions(),
+			"error":           eng.LastError(),
 		})
 	})
 
@@ -566,136 +571,6 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 		return c.JSON(fiber.Map{"authuser": authUser, "frames": frames})
 	})
 
-	// Resolve an image at a larger size over the batchexecute transport.
-	//
-	// The download menu's "2K / Upscaled" choice runs this before fetching the
-	// file, which is why no new project asset appears.
-	app.Post("/v1/debug/image-upscale", func(c fiber.Ctx) error {
-		var req struct {
-			ContentID  string `json:"content_id"`
-			MediaID    string `json:"media_id"`
-			ProjectID  string `json:"project_id"`
-			Resolution int    `json:"resolution"`
-			// HeaderOverrides is diagnostic: it varies the request headers so
-			// the one that matters can be found by elimination. A value of ""
-			// removes the header.
-			HeaderOverrides map[string]string `json:"header_overrides"`
-			// TLSProfile selects the TLS/HTTP2 fingerprint by name, e.g.
-			// "chrome_152" or "firefox_133". Empty means the default.
-			TLSProfile string `json:"tls_profile"`
-			// ProtocolRacing lets the TLS library race HTTP/3 against HTTP/2,
-			// the way the browser does.
-			ProtocolRacing bool `json:"protocol_racing"`
-			// HeaderOrder replaces the header ordering, so the browser's exact
-			// order can be replayed rather than approximated.
-			HeaderOrder []string `json:"header_order"`
-			// DropCredentials strips the session cookies for this call, which is
-			// how a real 401 is produced on demand. Without it the 401 recovery
-			// path cannot be exercised except by waiting for a session to expire.
-			DropCredentials bool `json:"drop_credentials"`
-		}
-		if err := c.Bind().JSON(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "invalid JSON body: " + err.Error()})
-		}
-		if req.ContentID == "" && req.MediaID == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "media_id or content_id is required"})
-		}
-		if req.ProjectID == "" {
-			req.ProjectID = eng.ProjectID()
-		}
-		// A caller normally holds the media id — it is what a generation returns
-		// and what the editor URL carries — while SPrCad takes the content id.
-		// Resolve it rather than making every caller know both.
-		if req.ContentID == "" {
-			contentID, err := eng.ResolveContentID(c.Context(), req.MediaID)
-			if err != nil {
-				return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
-			}
-			req.ContentID = contentID
-		}
-		if req.Resolution == 0 {
-			req.Resolution = 1
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-		defer cancel()
-
-		captcha, err := eng.CaptchaToken(ctx, "IMAGE_GENERATION")
-		if err != nil {
-			return c.Status(502).JSON(fiber.Map{"error": "captcha: " + err.Error()})
-		}
-
-		jar := eng.Bridge().Jar()
-		if jar == nil {
-			return c.Status(503).JSON(fiber.Map{"error": "no cookies loaded"})
-		}
-		httpOpts := []httpx.Option{
-			httpx.WithTimeout(time.Duration(config.RequestTimeout) * time.Second),
-			httpx.WithProfile(req.TLSProfile),
-		}
-		if req.ProtocolRacing {
-			httpOpts = append(httpOpts, httpx.WithProtocolRacing())
-		}
-		hc, err := httpx.New(httpOpts...)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		if req.DropCredentials {
-			jar = withoutAuthCookies(jar)
-		}
-
-		client := eng.NewBatchexecuteClient(jar, hc)
-		client.SetHeaderOverrides(req.HeaderOverrides)
-		client.SetHeaderOrder(req.HeaderOrder)
-		media, err := client.UpscaleImage(ctx, batchexecute.ImageUpscaleRequest{
-			ProjectID:    req.ProjectID,
-			MediaID:      req.MediaID,
-			ContentID:    req.ContentID,
-			Resolution:   req.Resolution,
-			CaptchaToken: captcha,
-		})
-		if err != nil {
-			return c.Status(502).JSON(fiber.Map{
-				"error":       err.Error(),
-				"captcha_len": len(captcha),
-			})
-		}
-
-		// Include the raw frames: the parsed view hides the shape, and the shape
-		// is what tells us where the resolved URL actually lives.
-		raw, _ := client.UpscaleImageRaw(ctx, batchexecute.ImageUpscaleRequest{
-			ProjectID:    req.ProjectID,
-			MediaID:      req.MediaID,
-			ContentID:    req.ContentID,
-			Resolution:   req.Resolution,
-			CaptchaToken: captcha,
-		})
-
-		// The verbatim body: when the parsed view is nil this is the only place
-		// the server's actual answer is still legible.
-		body, _ := client.UpscaleImageRawBody(ctx, batchexecute.ImageUpscaleRequest{
-			ProjectID:    req.ProjectID,
-			MediaID:      req.MediaID,
-			ContentID:    req.ContentID,
-			Resolution:   req.Resolution,
-			CaptchaToken: captcha,
-		})
-		if len(body) > 3000 {
-			body = body[:3000]
-		}
-
-		return c.JSON(fiber.Map{
-			"status":      "ok",
-			"captcha_len": len(captcha),
-			"resolution":  req.Resolution,
-			"media":       media,
-			"raw":         raw,
-			"raw_body":    body,
-			"fingerprint": eng.Fingerprint(),
-		})
-	})
-
 	// Dump raw CDP events whose payload contains a substring.
 	//
 	// Diagnostics only. requestWillBeSentExtraInfo carries the headers the
@@ -820,78 +695,6 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			"length": len(token),
 			"token":  token,
 		})
-	})
-
-	// Submit a video upscale over the Go transport and report the new asset id.
-	//
-	// Diagnostics only: it exists to establish whether this RPC works from Go at
-	// all, which the image upscale (SPrCad) does not.
-	app.Post("/v1/debug/video-upscale", func(c fiber.Ctx) error {
-		var req struct {
-			ContentID string `json:"content_id"`
-			MediaID   string `json:"media_id"`
-			ProjectID string `json:"project_id"`
-			Model     string `json:"model"`
-		}
-		if err := c.Bind().JSON(&req); err != nil || req.ContentID == "" || req.MediaID == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "content_id and media_id are required"})
-		}
-		if req.ProjectID == "" {
-			req.ProjectID = eng.ProjectID()
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-		defer cancel()
-
-		captcha, err := eng.CaptchaToken(ctx, "VIDEO_GENERATION")
-		if err != nil {
-			return c.Status(502).JSON(fiber.Map{"error": "captcha: " + err.Error()})
-		}
-
-		jar := eng.Bridge().Jar()
-		if jar == nil {
-			return c.Status(503).JSON(fiber.Map{"error": "no cookies loaded"})
-		}
-		hc, err := httpx.New(httpx.WithTimeout(time.Duration(config.RequestTimeout) * time.Second))
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		client := eng.NewBatchexecuteClient(jar, hc)
-		frames, err := client.Upscale(ctx, batchexecute.UpscaleRequest{
-			ProjectID:    req.ProjectID,
-			ContentID:    req.ContentID,
-			MediaID:      req.MediaID,
-			Model:        req.Model,
-			CaptchaToken: captcha,
-		}, batchexecute.CallOptions{
-			SourcePath: "/project/" + req.ProjectID + "/edit/" + req.MediaID,
-			BuildLabel: config.BuildLabel(),
-		})
-		if err != nil {
-			return c.Status(502).JSON(fiber.Map{
-				"error":       err.Error(),
-				"captcha_len": len(captcha),
-			})
-		}
-
-		assetID, parseErr := batchexecute.ParseUpscaledAssetID(frames)
-		raw := make([]json.RawMessage, 0, len(frames))
-		for _, f := range frames {
-			raw = append(raw, f.Payload)
-		}
-
-		out := fiber.Map{
-			"status":      "ok",
-			"captcha_len": len(captcha),
-			"frames":      raw,
-		}
-		if parseErr != nil {
-			out["parse_error"] = parseErr.Error()
-		} else {
-			out["upscaled_asset_id"] = assetID
-		}
-		return c.JSON(out)
 	})
 
 	// Upload an image and return its media id, for use as a condition image.
@@ -1251,10 +1054,8 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			"outcome":     outcome,
 		})
 	})
-	app.Post("/v1/videos/upscale", handleUpscale(eng))
 	app.Post("/v1/videos/edit", handleVideoEdit(eng))
 	app.Post("/v1/videos/reference", handleVideoReference(eng))
-	app.Post("/v1/images/upscale", handleImageUpscale(eng))
 
 	app.Get("/v1/jobs", func(c fiber.Ctx) error {
 		limit, _ := strconv.Atoi(c.Query("limit", "50"))
@@ -1659,33 +1460,6 @@ func unsupportedImageOptions(req ImageGenerationRequest) []string {
 	}
 	return out
 }
-func handleUpscale(eng *engine.Engine) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		var req UpscaleRequest
-		if err := c.Bind().JSON(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "invalid JSON body: " + err.Error()})
-		}
-		if req.MediaID == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "media_id is required"})
-		}
-		if req.Resolution == "" {
-			req.Resolution = "1080p"
-		}
-
-		// This is the same pass the Flow download menu offers as "1080p /
-		// Upscaled". The legacy REST upsampler this endpoint used to call is dead.
-		outcome, err := eng.UpscaleViaBatch(c.Context(), engine.BatchUpscaleRequest{
-			MediaID:    req.MediaID,
-			Resolution: req.Resolution,
-			Wait:       true,
-			Download:   boolOr(req.Download, true),
-		})
-		if err != nil {
-			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
-		}
-		return c.JSON(outcome)
-	}
-}
 
 // handleVideoReference submits a generation conditioned on reference images.
 //
@@ -1759,120 +1533,6 @@ func handleVideoEdit(eng *engine.Engine) fiber.Handler {
 		}
 		return c.JSON(outcome)
 	}
-}
-
-// handleImageUpscale resolves an image at a higher resolution.
-//
-// This runs the app's own SPrCad request inside the attached tab. The Go
-// transport cannot make this call — see engine.UpscaleImage for the elimination
-// that established it — so the browser does the request and hands back the bytes.
-func handleImageUpscale(eng *engine.Engine) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		var req ImageUpscaleRequest
-		if err := c.Bind().JSON(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "invalid JSON body: " + err.Error()})
-		}
-		if req.ContentID == "" && req.MediaID == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "media_id or content_id is required"})
-		}
-		if req.ProjectID == "" {
-			req.ProjectID = eng.ProjectID()
-		}
-		// A caller normally holds the media id — it is what a generation returns
-		// and what the editor URL carries — while SPrCad takes the content id.
-		// Resolve it rather than making every caller know both.
-		if req.ContentID == "" {
-			contentID, err := eng.ResolveContentID(c.Context(), req.MediaID)
-			if err != nil {
-				return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
-			}
-			req.ContentID = contentID
-		}
-
-		resolution, label, err := imageResolution(req.Resolution)
-		if err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		start := time.Now()
-		result, err := eng.UpscaleImage(c.Context(), req.ProjectID, req.MediaID, req.ContentID, resolution)
-		if err != nil {
-			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		response := fiber.Map{
-			"status":          "succeeded",
-			"media_id":        req.MediaID,
-			"content_id":      req.ContentID,
-			"resolution":      label,
-			"media_type":      result.MediaType,
-			"bytes":           result.Bytes,
-			"elapsed_seconds": time.Since(start).Seconds(),
-		}
-
-		if boolOr(req.Download, true) {
-			ext := ".bin"
-			switch result.MediaType {
-			case "image/jpeg":
-				ext = ".jpg"
-			case "image/png":
-				ext = ".png"
-			}
-			name := fmt.Sprintf("upscale-%s-%s%s", shortID(req.MediaID), strings.ToLower(label), ext)
-			if err := os.MkdirAll("output", 0o755); err != nil {
-				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-			}
-			if err := os.WriteFile(filepath.Join("output", name), result.Data, 0o644); err != nil {
-				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-			}
-			response["file"] = "output/" + name
-			response["url"] = "/output/" + name
-		}
-
-		return c.JSON(response)
-	}
-}
-
-// imageResolution maps the download menu's label onto SPrCad's selector.
-//
-// "1K | Original size" is not an upscale: it is the size the asset already has,
-// which its media URL serves directly, so asking for it is an error rather than a
-// silent no-op.
-func imageResolution(label string) (int, string, error) {
-	switch strings.ToUpper(strings.TrimSpace(label)) {
-	case "", "2K", "2":
-		return engine.Resolution2K, "2K", nil
-	case "4K", "4":
-		return engine.Resolution4K, "4K", nil
-	case "1K", "1", "ORIGINAL":
-		return 0, "", fmt.Errorf(
-			"1K is the asset's original size and needs no upscale; ask for 2K or 4K")
-	default:
-		return 0, "", fmt.Errorf("resolution must be 2K or 4K, not %q", label)
-	}
-}
-
-// withoutAuthCookies rebuilds a jar with the session cookies removed.
-//
-// Diagnostics only. It exists so a 401 can be produced on demand: the recovery
-// path that handles one is otherwise unreachable until a session happens to
-// expire, which is exactly when it must work.
-func withoutAuthCookies(jar *cookiejar.Jar) *cookiejar.Jar {
-	if jar == nil {
-		return nil
-	}
-	auth := make(map[string]bool, len(cookiejar.AuthCookieNames))
-	for _, name := range cookiejar.AuthCookieNames {
-		auth[name] = true
-	}
-	kept := make([]cookiejar.Cookie, 0, len(jar.Cookies()))
-	for _, ck := range jar.Cookies() {
-		if auth[ck.Name] {
-			continue
-		}
-		kept = append(kept, ck)
-	}
-	return cookiejar.FromCookies(kept, "diagnostic-no-credentials")
 }
 
 // shortID trims an id to something usable in a filename.
@@ -2008,10 +1668,8 @@ func helpSections() []map[string]string {
 		{"method": "GET", "path": "/v1/credits", "description": "Refresh and return account balances"},
 		{"method": "POST", "path": "/v1/videos/generations", "description": "Submit a video generation"},
 		{"method": "POST", "path": "/v1/images/generations", "description": "Submit an image generation"},
-		{"method": "POST", "path": "/v1/videos/upscale", "description": "Upscale a finished video to 1080p or 4k"},
 		{"method": "POST", "path": "/v1/videos/edit", "description": "Edit an existing asset with abra_edit"},
 		{"method": "POST", "path": "/v1/videos/reference", "description": "Generate from reference images with abra_r2v_*"},
-		{"method": "POST", "path": "/v1/images/upscale", "description": "Resolve an image at 2K or 4K (needs the browser)"},
 		{"method": "GET", "path": "/v1/jobs", "description": "Recent jobs"},
 		{"method": "GET", "path": "/v1/jobs/:id", "description": "One job"},
 		{"method": "GET", "path": "/v1/media", "description": "Recent generated media"},
@@ -2025,7 +1683,7 @@ func helpText() string {
 	return `flow-go — Google Flow generation engine
 
 The browser supplies cookies and base information. Everything else — access
-tokens, project resolution, generation, polling, upscaling, downloads, storage —
+tokens, project resolution, generation, polling, downloads, storage —
 happens in this process. No generation request travels through a browser.
 
 ENDPOINTS
@@ -2036,8 +1694,6 @@ ENDPOINTS
   GET  /v1/credits                 refresh and return account balances
   POST /v1/videos/generations      submit a video generation
   POST /v1/images/generations      submit an image generation
-  POST /v1/videos/upscale          upscale a finished video to 1080p or 4k
-  POST /v1/images/upscale          resolve an image at 2K or 4K (needs the browser)
   GET  /v1/jobs                    recent jobs
   GET  /v1/jobs/:id                one job
   GET  /v1/media                   recent generated media

@@ -227,49 +227,11 @@ const (
 	// presumably the trim window. Not wired into the API yet.
 	RPCIDVideoEdit = "jIps6"
 
-	// RPCIDUpscale renders a finished video at a higher resolution.
-	//
-	// Captured from the media viewer's download menu, which offers 270p (Animated
-	// GIF), 720p (Original size), 1080p (Upscaled) and 4K (Upscaled, paid).
-	// Decoded:
-	//
-	//	[[[ [null, "<operation-id>"], null, 1, null,
-	//	     [null, "<source-media-id>", null, null, "<uuid>"],
-	//	     null, 2, null × 27,
-	//	     "<upsampler-model>" ]],
-	//	 [null, 22, null, null, null, "<project-id>", null, null, null, null,
-	//	  ["<recaptcha-token>", 1]]]
-	//
-	// The upsampler model key sits at index 34 of the 35-element request, after a
-	// long run of nulls — which is why it is easy to miss. Keys come from the
-	// model catalog: veo_3_1_upsampler_1080p and veo_3_1_upsampler_4k.
-	//
-	// Note this is a separate surface from the legacy REST upsampler the Python
-	// engine called, which no longer works.
-	RPCIDUpscale = "p0UkFb"
-
 	// RPCIDOperation polls a long-running operation by id.
 	//
 	// Payload [null, null, [[<operation-id>]]]. Used to follow an upscale or an
 	// edit to completion.
 	RPCIDOperation = "jwpduf"
-
-	// RPCIDImageUpscale resolves an image at a chosen resolution.
-	//
-	// This is the "instant" step in the download flow. The download menu offers
-	// 1K (Original size), 2K (Upscaled) and 4K (Upscaled); picking anything other
-	// than 1K runs this first, then the file is fetched. That is why clicking 2K
-	// leaves no new project asset: nothing is created, the asset is simply served
-	// at a larger size.
-	//
-	// Decoded:
-	//
-	//	["<content-id>", <resolution>, [null, 22, null, null, null, "<project-id>",
-	//	 null, null, null, null, ["<recaptcha-token>", 1]]]
-	//
-	// Position [1] is the resolution selector; 1 was observed for the 2K choice.
-	// Its exact scale is not certain, so it is passed through rather than mapped.
-	RPCIDImageUpscale = "SPrCad"
 
 	// RPCIDMediaDetail returns the signed URLs for one asset.
 	//
@@ -416,13 +378,6 @@ type Client struct {
 	// removed instead of set. Diagnostics only: it exists so a request can be
 	// compared against the browser's own, header by header.
 	overrides map[string]string
-	// useQUIC allows the HTTP/3 path on these POSTs. The app's own batchexecute
-	// calls go out over h3; the default transport keeps POSTs on HTTP/2.
-	useQUIC bool
-	// headerOrder overrides the header ordering. Diagnostics only: a header that
-	// is absent from the order list is emitted in an arbitrary position, so a
-	// faithful replay has to supply the order as well as the headers.
-	headerOrder []string
 	// onUnauthorized refreshes an expired session. Nil means a 401 is terminal.
 	onUnauthorized UnauthorizedHandler
 	// authUser selects which signed-in Google account these calls act as.
@@ -465,27 +420,6 @@ func (c *Client) endpointURL(rawQuery string) string {
 		endpoint += "&authuser=" + strconv.Itoa(index)
 	}
 	return endpoint
-}
-
-// SetHeaderOrder overrides the order headers are sent in.
-//
-// Diagnostics only. The default list omits headers the app sends (sec-fetch-*,
-// x-same-domain), and an unlisted header lands wherever the map iterates to —
-// which is not reproducible and not what the browser sends.
-func (c *Client) SetHeaderOrder(order []string) {
-	c.mu.Lock()
-	c.headerOrder = order
-	c.mu.Unlock()
-}
-
-// SetUseQUIC allows these calls to go out over HTTP/3.
-//
-// Only for calls that are safe to repeat: the QUIC path falls back to HTTP/2,
-// which would submit a write twice.
-func (c *Client) SetUseQUIC(enabled bool) {
-	c.mu.Lock()
-	c.useQUIC = enabled
-	c.mu.Unlock()
 }
 
 // SetHeaderOverrides installs headers to apply after the built-in set. Mapping a
@@ -792,60 +726,6 @@ func (c *Client) CallWith(ctx context.Context, rpcID string, payload any, opts C
 	return ParseFrames(resp.Text())
 }
 
-// CallRaw performs the same call as CallWith but returns the response body
-// verbatim.
-//
-// Diagnostics only. ParseFrames keeps only the wrb.fr frames and drops the
-// payload of any frame whose data element is not a non-empty string, so an RPC
-// that answers with an error frame and an RPC that genuinely returns nothing
-// both look like a nil Payload. When that happens the raw body is the only place
-// the reason is still visible.
-func (c *Client) CallRaw(ctx context.Context, rpcID string, payload any, opts CallOptions) (string, error) {
-	auth, err := c.Authorization()
-	if err != nil {
-		return "", err
-	}
-
-	arg := "[]"
-	if payload != nil {
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return "", fmt.Errorf("batchexecute: could not encode the payload: %w", err)
-		}
-		arg = string(encoded)
-	}
-
-	envelope := [][][]any{{{rpcID, arg, nil, "generic"}}}
-	envelopeJSON, err := json.Marshal(envelope)
-	if err != nil {
-		return "", fmt.Errorf("batchexecute: could not encode the envelope: %w", err)
-	}
-
-	sourcePath := opts.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project"
-	}
-
-	query := url.Values{}
-	query.Set("rpcids", rpcID)
-	query.Set("source-path", sourcePath)
-	query.Set("hl", "en")
-	query.Set("rt", "c")
-	query.Set("_reqid", strconv.FormatInt(atomic.AddInt64(&c.reqs, 1)*100000+1000, 10))
-	if opts.BuildLabel != "" {
-		query.Set("bl", opts.BuildLabel)
-	}
-	if sid := c.sessionIDFor(opts); sid != "" {
-		query.Set("f.sid", sid)
-	}
-
-	resp, err := c.post(ctx, rpcID, string(envelopeJSON), query.Encode(), auth)
-	if err != nil {
-		return "", err
-	}
-	return resp.Text(), nil
-}
-
 // UnauthorizedHandler refreshes a session the server has rejected.
 //
 // It returns the fresh cookie jar so the client can swap it in, or nil to keep
@@ -889,23 +769,21 @@ func (c *Client) post(ctx context.Context, rpcID, envelopeJSON, rawQuery, auth s
 				body.Set("at", token)
 			}
 
-			c.mu.Lock()
-			useQUIC := c.useQUIC
-			order := c.headerOrder
-			c.mu.Unlock()
-			if len(order) == 0 {
-				order = httpx.ChromeHeaderOrder
-			}
-
+			// QUIC is off and the header order is Chrome's, always. Both used to
+			// be settable for the image-upscale diagnosis — the app's own
+			// batchexecute calls go out over h3, and a faithful replay has to
+			// supply the header order as well as the headers — and neither made
+			// any difference to that rejection. The setters went with the
+			// upscale code; the values are what they always resolved to.
 			resp, err := c.hc.Do(ctx, &httpx.Request{
 				Method:      "POST",
 				URL:         fullURL,
 				Body:        []byte(body.Encode()),
 				Headers:     headers,
-				HeaderOrder: order,
+				HeaderOrder: httpx.ChromeHeaderOrder,
 				Cookies:     c.jar.HeaderForDomain(Origin + "/"),
-				DisableQUIC: !useQUIC,
-				AllowQUIC:   useQUIC,
+				DisableQUIC: true,
+				AllowQUIC:   false,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("batchexecute: %s request failed: %w", rpcID, err)
@@ -984,56 +862,6 @@ func (c *Client) post(ctx context.Context, rpcID, envelopeJSON, rawQuery, auth s
 
 // upsampledSuffix is appended to the source asset's content id to name the
 // upscaled render. It is what makes the id findable without trusting a path.
-const upsampledSuffix = "_upsampled"
-
-// ParseUpscaledAssetID pulls the new asset id out of an upscale response.
-//
-// The payload is `[[[["<content-id>_upsampled"],"",null,null,1]],323,[...]]`, so
-// the id sits at [0][0][0][0] — four levels down, which is worth pinning because
-// the value is a one-element array rather than a bare string.
-//
-// What it returns is a *submission acknowledgement*: the id names a render that
-// does not exist yet, and its URL only appears once the render finishes. Treating
-// this response as the finished asset — or as "no output", because it carries no
-// URL — is the mistake that made this RPC look broken.
-func ParseUpscaledAssetID(frames []Frame) (string, error) {
-	for _, frame := range frames {
-		if len(frame.Payload) == 0 {
-			continue
-		}
-		var payload []any
-		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
-			continue
-		}
-		if id := firstStringAt(payload, 0, 0, 0, 0); strings.HasSuffix(id, upsampledSuffix) {
-			return id, nil
-		}
-		// The path above is the captured shape. Fall back to a search so a
-		// re-nested response degrades to "found anyway" rather than "no output".
-		if id := findUpsampledID(payload); id != "" {
-			return id, nil
-		}
-	}
-	return "", fmt.Errorf("batchexecute: the upscale response carried no asset id")
-}
-
-// findUpsampledID walks a decoded payload for the upscaled asset id. The suffix
-// is unique to it, so the search cannot pick up a neighbouring value.
-func findUpsampledID(value any) string {
-	switch typed := value.(type) {
-	case string:
-		if strings.HasSuffix(typed, upsampledSuffix) {
-			return typed
-		}
-	case []any:
-		for _, item := range typed {
-			if found := findUpsampledID(item); found != "" {
-				return found
-			}
-		}
-	}
-	return ""
-}
 
 // firstStringAt walks a nested array by index and returns the string it finds,
 // or "" if the path does not lead to one.
@@ -2079,10 +1907,7 @@ func VideoRPCID(req GenerateVideoRequest) string {
 }
 
 // Upsampler model keys, as they appear in the model catalog.
-const (
-	UpscaleModel1080p = "veo_3_1_upsampler_1080p"
-	UpscaleModel4K    = "veo_3_1_upsampler_4k"
-)
+const ()
 
 // upscaleRequestLength is the size of the upscale request array. The payload is a
 // fixed-length positional array with a long run of nulls, and the model key sits
@@ -2091,190 +1916,8 @@ const (
 // Measured from the app's own request: 32 elements, model at index 31. An earlier
 // value of 35 (model at 34) was wrong and the server accepted the call without
 // acting on it, which is the worst kind of failure — no error, no output.
-const upscaleRequestLength = 32
 
 // upscaleModelIndex is where the upsampler model key goes.
-const upscaleModelIndex = 31
-
-// UpscaleRequest describes an upscale submission.
-type UpscaleRequest struct {
-	ProjectID string
-	// ContentID is the source asset's content id, which is not the same as its
-	// media id. It goes at request[0] and the server derives the new asset's id
-	// from it by appending "_upsampled".
-	ContentID string
-	// MediaID is the source video's media id.
-	MediaID string
-	// CallID is the uuid in the argument's trailing element, ["<uuid>"], and not
-	// the id at request[0] — that position holds the source content id. An empty
-	// value gets a fresh uuid, which is what the app sends per submission; set it
-	// only to replay a capture exactly.
-	CallID string
-	// Model is the upsampler key. Empty defaults to the 1080p upsampler.
-	Model string
-	// CaptchaToken is a reCAPTCHA token minted for the VIDEO_GENERATION action.
-	CaptchaToken string
-}
-
-// Upscale submits a higher-resolution render of a finished video.
-func (c *Client) Upscale(ctx context.Context, req UpscaleRequest, opts CallOptions) ([]Frame, error) {
-	if req.ProjectID == "" {
-		return nil, fmt.Errorf("batchexecute: a project id is required")
-	}
-	if req.MediaID == "" {
-		return nil, fmt.Errorf("batchexecute: a source media id is required")
-	}
-	if req.ContentID == "" {
-		// The content id is not interchangeable with the media id: it goes at
-		// request[0] and the server names the new asset after it.
-		return nil, fmt.Errorf("batchexecute: the source asset's content id is required")
-	}
-	if req.CaptchaToken == "" {
-		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
-	}
-
-	arg := buildUpscaleArgument(req)
-
-	if opts.SourcePath == "" {
-		opts.SourcePath = "/project/" + req.ProjectID + "/edit/" + req.MediaID
-	}
-	return c.CallWith(ctx, RPCIDUpscale, arg, opts)
-}
-
-// buildUpscaleArgument assembles the upscale payload.
-//
-// Separated so the shape can be asserted: the array is positional and mostly
-// nulls, with the model key at the very end.
-func buildUpscaleArgument(req UpscaleRequest) []any {
-	model := req.Model
-	if model == "" {
-		model = UpscaleModel1080p
-	}
-
-	// Start all-null and fill the positions the app uses.
-	//
-	// Every index below is read off the app's own request. They are not
-	// interchangeable: the server accepts a payload with the right shape but the
-	// wrong indices and simply does nothing, returning a well-formed empty
-	// result rather than an error.
-	request := make([]any, upscaleRequestLength)
-	request[0] = []any{nil, req.ContentID}
-	request[2] = 2
-	request[4] = []any{nil, req.MediaID, nil, nil, uuid.NewString()}
-	request[6] = 2
-	request[upscaleModelIndex] = model
-
-	contextBlock := []any{
-		nil,
-		toolContextID,
-		nil, nil, nil,
-		req.ProjectID,
-		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
-	}
-
-	// The third element is a bare uuid in its own array. It is easy to miss —
-	// the request is otherwise [request, context] like every other RPC.
-	return []any{
-		[]any{request},
-		contextBlock,
-		[]any{upscaleCallID(req)},
-	}
-}
-
-// upscaleCallID is the trailing uuid on an upscale submission. The app sends a
-// fresh one per call; an explicit value is honoured so a capture can be replayed
-// byte-for-byte.
-func upscaleCallID(req UpscaleRequest) string {
-	if req.CallID != "" {
-		return req.CallID
-	}
-	return uuid.NewString()
-}
-
-// OperationStatus polls a long-running operation.
-func (c *Client) OperationStatus(ctx context.Context, projectID, operationID string) ([]Frame, error) {
-	if operationID == "" {
-		return nil, fmt.Errorf("batchexecute: an operation id is required")
-	}
-	return c.CallWith(ctx, RPCIDOperation,
-		[]any{nil, nil, []any{[]any{operationID}}},
-		CallOptions{SourcePath: "/project/" + projectID})
-}
-
-// ImageUpscaleRequest asks for an image at a chosen resolution.
-type ImageUpscaleRequest struct {
-	ProjectID string
-	// MediaID is the image's media id, used to build the source-path.
-	MediaID string
-	// ContentID is the asset's storage id, which is what the RPC actually takes.
-	ContentID string
-	// Resolution is the selector sent at position [1]. 1 was observed for the 2K
-	// option; the mapping to a scale is not certain.
-	Resolution int
-	// CaptchaToken is a reCAPTCHA token.
-	CaptchaToken string
-	// BuildLabel is the `bl` query parameter. The app always sends one, and the
-	// generation RPC is routed by it, so leaving it off is a needless difference.
-	BuildLabel string
-	// SourcePath overrides the derived `source-path`. Empty means
-	// "/project/<project>/edit/<media>". Diagnostics only.
-	SourcePath string
-	// SessionID is the `f.sid` query parameter. The app always sends one.
-	SessionID string
-}
-
-// UpscaleImage resolves an image at a larger size and returns the assets.
-//
-// The download menu's "2K / Upscaled" choice runs this before fetching the file,
-// which is why no new project asset appears: the image is served bigger, not
-// re-created.
-func (c *Client) UpscaleImage(ctx context.Context, req ImageUpscaleRequest) ([]GeneratedMedia, error) {
-	if req.ProjectID == "" {
-		return nil, fmt.Errorf("batchexecute: a project id is required")
-	}
-	if req.ContentID == "" {
-		return nil, fmt.Errorf("batchexecute: a content id is required")
-	}
-	if req.CaptchaToken == "" {
-		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
-	}
-
-	resolution := req.Resolution
-	if resolution == 0 {
-		resolution = 1
-	}
-
-	contextBlock := []any{
-		nil,
-		toolContextID,
-		nil, nil, nil,
-		req.ProjectID,
-		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
-	}
-
-	sourcePath := req.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project/" + req.ProjectID
-		if req.MediaID != "" {
-			sourcePath += "/edit/" + req.MediaID
-		}
-	}
-
-	frames, err := c.CallWith(ctx, RPCIDImageUpscale,
-		[]any{req.ContentID, resolution, contextBlock},
-		CallOptions{SourcePath: sourcePath, BuildLabel: req.BuildLabel, SessionID: req.SessionID})
-	if err != nil {
-		return nil, err
-	}
-
-	var out []GeneratedMedia
-	for _, frame := range frames {
-		out = append(out, ParseGeneratedMedia(frame.Payload)...)
-	}
-	return out, nil
-}
 
 // GeneratedMedia is one asset returned by a generation call.
 type GeneratedMedia struct {
@@ -2406,12 +2049,13 @@ func isNonEmptyString(value any) bool {
 }
 
 // AssetTypeOriginal marks a row that is the asset as it was generated. Other
-// codes ("CAI", "CAM") mark derived assets — an upscale, a variant — which share
-// the same media id and are not interchangeable for the upscale RPC.
+// codes ("CAI", "CAM") mark derived assets — a variant, or an upscale — which share
+// the same media id and are not interchangeable.
 //
-// The meaning is inferred from behaviour rather than documentation: for the same
-// media id, SPrCad returns an image for the CAE row and returns nothing at all
-// for the CAI one.
+// The meaning is inferred from behaviour rather than documentation: for one media
+// id the CAE row answers with image data and the CAI row answers with nothing.
+// That was established through the image-upscale RPC, since removed, but
+// ResolveContentID and MediaDetail still depend on it.
 const AssetTypeOriginal = "CAE"
 
 // ProjectAsset is one entry from a project listing.
@@ -2739,61 +2383,4 @@ func truncate(value string, max int) string {
 		return value
 	}
 	return value[:max] + "..."
-}
-
-// UpscaleImageRaw is UpscaleImage but returns the raw frames.
-//
-// Exposed for diagnostics: the parsed view only surfaces URLs, and when a
-// response carries none the raw shape is what shows where the value actually is.
-func (c *Client) UpscaleImageRaw(ctx context.Context, req ImageUpscaleRequest) ([]json.RawMessage, error) {
-	resolution := req.Resolution
-	if resolution == 0 {
-		resolution = 1
-	}
-	contextBlock := []any{
-		nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
-	}
-	sourcePath := req.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project/" + req.ProjectID
-		if req.MediaID != "" {
-			sourcePath += "/edit/" + req.MediaID
-		}
-	}
-
-	frames, err := c.CallWith(ctx, RPCIDImageUpscale,
-		[]any{req.ContentID, resolution, contextBlock},
-		CallOptions{SourcePath: sourcePath, BuildLabel: req.BuildLabel, SessionID: req.SessionID})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]json.RawMessage, 0, len(frames))
-	for _, f := range frames {
-		out = append(out, f.Payload)
-	}
-	return out, nil
-}
-
-// UpscaleImageRawBody returns the verbatim response body for the image-upscale
-// RPC. Diagnostics only; see CallRaw for why the parsed view is not enough.
-func (c *Client) UpscaleImageRawBody(ctx context.Context, req ImageUpscaleRequest) (string, error) {
-	resolution := req.Resolution
-	if resolution == 0 {
-		resolution = 1
-	}
-	contextBlock := []any{
-		nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
-	}
-	sourcePath := req.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project/" + req.ProjectID
-		if req.MediaID != "" {
-			sourcePath += "/edit/" + req.MediaID
-		}
-	}
-	return c.CallRaw(ctx, RPCIDImageUpscale,
-		[]any{req.ContentID, resolution, contextBlock},
-		CallOptions{SourcePath: sourcePath, BuildLabel: req.BuildLabel, SessionID: req.SessionID})
 }

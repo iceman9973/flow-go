@@ -31,7 +31,7 @@ token. That made the browser a hard dependency on the critical path, and when th
 token went stale the pipeline deadlocked.
 
 This port keeps the browser only where it is genuinely required — cookies, page
-tokens, a reCAPTCHA token, and one in-page upscale call — and does the rest in Go.
+tokens and a reCAPTCHA token — and does the rest in Go.
 
 ## Quick start
 
@@ -126,8 +126,6 @@ popup has no editor by design, so clear `browserCdp.config` from
 | GET | `/v1/credits` | Refresh and return account balances |
 | POST | `/v1/videos/generations` | Submit a video generation |
 | POST | `/v1/images/generations` | Submit an image generation |
-| POST | `/v1/videos/upscale` | Upscale a finished video to 1080p (`p0UkFb`, submit then poll) |
-| POST | `/v1/images/upscale` | Resolve an image at 2K or 4K (`SPrCad`, run in the browser) |
 | POST | `/v1/bridge/refresh` | Ask the browser to renew its session, then re-sync |
 | GET | `/v1/jobs` | Recent jobs |
 | GET | `/v1/jobs/:id` | One job |
@@ -237,8 +235,6 @@ row[2] = media id     ← what the UI and the editor URL use
 
 | Call | Takes |
 |---|---|
-| `SPrCad` (image upscale) | content id |
-| `p0UkFb` (video upscale) | **both** — content at `request[0]`, media at `request[4]` |
 | `nprQif` / `eb1hJf` (image-to-video) | content id, in `startImage`/`endImage` |
 | `as29s` (media detail) | content id |
 | `/project/<id>/edit/<X>` | media id |
@@ -389,7 +385,7 @@ The path is reachable on demand rather than only when a session happens to expir
 which is how it was verified:
 
 ```
-batchexecute: SPrCad returned 401; refreshing the session and retrying
+batchexecute: as29s returned 401; refreshing the session and retrying
 bridge: attached to https://flow.google.com/project/… for a session refresh
 ```
 
@@ -401,8 +397,6 @@ was wrong, so the only way through is to vary one thing at a time:
 | POST | `/v1/debug/headers` | The exact headers and Cookie a call would send, so they can be diffed against the browser's |
 | POST | `/v1/debug/captcha` | Mint a reCAPTCHA token and hand it back, to replay it from the page |
 | POST | `/v1/debug/events-raw` | Raw CDP events. `requestWillBeSentExtraInfo` is the only place the browser's *real* headers, Cookie included, are visible |
-| POST | `/v1/debug/image-upscale` | `SPrCad` over the Go transport, with the raw response body. Takes `header_overrides`, `header_order`, `tls_profile`, `protocol_racing`, `build_label`, `at_token`, `source_path`, `session_id`, `use_quic`, `drop_credentials` |
-| POST | `/v1/debug/video-upscale` | `p0UkFb` over the Go transport, returning the queued asset id |
 | GET | `/v1/debug/credits-rpc` | The raw **batchexecute** credits payload for one account (`?authuser=N`). Unlike `/v1/debug/credits-raw`, which hits the legacy endpoint and reports whichever account that credential belongs to, this uses the transport and `authuser` a real balance read uses — so it can be pointed at a specific account. It is how the tier question was settled: the payload is `[[7,3,8,1,null,7]]`, numbers only, no tier |
 | POST | `/v1/bridge/eval` | Evaluate an expression in the attached tab |
 | POST | `/v1/bridge/cdp` | Issue an arbitrary CDP command |
@@ -518,13 +512,13 @@ fine and is the normal debugging setup.
 | --- | --- | --- |
 | Chrome name | **Flow Go Bridge** | **browser-Cdp** |
 | Belongs to | this repo | the `browser-Cdp` project |
-| Surface | a fixed list of Flow operations (`flow.at`, `flow.captcha`, `flow.upscale`, …) | arbitrary CDP: `cdp.call`, `cdp.evaluate` |
+| Surface | a fixed list of Flow operations (`flow.at`, `flow.captcha`, …) | arbitrary CDP: `cdp.call`, `cdp.evaluate` |
 | `debugger` permission | **no** | yes |
 | Host access | Google hosts only | `<all_urls>` |
 | Empty scope means | refuse (fail-closed) | allow (fail-open) |
 
 **flow-go uses the narrow one.** It needs cookies, a page token, a reCAPTCHA token
-and one in-page upscale call — all of which are named operations. Arbitrary CDP is a
+and the page-minted captcha — all of which are named operations. Arbitrary CDP is a
 debugging convenience, not a requirement, and the narrow extension is the one that
 cannot be talked into driving an unrelated site.
 
@@ -536,6 +530,51 @@ Both dial `ws://127.0.0.1:9222`, so **exactly one backend can own that port**. T
 backend tells them apart from the `ops` list each reports on `ping`, and prefers the
 narrow one as `current` when both are attached. The generic one is still reachable
 by address — `/v1/debug/cookies {"all": true}` lists every attached client.
+
+### Two browser profiles must not both be connected
+
+This is the one setup that silently produces nonsense, and it is easy to walk into:
+load the extension in a second Chrome profile and now **two narrow extensions** are
+attached, from two different Google accounts.
+
+The bridge holds **one** cookie jar, and `Current()` is whichever client connected
+last. So the account and the project flip depending on who synced most recently, and
+the engine is left holding a client it built at boot while the jar underneath it has
+changed. Observed directly, same process, same minute:
+
+```
+09:12:15 auth: minted access token for kiak9622@gmail.com      <- the old profile
+09:12:16 engine: 1 project(s) listed; taking d57b3c78-…        <- the old account's
+09:12:17 GET /v1/projects -> the new account's 16 projects      <- the new profile
+```
+
+and then a generation that reported the **old** account id and the **old** project
+while the jar held the **new** account's cookies.
+
+`/v1/debug/cookies {"all": true, "domain": "flow.google.com"}` is how to see it —
+three clients, two of them with `flow_operations: true`:
+
+| addr | flow operations |
+| --- | --- |
+| `127.0.0.1:62783` | yes |
+| `127.0.0.1:62784` | no — the generic bridge |
+| `127.0.0.1:62788` | yes |
+
+**Close the extension, or the Flow tab, in every profile but one.** Until then every
+result is unreliable, and the failures look like bugs in this engine rather than like
+two accounts taking turns.
+
+A second profile also has no bridge token, so its first connection is refused:
+
+```
+cdp: rejected an upgrade from 127.0.0.1:62587 — no token was presented and pairing is
+closed, so the extension has none stored.
+```
+
+Paste the contents of `data/bridge-token` into that profile's extension popup. The
+alternative — deleting `data/bridge-token.claimed` and restarting — reopens a
+one-connection tokenless window, but whichever extension reconnects first wins that
+race, so pasting is the deterministic fix.
 
 The bridge itself is **not part of this module**. `cdp-control/{bridge,cdp,cookiejar}`
 live in the `browser-Cdp` project and are pulled in by a relative `replace` in
@@ -558,7 +597,7 @@ The settings that matter most:
 | Setting | Purpose |
 | --- | --- |
 | `--proxy` | CLI flag. Route upstream traffic through one exit IP. Flow scores on IP consistency, so a stable proxy measurably improves success. |
-| `--captcha` | CLI flag, **not** an environment variable: `auto` (default), `broker`, `http`, or `off`. Setting `FLOW_RECAPTCHA` does nothing. |
+| `--captcha` | CLI flag, **not** an environment variable: `auto` (default), `broker`, `http`, or `off`. Setting `FLOW_RECAPTCHA` does nothing. `auto` and `http` both mint over the transport and need no browser; `broker` opts into the page token. |
 | `WS_PORT` / `HTTP_PORT` | Environment variables. Extension bridge and API ports. |
 | `ACCOUNT_INDEX` | Environment variable. Seeds which signed-in account to act as. Only a seed — once `/v1/accounts/switch` has been used, the stored index wins, so a deliberate choice survives a restart. |
 | `ACCOUNT_SCAN_LIMIT` | Environment variable, default 6. How many account indices are examined when looking for one that can pay. Chrome permits ten, but the scan costs a session, a profile and a balance read per index and runs on the request path. |
@@ -571,39 +610,35 @@ The settings that matter most:
 ### What the browser is for, and what the API is for
 
 The generation itself never goes through the browser. Every RPC — submit, poll,
-media detail, credits, upscale — is a `POST` to batchexecute from the Go process,
-authenticated by `SAPISIDHASH` over cookies. The browser is not a proxy; it is a
-key holder.
+media detail, credits, project list, project create — is a `POST` to batchexecute
+from the Go process, authenticated by `SAPISIDHASH` over cookies. The browser is
+not a proxy; it is a key holder.
 
-Four things only exist in a loaded Flow editor page, and none can be minted from
-a cookie jar:
+What used to need a loaded page, and what still does:
 
-| What | Why it cannot come from the API |
+| What | State |
 | --- | --- |
-| reCAPTCHA token | The widget is rendered in the page. `flow.captcha` asks the page to run `grecaptcha.enterprise.execute`, which scores better than the HTTP provider |
-| `at` and `f.sid` | The anti-CSRF token and session id the app puts on every request. Page-only |
-| Current cookies | `__Secure-1PSIDTS` rotates on Google's schedule; the page always holds the live pair |
+| reCAPTCHA token | **avoidable** — the HTTP provider works server-side, once it stops reusing a single-use token |
+| Project id | **avoidable** — listed and created over the transport |
+| `at` and `f.sid` | avoidable — persisted, and the client primes for `at` without them |
+| Current cookies | not avoidable, but a snapshot or the cache carries them across processes |
+| Browser identity | not avoidable, but persisted (`data/fingerprint.json`) |
 
-That is the whole reason a tab opens. It is also why "why does it need a browser
-if it calls an API" is the wrong question — the API call is the work, and the
-browser is what proves the call is allowed.
+So a run with no browser can create a project, list projects, read credits, upload,
+generate an image, generate a video, poll it, resolve it and download it. Verified:
+`acct-dd4c92d5-9b5.mp4`, `status: "ready"`, with `flow.captcha failed: no extension
+attached` in the log — the browser was not consulted.
 
-**Three of the four are now avoidable.** The project id used to be on this list,
-on the belief that no RPC could list projects. That belief was wrong and it was
-expensive: the id believed to be the listing (`WuwhI`) is the generation-status
-RPC, and it answers `null` to everything else. The real one is `UpteDb`, takes
-`["projects/*", 21, …]`, and returns the account's projects with timestamps —
-over the transport, with no tab involved. See "Where a project id comes from".
+Nothing on this list needs a page any more. Upscaling was the last holdout and it
+has been removed — see "Upscaling — removed" for what it cost and why it could not
+be moved to the transport.
 
-`at` and `f.sid` are already optional — without them the client primes for a
-token itself. Cookies and the reCAPTCHA token are not avoidable; they are the
-credentials.
-
-Note that configuring or listing a project does **not** stop the pre-submit
-navigation. That one is separate: `ensureProjectTab` runs before every generation
-so the reCAPTCHA widget has a page to render in. It navigates the tab already
-attached rather than opening a new one, so repeated switches do not accumulate
-tabs.
+Note that `ensureProjectTab` still runs before every generation and navigates a
+tab when a bridge is attached. It is now belt-and-braces rather than a
+requirement: it keeps the higher-scoring page token in play when a browser is
+there, and a browserless run simply falls through to the HTTP provider. It
+navigates the tab already attached rather than opening a new one, so repeated
+switches do not accumulate tabs.
 
 ### Where a project id comes from
 
@@ -740,45 +775,124 @@ file:    output/acct-460ddc37-2e6.jpg   89864 bytes   1376x768 JPEG
 | **Image generation + download** (`/v1/images/generations`) | **works** |
 | **Video generation + download** (`/v1/videos/generations`) | **works** — text-to-video, first-frame-only, and first+last |
 | Media listed back out of the project | works |
-| **Image upscale** (`/v1/images/upscale`) | **works** — 1376x768 -> 2752x1536, verified with ffprobe |
-| **Video upscale** (`/v1/videos/upscale`) | **works** — 1280x720 -> 1920x1080, verified with ffprobe |
 
 No API key. No bearer token. No `aisandbox-pa.googleapis.com`.
 
-### The reCAPTCHA token is load-bearing for video
+### The reCAPTCHA token: server-side works, and a cache made it look broken
 
-The token can be minted two ways, and they are not equivalent.
+> **See [`docs/RECAPTCHA.md`](docs/RECAPTCHA.md)** for the full account — the mint
+> exchange, the failure signature to recognise, a checklist for an empty
+> generation, and everything already ruled out so it is not re-tested.
 
-| Provider | Needs a browser | Video submission |
+> **Correction, twice over.** An earlier revision claimed the user agent was the
+> fix; that did not reproduce and was retracted. The retraction then claimed the
+> HTTP provider was inherently intermittent and the page token was the only
+> dependable one. **That was also wrong.** The real cause was a token cache in
+> `HTTPProvider`, and with it removed the server-side path works — image, video,
+> and a run with no browser attached at all.
+
+The token can be minted two ways, and the default is the one that needs nothing:
+
+| Provider | Needs a browser | Used by |
 | --- | --- | --- |
-| `flow.captcha` (page) | yes | **submitted** — media id returned, credits charged |
-| `http` (anchor/reload protocol) | no | **empty** — no media id, nothing charged |
+| `http` (anchor/reload protocol) | **no** | `auto` (the default) and `http` |
+| `flow.captcha` (page) | yes | `broker`, and only when asked for |
 
-Measured as an A/B, same server, same project, same prompt, same model, only the
-provider varied. The HTTP provider also failed against a second, older project, so
-the project is not the variable. The earlier one success out of four attempts is
-not enough to call it flaky rather than broken — treat it as broken.
+`auto` used to lead with `flow.captcha` and the broker, on the belief that a
+page-minted token scored better. It does — and it was also why every generation
+needed an extension attached and a tab parked on a Flow project. The transport
+turns out to be sufficient, so the default now asks the browser for nothing, and
+`ensureProjectTab` only runs in `broker` mode. Anyone who wants the page token can
+still have it with `--captcha broker`.
 
-This matters because the failure is **silent**. Flow accepts the request, answers
-`200`, returns an empty frame and charges nothing. There is no error to catch and
-no status to check, so it reads exactly like a wrong model key or a wrong RPC id —
-which is where the diagnostic used to send the reader. It now names the provider
-and says so:
+#### What was actually wrong
+
+`HTTPProvider` cached its token for two minutes:
+
+```go
+if p.token != "" && time.Now().Before(p.expiry) {
+        return p.token, nil
+}
+```
+
+**A reCAPTCHA token is single-use.** It is verified once and every later call
+presenting it is rejected — with an empty frame and no error, which is why this
+survived so long and why it was mistaken for a scoring problem. The cache meant
+that in a long-lived process, the first generation succeeded and every one after
+it inside the window silently did nothing.
+
+The command line hid it completely: a CLI run is a fresh process, so it minted a
+new token every time and appeared fine. The server — the thing this was built
+for — did not. Two consecutive calls now return real media ids where they used to
+return `[null]`:
+
+```
+call 1: captcha_len 2361 -> 392023ba-5f57-4cf0-…
+call 2: captcha_len 2297 -> 64daa2f5-ecc4-49cd-…
+```
+
+#### Verified server-side, no browser involved
+
+```
+recaptcha: provider flow.captcha failed: recaptcha: no extension attached
+recaptcha: token acquired via http (2340 chars)
+engine: saved acct-7f3d13f8-874.jpg (0.1 MB, image/jpeg)
+engine: generated 1 image(s) in 26.7s
+```
+
+and through the server, into a project created over the transport:
+
+| | Result |
+| --- | --- |
+| image | `acct-02dec3f7-b35.jpg`, `status: succeeded`, 25.7s |
+| video | `acct-dd4c92d5-9b5.mp4`, `status: **ready**`, 28.7s, 4 credits |
+
+#### What is still not explained
+
+The failures at 08:46–08:48 — a fresh CLI process, one call, so no cache involved
+— are **not** accounted for by this. Between those runs and the working ones the
+account, its cookies and its project all changed, and the old account's project
+listing had gone empty more than once, so a generation against a project that no
+longer existed would have produced exactly the same empty frame. That is the
+likeliest explanation and it is not proven; the honest statement is that the
+cache was a real bug, fixing it made the server-side path work, and the earlier
+standalone failures have a separate and untested cause.
+
+#### The user agent, kept
+
+`WithUserAgent` stays. A captcha-bearing call is checked against the client its
+token was minted for, so presenting the browser's own identity is right on
+principle even though it was not what unblocked anything. Same for the origin
+parameter, which is derived from `recaptchaOrigin` so the two cannot drift apart.
+
+#### What does not work, and why it is worth knowing
+
+The page mints through `POST https://www.google.com/recaptcha/enterprise/clr?k=<siteKey>`
+with a 1908-byte protobuf body — field 1 is the site key, field 2 is 1864 bytes of
+opaque state. Two mints produce **byte-identical** bodies, so replay looks
+obviously viable.
+
+It is not. The response is empty, **including for the page itself**. The token is
+assembled in JS by `enterprise.js` from that challenge plus client-side signals;
+no request returns it. There is no cookie to carry and no request to replay —
+but none of that matters, because the anchor/reload flow the provider already
+uses is sufficient.
+
+This matters because the failure is otherwise silent. Flow accepts the request,
+answers `200`, returns an empty frame and charges nothing. There is no error to
+catch and no status to check, so it reads exactly like a wrong model key or a
+wrong RPC id. The diagnostic now names the provider and the two causes that have
+actually produced it:
 
 ```
 engine: nothing submitted for abra_t2v_4s_360p — it costs 4 credits at 360p and the
 account has 31, which was checked and covers it; so the balance is not the cause.
-The reCAPTCHA token came from "http". A token minted without a browser scores lower
-and Flow answers an empty result rather than an error, which is the usual cause here
-— attach the extension so the page can mint one.
+The reCAPTCHA token came from "http". A token is single-use, so a reused or cached
+one produces exactly this — Flow verifies it once and answers an empty frame on
+every later call. Check next that the project exists on the account in use:
+generating into a project that is not there is accepted the same silent way. Only
+then suspect the model key and the RPC it went to.
 ```
-
-So `--captcha http` is a real option for images and for the read-only calls, and a
-trap for video. The HTTP provider is not fixable from here: it speaks the Enterprise
-anchor/reload protocol without a page, which yields a lower-scoring assessment, and
-raising that score means running a browser or a captcha-solving service. The browser
-dependency for video is genuine; the useful work is keeping it to *one* thing — a
-page that is already loaded — rather than chasing it away.
 
 ### Video
 
@@ -868,237 +982,46 @@ credits: 11  (18 → 11, so a 4s 720p video costs 7)
 elapsed: 41.6s
 ```
 
-### Upscaling — solved
+### Upscaling — removed
 
-The media viewer's download menu is what gave this away — it offers **270p
-(Animated GIF)**, **720p (Original size)** and **1080p (Upscaled)**. (Images also
-offer 4K; this account's video menu does not.) Clicking 1080p captures the RPC:
-**`p0UkFb`**.
+Image and video upscaling were removed. Both worked; the reason for removing them
+is worth one paragraph each, because the shape of the work is not obvious from the
+absence of the code.
 
-```
-[[[ [null, "<content-id>"], null, 2, null,
-     [null, "<media-id>", null, null, "<uuid>"],
-     null, 2, null × 24,
-     "<upsampler-model>" ]],
- [null, 22, null, null, null, "<project-id>", null, null, null, null,
-  ["<recaptcha-token>", 1]],
- ["<call-uuid>"]]
-```
+**`SPrCad` (image, 2K / 4K) ran inside the attached tab.** The Go transport was
+rejected with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` even with the payload, the URL, the
+query parameters and both ids matching a request captured from the app itself,
+byte for byte — including the media id in position 0, a source path naming only
+the project, a timestamped captcha pair, and `bl` and `f.sid` present. So it was a
+client-level check, not a malformed request, and nothing the client could vary got
+past it. The browser was genuinely required.
 
-Four details in that payload are load-bearing, and every one of them was wrong in
-the first attempt:
+**`p0UkFb` (video, 1080p / 4K) ran over the transport** and needed no browser.
 
-| | Correct | First attempt |
-|---|---|---|
-| request array length | **32** (model at index 31) | 35 (model at 34) |
-| `request[0][1]` | the source asset's **content id** | a fresh uuid |
-| `request[2]` | `2` | `1` |
-| third top-level element | **`["<call-uuid>"]`** | absent |
+The full elimination is in git history —
+`git log --all --oneline -- '*upscale*'` — and is worth reading before anyone
+tries to bring the transport path back.
 
-The failure mode is what made this hard: with the wrong shape the server returns
-`200`, a well-formed empty result, and renders nothing. There is no error to
-notice. The model keys are `veo_3_1_upsampler_1080p` and `veo_3_1_upsampler_4k`.
+**Two things survived the removal on purpose.** `httpx.WithProfile` and
+`httpx.WithProtocolRacing` are now called by nothing but their own tests, and they
+are kept: they are the only way to vary the TLS fingerprint and the protocol at
+runtime, and this project has hit that question twice already. A rejection that
+does not move when the fingerprint changes is not a fingerprint check, and without
+these there is no way to establish that. Everything else the upscale diagnosis
+needed — the per-request header order and QUIC toggles on the batchexecute client,
+the raw-body helper, the operation poller, the credential-stripping jar — went with
+the routes that used it.
 
-**The reply is a submission acknowledgement, not a result.** It carries no URL — it
-names the render it queued, `<content-id>_upsampled`. That id is then polled for in
-the project listing until it appears, and resolved to a URL like any other video.
-Reading that reply as "no output" is exactly what made this RPC look broken.
+**One thing that outlived the feature and still matters:** an asset and its
+upscales share one media id, so a media-id lookup returns whichever row comes
+first. `ResolveContentID` has to pick by type code — `CAE` for the original — and
+`MediaDetail` still depends on that. The listing parser and the URL regex were both
+broken in ways that only showed up through the upscale path, and both are still
+covered by tests in `internal/batchexecute`.
 
-Measured end to end with `ffprobe`:
-
-| | Width × Height |
-|---|---|
-| Original (720p) | 1280 × 720 |
-| `p0UkFb` 1080p | **1920 × 1080** |
-
-Unlike the image upscale, this one runs **over the Go transport** — no browser
-needed beyond the captcha broker.
-
-#### The project-listing parser was broken, and it hid the whole thing
-
-Worth recording because it caused a silent 7-minute timeout rather than an error.
-
-A listing row is:
-
-```
-[content-id, project-id, media-id, type-code, null, detail, ...]
-```
-
-The parser had two faults. It read the media id from `row[0]` (that is the
-*content* id) and the content id from `row[3][4]` (that is a string, `"CAE"` for an
-original or `"CAI"` for a derived asset). Worse, `findEntryList` *identified rows*
-by requiring `row[3]` to be an array — which no row is — so every listing parsed
-to **nothing at all**.
-
-The consequence was invisible: `waitForNewVideo` and `waitForUpscaledAsset` simply
-polled an empty list until their timeout, and the only symptom was a job that
-stayed `submitted`. Anything that resolves a media id to a URL was affected, since
-`ResolveVideoURL` reads the same listing.
-
-#### …and the URL regex could not match an upscaled asset
-
-Fixing the listing exposed a third fault. The signed-URL matcher captured the
-content id as exactly 36 hex-or-dash characters:
-
-```go
-`https://flow-content\.google/(image|video)/([0-9a-fA-F-]{36})\?[^"\\\s]*`
-```
-
-An upscaled asset's id is `451f2cef-…_upsampled` — 46 characters, with an
-underscore — so **no upscaled URL ever matched**, and `MediaDetail` kept reporting
-"still rendering". The fix allows the optional suffix:
-
-```go
-`https://flow-content\.google/(image|video)/([0-9a-fA-F-]{36}(?:_[a-z]+)?)\?[^"\\\s]*`
-```
-
-#### The last trap: an asset and its upscales share one media id
-
-With the URL resolving, the endpoint reported success and downloaded the **source**
-video — 1.9 MB at 720p. Both rows carry the same media id, so a media-id lookup
-returns whichever comes first, which is the original. The upscale has to be
-resolved by its own *content* id.
-
-That is three independent faults stacked on one feature, and none of them produced
-an error. The end-to-end result is now 1280×720 → **1920×1080** in about 8 seconds.
-
-### Image resolution — solved, and it is not a download-URL trick
-
-An image's download menu offers exactly three choices:
-
-```
-1K | Original size
-2K | Upscaled
-4K | Upscaled
-```
-
-The labels are literal. **1K is the size the asset already has** and needs no call
-at all; only the two "Upscaled" entries do anything.
-
-Clicking **2K** sends one RPC: **`SPrCad`**.
-
-```
-["<content-id>", <selector>, [null, 22, null, null, null, "<project-id>",
-                              null, null, null, null, ["<captcha>", 1]]]
-```
-
-**The response carries the image itself**, as base64 JPEG inside the frame — not a
-URL. That is the whole mechanism, and it explains two things that had looked
-contradictory: why no new project asset appears (nothing is re-created), and why
-the download is a `blob:` (the page decodes the base64 and saves it). There is no
-higher-resolution URL variant to request; the bytes arrive in the RPC response.
-
-Measured with `ffprobe`, on an image generated at 1376x768:
-
-| | Width x Height | Bytes |
-|---|---|---|
-| Original (the asset's own URL) | 1376 x 768 | 89,864 |
-| `SPrCad` selector `1` ("2K") | **2752 x 1536** | 315,871 |
-
-2752 = 1376 x 2 exactly.
-
-The selector is 1-based over the *upscaled* options, not an index over the menu:
-
-| Selector | Menu item | Result |
-|---|---|---|
-| `1` | 2K \| Upscaled | works — 2x the original |
-| `2` | 4K \| Upscaled | `PUBLIC_ERROR_MODEL_ACCESS_DENIED` — 4K is gated, this account has no entitlement |
-| `0` | never sent by the app | returns the same 2752x1536 image as `1` |
-
-Only 2K has been produced end to end. 4K is unverified beyond confirming it is
-refused for want of entitlement.
-
-`POST /v1/images/upscale` implements this. See below for why it runs in the page.
-
-#### Both upscales need the source's *content* id, and rows are not interchangeable
-
-A caller holds a media id — it is what a generation returns and what the editor
-URL carries — while `SPrCad` takes a **content id**. They are different values, so
-the upscale endpoints resolve the content id from the project listing when only a
-media id is given. (`as29s` takes the content id too — it was the *listing parser*
-that had the two swapped, not the RPC table. See "Which field is the content id
-depends on the listing shape" above.)
-
-That resolution has a trap. One media id can have **several rows**: the original
-and each derived asset share it. They are not interchangeable, and picking the
-wrong one fails silently:
-
-| Row for media `8e637e6c…` | Type code | `SPrCad` |
-|---|---|---|
-| `036d5a66-…` | `CAE` | works — returns the image |
-| `003fe030-…` | `CAI` | **no image data at all** |
-
-So the original is selected explicitly by its type code, `CAE`, rather than by
-taking the first row that matches. The meaning of the codes is inferred from
-behaviour, not documented: for the same media id, `SPrCad` answers the `CAE` row
-and returns nothing for the `CAI` one.
-
-### The image upscale runs in the browser, deliberately
-
-The Go transport **cannot** make this call. Sending the identical request from Go
-is rejected with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` while the same captcha token and
-payload succeed from the page. That was established by elimination — each of the
-following was varied in turn and made no difference:
-
-- the `bl` build label (absent, present, and the browser's own value)
-- the `f.sid` session id
-- the `at` anti-CSRF token, including the page's own `SNlM0e`
-- the `source-path` shape
-- the header set, including a byte-for-byte replica of **every** header the
-  browser sends (`accept-encoding`, `priority`, `sec-ch-ua-*`, `x-browser-*`,
-  `x-client-data`), and separately with `Authorization` removed
-- the cookie jar (the same jar the browser produced)
-- HTTP/2 and HTTP/3
-
-The captcha token is not the problem: a token minted by this engine's own provider
-was replayed from the page and returned the image.
-
-The **TLS fingerprint** was the obvious next suspect and it is **not** the cause
-either — six profiles including a Firefox one, HTTP/3, and the browser's exact
-header order all produce the identical rejection. The full table is under "What is
-not done yet" below. Tellingly, the generation RPC over the same Go transport
-*does* succeed, so `SPrCad` applies a stricter client check than generation does.
-
-So the request is made by the page, which is already required for the captcha
-broker. This is a real constraint, not a shortcut: **image upscaling needs the
-browser attached.** The Go-side implementation is kept in
-`internal/batchexecute/client.go` (`UpscaleImage`) and is correct as far as the
-protocol goes, but it will be rejected until the transport can match the browser's
-fingerprint.
 
 ### What is not done yet
 
-- **4K, on both kinds of asset.** The code path is wired (`Resolution4K`,
-  `UpscaleModel4K`) but cannot be exercised on this account: an image 4K upscale is
-  refused with `PUBLIC_ERROR_MODEL_ACCESS_DENIED`, and the video download menu does
-  not offer 4K at all. 4K is gated on a higher plan, so this is entitlement rather
-  than a missing RPC.
-- **The image upscale needs the browser attached.** `SPrCad` is rejected over the
-  Go transport while the identical call succeeds from the page. This is the only
-  place the Go transport is not sufficient, and it is a property of the RPC, not a
-  gap in the implementation: `p0UkFb` over the same transport works.
-
-  The obvious theory — that the transport's fingerprint is simply too old — was
-  tested and does **not** hold. Do not spend time advancing the TLS profile:
-
-  | Varied | Result |
-  |---|---|
-  | TLS profile: `chrome_152`, `chrome_144`, `chrome_133`, `chrome_120` | `UNUSUAL_ACTIVITY` |
-  | TLS profile: `firefox_135`, `firefox_120` — a *completely different* fingerprint | `UNUSUAL_ACTIVITY`, identical |
-  | HTTP/3 via `WithProtocolRacing` (the library's own h3, not Go's stdlib) | `UNUSUAL_ACTIVITY` |
-  | The browser's **exact** header order, plus its complete header set | `UNUSUAL_ACTIVITY` |
-
-  A rejection that does not move when the fingerprint changes by that much is not a
-  fingerprint check. Note also that `tls-client` ships no Chrome 153 profile —
-  `chrome_152` is its newest — but adjacent Chrome releases have effectively
-  identical ClientHellos, so there would be nothing to gain even if it did.
-
-  What remains is something in the transport this code does not control: the
-  frame-level details of a real Chrome connection, or a check that ties the
-  captcha assessment to the connection that minted it — which a different process
-  cannot satisfy by construction. `httpx.WithProfile` and
-  `httpx.WithProtocolRacing` are kept because they are how this was established,
-  and they are useful for any future fingerprint question.
 - **Aspect ratio and resolution.** The app's composer exposes them (16:9 / 9:16,
   360p / 720p, and an Image/Video and Frames/Ingredients toggle), so the UI
   mapping is known — the payload positions are not. Until they are, the endpoints
@@ -1200,7 +1123,7 @@ abra_i2v_*                              image to video, first frame only ← use
 omni_flash_i2v_8s_first_last_360p       image to video, first + last     ← used
 abra_r2v_*                              reference images
 abra_edit / abra_edit_360p              video edit
-veo_3_1_upsampler_1080p / _4k           upscalers                       ← used
+                                        (no upsampler keys — upscaling removed)
 ```
 
 **The engine selects from `abra_*` and `omni_flash_*` only.** The catalog also holds
@@ -1211,7 +1134,7 @@ and, for some, an aspect pair via a `_portrait` suffix. None of those are wired 
 and naming one outright is not a supported path. The only `veo_*` keys in use are
 the two upsamplers, which are a second pass rather than a generation model.
 
-**Resolution is the `_360p` suffix**, which is why the upscalers are separate keys
+**Resolution is the `_360p` suffix**, which is why the model keys carry it
 rather than a parameter.
 
 #### Aspect is decided by the model family; `_360p` is only resolution
@@ -1332,7 +1255,6 @@ image-to-video. Everything else is the `abra` family.
 | Image to video, first + last | **`omni_flash_i2v_*_first_last*`** | — |
 | Reference images | — | `abra_r2v_*` |
 | Video edit | — | `abra_edit` |
-| Upscaler | `omni_upsampler_360p` | — |
 
 **Nothing in this implementation uses a `veo` model.** Text-to-video is
 `abra_t2v_*` and image-to-video is `abra_i2v_*` / `omni_flash_i2v_*_first_last_*`.
@@ -1408,7 +1330,7 @@ checkout:
 | Video input (edit) | `videoInput.mediaId` + `startFrameIndex`/`endFrameIndex` | `abra_edit` |
 | Video model keys | `videoModelKey` | `abra_t2v_{4,6,8,10}s`, `abra_edit` |
 | Image models | — | `NARWHAL`, `HARBOR_SEAL`, `GEM_PIX_2` |
-| Cost | — | 4s=7, 6s=10, 8s=12, 10s=15 credits; 1080p upscale free, 4K=50 |
+| Cost | — | 4s=7, 6s=10, 8s=12, 10s=15 credits |
 
 That reference gives the **semantics** of every missing feature. It does not give the
 batchexecute wire format, which is positional and still needs a capture.
@@ -1480,8 +1402,8 @@ regression test where the fix is behavioural.
 
 ### What the browser is still needed for
 
-Cookies, a signed-in Flow editor tab for the reCAPTCHA broker, and the one
-in-page call `SPrCad` needs. Generation itself never travels through it. See
+Cookies. That is the whole list: the captcha is minted over the transport, projects
+are listed and created over it, and generation never travels through the page. See
 `docs/WHAT-WE-NEED-FROM-THE-BROWSER.md`.
 
 ## Layout
@@ -1499,7 +1421,7 @@ flow-go/
 │   ├── engine/                 orchestration
 │   ├── flowapi/                legacy aisandbox REST client
 │   ├── httpx/                  Chrome-impersonating transport
-│   ├── pool/                   worker pool (images, uploads, upscales)
+│   ├── pool/                   worker pool (images, uploads)
 │   ├── recaptcha/              reCAPTCHA Enterprise strategies
 │   ├── server/                 HTTP API
 │   └── store/                  SQLite persistence

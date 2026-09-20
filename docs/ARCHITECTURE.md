@@ -29,7 +29,7 @@ This port inverts that. The browser supplies cookies; Go derives everything else
                     ├──────────────────────────────────────┤
                     │  Flow Go Bridge                      │  narrow: Flow only,
                     │  · the same, minus cdp.evaluate      │  no debugger
-                    │  · flow.at / flow.captcha / flow.upscale
+                    │  · flow.at / flow.captcha
                     └───────────────┬──────────────────────┘
                                     │ WebSocket, extension dials out
                                     │ both extensions hardcode ws://127.0.0.1:9222,
@@ -43,7 +43,7 @@ This port inverts that. The browser supplies cookies; Go derives everything else
                                     ▼
    internal/auth       ── Labs session endpoint → access token, cached by jar hash
    internal/httpx      ── Chrome-impersonating transport (uTLS + HTTP/3 → HTTP/2)
-   internal/recaptcha  ── flow.captcha → broker → http → empty
+   internal/recaptcha  ── http → empty (flow.captcha and the broker are opt-in)
    internal/batchexecute ── the RPC transport the app actually uses
    internal/flowapi    ── legacy aisandbox REST, error classification, retry
    internal/pool       ── account routing, failover, circuit breaking
@@ -109,9 +109,8 @@ indistinguishable from a render that has not finished:
 | RPC | Takes |
 | --- | --- |
 | `as29s` (media detail) | the **content id** |
-| `SPrCad` (image upscale), `nprQif` / `eb1hJf` conditioning | the **content id** |
+| `nprQif` / `eb1hJf` conditioning | the **content id** |
 | `/project/<id>/edit/<X>` | the media id |
-| `p0UkFb` (video upscale) | **both** |
 
 **Which field holds the content id depends on the listing shape**, and this is
 where it went wrong:
@@ -213,7 +212,7 @@ pool's `Worker` carries a `flowapi.Client`, which the batchexecute path has no u
 for. Account selection for video is done by `switchToAffordableAccount` in the
 engine instead. That is a deliberate choice and it does leave two selection
 mechanisms in the tree; the honest summary is that the pool routes images and
-upscales, and the engine routes video.
+uploads, and the engine routes video.
 
 Two consequences worth knowing:
 
@@ -261,7 +260,7 @@ with a regression test where the fix is behavioural.
 | 2 | The stale key cache was never cleared, so `/health` advertised a usable credential the extension did not have | Token cache is keyed on the cookie jar hash and invalidated on any auth failure | `TestSessionJarSwapInvalidates` |
 | 3 | `has_flow_key()` reported a server-side cache, not the actual state | `bridge.Status().HasCredentials` is derived from the live cookie jar | `TestHasAuthCookies` |
 | 4 | `tests/test_worker_pool.py` had no isolation and wrote fixtures into the production database | Tests open a private temporary database; `Open` requires an explicit path | `TestStoresAreIsolated` |
-| 5 | The worker pool was dead code — `register_worker` / `acquire_worker` / `execute_with_failover` had no production callers | The pool is wired for images, uploads and upscales. The video path does not use it (see Worker pool above), which is a deliberate exception rather than an oversight | `TestExecuteFailover`, `TestFreeTierIsSpentFirst` |
+| 5 | The worker pool was dead code — `register_worker` / `acquire_worker` / `execute_with_failover` had no production callers | The pool is wired for images and uploads. The video path does not use it (see Worker pool above), which is a deliberate exception rather than an oversight | `TestExecuteFailover`, `TestFreeTierIsSpentFirst` |
 | 6 | `/stats` reported 1600 credits of test fixtures as live analytics | Statistics aggregate real rows only; credits are `NULL` until observed | `TestEmptyDatabaseReportsZeros`, `TestCreditsAreNotInvented` |
 | 7 | `direct_client.py` was never wired in, so the "reduced browser dependency" claim was false | The browser is out of the generation path entirely | verified live: token minted without a browser |
 | 8 | The nested listing's id pair was parsed backwards, so `as29s` was handed the wrong uuid. A wrong uuid is answered with a `null` payload and no error, so every finished render looked like one that never finished | `ParseProjectAssets` maps the nested shape as `row[0]` = media id, `detail[4]` = content id; `ResolveVideoURL` passes the content id | `TestParseProjectAssetsReadsTheNestedListingShape`; verified live: a render that had "never resolved" downloaded immediately |
@@ -325,11 +324,7 @@ bearer token, and so never touches that exchange.
 
 What is still open, in order of effort:
 
-1. **`SPrCad` (image upscale) cannot run over the Go transport.** It is rejected
-   `PUBLIC_ERROR_UNUSUAL_ACTIVITY` regardless of TLS profile, so it runs in the
-   page. This is a genuine, unexplained difference and the only operation that
-   still needs the browser for more than credentials.
-2. **`row.SKU` is authuser-blind, and there is no source that is not.** It is read
+1. **`row.SKU` is authuser-blind, and there is no source that is not.** It is read
    from the same session endpoint that made every account's email look alike, so
    every row carries the default account's tier. Unlike the email this was not
    fixable by switching source — both alternatives were checked and neither works:

@@ -71,7 +71,7 @@ func usage() string {
 	return `flow-go — Google Flow generation engine
 
 The browser supplies cookies and base information. Everything else — access
-tokens, project resolution, generation, polling, upscaling, downloads, storage —
+tokens, project resolution, generation, polling, downloads, storage —
 happens here, in Go. No generation request travels through a browser.
 
 USAGE
@@ -130,11 +130,15 @@ type commonFlags struct {
 	captcha   string
 	db        string
 	email     string
-	// at and fsid are the page tokens taken from a running server's session, and
-	// are not flags: they are short-lived page state, not something a caller
-	// should be typing.
+	// at, fsid and fingerprint are the browser-derived values taken from a
+	// running server's session, and are not flags: they are short-lived client
+	// state, not something a caller should be typing.
 	at   string
 	fsid string
+	// fingerprint is the browser identity the session was established under. It
+	// matters for any call that carries a reCAPTCHA token, because the token is
+	// checked against the client it was minted for.
+	fingerprint *flowapi.BrowserFingerprint
 }
 
 func (c *commonFlags) bind(fs *flag.FlagSet) {
@@ -153,6 +157,7 @@ func (c *commonFlags) build() (*app.App, error) {
 		DBPath:      c.db,
 		AtToken:     c.at,
 		Fsid:        c.fsid,
+		Fingerprint: c.fingerprint,
 	})
 }
 
@@ -168,14 +173,23 @@ func (c *commonFlags) build() (*app.App, error) {
 // Best-effort by design. A CLI with no server running is a supported case, and it
 // falls back to the persisted copy; the only cost of not asking is the staleness
 // that was already there.
-func adoptRunningSession(ctx context.Context) (projectID, at, fsid string, ok bool) {
+// runningSession is what a server with the browser can hand to a process without
+// one. Every field is something the browser supplied and cannot be derived.
+type runningSession struct {
+	ProjectID   string
+	At          string
+	Fsid        string
+	Fingerprint *flowapi.BrowserFingerprint
+}
+
+func adoptRunningSession(ctx context.Context) (runningSession, bool) {
 	raw, err := os.ReadFile(filepath.Join(config.DataDir(), "bridge-token"))
 	if err != nil {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 	token := strings.TrimSpace(string(raw))
 	if token == "" {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -184,52 +198,68 @@ func adoptRunningSession(ctx context.Context) (projectID, at, fsid string, ok bo
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/session", config.HTTPPort)
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 	req.Header.Set("X-Bridge-Token", token)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 
 	var snapshot struct {
-		Cookies   []cookiejar.Cookie `json:"cookies"`
-		At        string             `json:"at"`
-		Fsid      string             `json:"fsid"`
-		ProjectID string             `json:"project_id"`
+		Cookies     []cookiejar.Cookie          `json:"cookies"`
+		At          string                      `json:"at"`
+		Fsid        string                      `json:"fsid"`
+		ProjectID   string                      `json:"project_id"`
+		Fingerprint *flowapi.BrowserFingerprint `json:"fingerprint"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil || len(snapshot.Cookies) == 0 {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 
 	// Persist where the engine looks for it, so the bootstrap below picks it up
 	// without needing a new path through the engine.
 	jar := cookiejar.FromCookies(snapshot.Cookies, "server session")
 	if err := jar.Save(filepath.Join(config.DataDir(), "cookies.json")); err != nil {
-		return "", "", "", false
+		return runningSession{}, false
 	}
 
-	fmt.Printf("  session          taken from the running server (%d cookies)\n", jar.Count())
-	return snapshot.ProjectID, snapshot.At, snapshot.Fsid, true
+	// Say whether the fingerprint came across, because its absence is invisible
+	// later: the run still mints a token, still submits, and gets an empty result
+	// back with no error to explain it.
+	fingerprint := "none"
+	if snapshot.Fingerprint != nil && snapshot.Fingerprint.UserAgent != "" {
+		fingerprint = "adopted"
+	}
+	fmt.Printf("  session          taken from the running server (%d cookies, fingerprint %s)\n",
+		jar.Count(), fingerprint)
+
+	return runningSession{
+		ProjectID:   snapshot.ProjectID,
+		At:          snapshot.At,
+		Fsid:        snapshot.Fsid,
+		Fingerprint: snapshot.Fingerprint,
+	}, true
 }
 
 // adoptSessionFor fills in what a running server can supply, leaving anything the
 // caller set explicitly alone. Returns whether a session was adopted, so the caller
 // knows whether it still needs to look for a browser itself.
 func adoptSessionFor(ctx context.Context, common *commonFlags) bool {
-	projectID, at, fsid, ok := adoptRunningSession(ctx)
+	session, ok := adoptRunningSession(ctx)
 	if !ok {
 		return false
 	}
 	if strings.TrimSpace(common.projectID) == "" {
-		common.projectID = projectID
+		common.projectID = session.ProjectID
 	}
-	common.at, common.fsid = at, fsid
+	common.at, common.fsid = session.At, session.Fsid
+	common.fingerprint = session.Fingerprint
 	return true
 }
 

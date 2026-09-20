@@ -2,7 +2,6 @@ package recaptcha
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +69,7 @@ func TestNewBrokerKeepsTheResolver(t *testing.T) {
 // nil one, in every mode.
 func TestBuildFallsBackWithoutABroker(t *testing.T) {
 	for _, mode := range []string{"", "auto", "broker", "http"} {
-		p := Build(mode, nil, nil, nil, nil)
+		p := Build(mode, nil, nil, nil, nil, "")
 		if p == nil {
 			t.Errorf("mode %q: Build returned nil", mode)
 			continue
@@ -81,60 +80,81 @@ func TestBuildFallsBackWithoutABroker(t *testing.T) {
 	}
 }
 
-// TestBuildNamesTheBrokerWhenPresent is the other half: with a client the chain
-// must actually include the broker, so the high-score path is not silently
-// dropped by the signature change.
-func TestBuildNamesTheBrokerWhenPresent(t *testing.T) {
-	p := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil)
-	if p == nil {
-		t.Fatal("Build returned nil")
-	}
-	if name := p.Name(); !strings.Contains(name, "broker") {
-		t.Errorf("the auto chain should include the broker, got %q", name)
+// TestAutoChainIsServerSideOnly pins the default to the transport.
+//
+// The chain used to lead with `flow.captcha` and the broker, which meant every
+// generation needed an extension attached and a tab sitting on a Flow project.
+// The transport turns out to be sufficient — the defect was that it reused a
+// single-use token — so the default asks the browser for nothing.
+//
+// This is the assertion that would have caught the regression the other way
+// round: a provider creeping back into the default chain is exactly what makes
+// the browser load-bearing again, and it would do so silently.
+func TestAutoChainIsServerSideOnly(t *testing.T) {
+	for _, mode := range []string{"auto", "", "http"} {
+		built := Build(mode, nil, cdp.New(nil),
+			func() string { return "https://example.test/project/x" },
+			func() *cdp.Client { return cdp.New(nil) }, "")
+
+		chain, ok := built.(*Chain)
+		if !ok {
+			t.Fatalf("mode %q: expected a chain, got %T", mode, built)
+		}
+		for _, provider := range chain.providers {
+			switch provider.Name() {
+			case "flow.captcha", "broker":
+				t.Errorf("mode %q: %q is in the default chain; the browser is not "+
+					"supposed to be asked for a token unless the caller opts in",
+					mode, provider.Name())
+			}
+		}
+		if name := chain.providers[0].Name(); name != "http" {
+			t.Errorf("mode %q: first provider is %q, want http", mode, name)
+		}
 	}
 }
 
-// TestAutoChainPrefersTheFlowOperation pins the order of the automatic chain.
-//
-// The broker reaches the page with `cdp.evaluate`, which is exactly the surface a
-// Flow extension does not expose — it offers named operations instead. So with a
-// Flow bridge attached the broker cannot mint at all, and the extension's own
-// captcha operation has to come first. It was implemented, advertised, and called
-// by nothing until this.
-//
-// The broker stays in the chain regardless: a generic bridge has no `flow.captcha`,
-// and that case still needs it.
-func TestAutoChainPrefersTheFlowOperation(t *testing.T) {
-	resolver := func() *cdp.Client { return nil }
-	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, resolver)
+// TestBrokerModeOptsIntoThePage is the other half: the page path has to remain
+// reachable, and in the order that works — the broker cannot mint through a Flow
+// bridge, which offers named operations rather than `cdp.evaluate`, so the
+// extension's own operation has to come first.
+func TestBrokerModeOptsIntoThePage(t *testing.T) {
+	resolver := func() *cdp.Client { return cdp.New(nil) }
+	built := Build("broker", nil, cdp.New(nil),
+		func() string { return "https://example.test/project/x" }, resolver, "")
 
 	chain, ok := built.(*Chain)
 	if !ok {
-		t.Fatalf("auto should build a chain, got %T", built)
+		t.Fatalf("broker mode should build a chain, got %T", built)
 	}
 	if len(chain.providers) == 0 {
 		t.Fatal("the chain is empty")
 	}
 	if name := chain.providers[0].Name(); name != "flow.captcha" {
-		t.Errorf("first provider is %q, want flow.captcha — the broker cannot mint through a "+
-			"Flow bridge, so the extension's own operation has to be tried first", name)
+		t.Errorf("first provider is %q, want flow.captcha", name)
 	}
 
-	var sawBroker bool
+	var sawBroker, sawHTTP bool
 	for _, provider := range chain.providers {
-		if provider.Name() == "broker" {
+		switch provider.Name() {
+		case "broker":
 			sawBroker = true
+		case "http":
+			sawHTTP = true
 		}
 	}
 	if !sawBroker {
-		t.Error("the broker must stay in the chain for the case where a generic bridge is attached")
+		t.Error("the broker must be in the broker chain: a generic bridge has no flow.captcha")
+	}
+	if !sawHTTP {
+		t.Error("the transport must stay behind the page providers as a fallback")
 	}
 }
 
 // TestAutoChainOmitsTheFlowProviderWithoutAResolver keeps the old behaviour
 // reachable: a caller that cannot resolve a client gets the chain it had before.
 func TestAutoChainOmitsTheFlowProviderWithoutAResolver(t *testing.T) {
-	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil)
+	built := Build("auto", nil, cdp.New(nil), func() string { return "https://example.test/project/x" }, nil, "")
 
 	chain, ok := built.(*Chain)
 	if !ok {

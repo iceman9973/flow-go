@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 // SessionTokenCookie is the long-lived Labs session cookie. Exchanging it at the

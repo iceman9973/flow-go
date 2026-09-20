@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kodelyx/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
 )
 
 /* ------------------------------------------------------------------ *

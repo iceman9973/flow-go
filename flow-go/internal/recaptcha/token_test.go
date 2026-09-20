@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 // testClient is the transport the provider needs; a nil one panics.

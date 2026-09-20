@@ -9,7 +9,7 @@ package main
 import (
 	"os"
 
-	"github.com/kodelyx/flow-go/internal/cli"
+	"github.com/kodelyx/flow-go/flow-go/internal/cli"
 )
 
 func main() {

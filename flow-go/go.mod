@@ -1,4 +1,4 @@
-module github.com/kodelyx/flow-go
+module github.com/kodelyx/flow-go/flow-go
 
 go 1.26.4
 

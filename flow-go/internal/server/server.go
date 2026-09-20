@@ -22,10 +22,10 @@ import (
 	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
 	"github.com/kodelyx/Browser-cdp/cdp-control/cdp"
 	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
-	"github.com/kodelyx/flow-go/internal/batchexecute"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/engine"
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/engine"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 // RegisterRoutes wires every HTTP route onto the app.

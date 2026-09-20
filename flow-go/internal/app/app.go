@@ -11,11 +11,11 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/engine"
-	"github.com/kodelyx/flow-go/internal/flowapi"
-	"github.com/kodelyx/flow-go/internal/server"
-	"github.com/kodelyx/flow-go/internal/store"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/engine"
+	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/server"
+	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
 
 // DefaultTargets is what the bridge is allowed to attach to, and the first entry

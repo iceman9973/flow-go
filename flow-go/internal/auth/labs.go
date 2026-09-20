@@ -32,8 +32,8 @@ import (
 	"time"
 
 	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 // Session is a minted Labs session.

@@ -28,14 +28,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
 	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
-	"github.com/kodelyx/flow-go/internal/auth"
-	"github.com/kodelyx/flow-go/internal/batchexecute"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/flowapi"
-	"github.com/kodelyx/flow-go/internal/httpx"
-	"github.com/kodelyx/flow-go/internal/pool"
-	"github.com/kodelyx/flow-go/internal/recaptcha"
-	"github.com/kodelyx/flow-go/internal/store"
+	"github.com/kodelyx/flow-go/flow-go/internal/auth"
+	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/pool"
+	"github.com/kodelyx/flow-go/flow-go/internal/recaptcha"
+	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
 
 // Options configures the engine.

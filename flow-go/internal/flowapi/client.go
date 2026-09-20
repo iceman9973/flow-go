@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kodelyx/flow-go/internal/auth"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/httpx"
-	"github.com/kodelyx/flow-go/internal/recaptcha"
+	"github.com/kodelyx/flow-go/flow-go/internal/auth"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/recaptcha"
 )
 
 // BrowserFingerprint is the request identity to present upstream.

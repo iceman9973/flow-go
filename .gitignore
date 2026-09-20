@@ -1,5 +1,6 @@
-# Build artifacts
-/flow-go
+# Build artifacts. The binary is named after the module, so it sits beside the
+# module rather than at the repository root.
+/flow-go/flow-go
 /dist/
 *.exe
 *.test
@@ -7,10 +8,11 @@
 # macOS metadata
 .DS_Store
 
-# Runtime state — never commit these
-/data/
-/output/
-/cookies/
+# Runtime state — never commit these. They sit beside the module because the
+# paths are resolved against the working directory the binary runs from.
+/flow-go/data/
+/flow-go/output/
+/flow-go/cookies/
 .env
 config.env
 

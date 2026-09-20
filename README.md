@@ -36,11 +36,12 @@ tokens and a reCAPTCHA token — and does the rest in Go.
 ## Quick start
 
 ```bash
-# 1. Build
+# 1. Build — the module lives in flow-go/, not at the repository root
+cd flow-go
 go build -o flow-go .
 
-# 2. Load extension/ as an unpacked extension
-#    chrome://extensions -> Developer mode -> Load unpacked -> select extension/
+# 2. Load the extension
+#    chrome://extensions -> Developer mode -> Load unpacked -> select ../extension/
 #    (Optionally also load the generic extension — clone github.com/kodelyx/Browser-cdp
 #     and load its extension/ directory; see "The two extensions".)
 
@@ -1412,25 +1413,32 @@ are listed and created over it, and generation never travels through the page. S
 ## Layout
 
 ```
-flow-go/
-├── main.go                     entry point
-├── extension/                  the narrow Flow bridge (this repo's extension)
-├── internal/
-│   ├── app/                    assembly and lifecycle
-│   ├── auth/                   Labs session → access token
-│   ├── batchexecute/           the RPC transport the app actually uses
-│   ├── cli/                    command line
-│   ├── config/                 endpoints, models, credits, ports
-│   ├── engine/                 orchestration
-│   ├── flowapi/                legacy aisandbox REST client
-│   ├── httpx/                  Chrome-impersonating transport
-│   ├── pool/                   worker pool (images, uploads)
-│   ├── recaptcha/              reCAPTCHA Enterprise strategies
-│   ├── server/                 HTTP API
-│   └── store/                  SQLite persistence
-├── docs/ARCHITECTURE.md
-└── .env.example
+flow-go/                        the repository
+├── README.md
+├── extension/                  the narrow Flow bridge — load this in Chrome
+└── flow-go/                    the module
+    ├── main.go                 entry point
+    ├── internal/
+    │   ├── app/                assembly and lifecycle
+    │   ├── auth/               Labs session → access token
+    │   ├── batchexecute/       the RPC transport the app actually uses
+    │   ├── cli/                command line
+    │   ├── config/             endpoints, models, credits, ports
+    │   ├── engine/             orchestration
+    │   ├── flowapi/            legacy aisandbox REST client
+    │   ├── httpx/              Chrome-impersonating transport
+    │   ├── pool/               worker pool (images, uploads)
+    │   ├── recaptcha/          reCAPTCHA Enterprise strategies
+    │   ├── server/             HTTP API
+    │   └── store/              SQLite persistence
+    ├── docs/                   the design notes
+    └── .env.example
 ```
+
+The two folders are the two halves of the project: the module that talks to Flow,
+and the extension that talks to the browser. `data/`, `output/` and `cookies/` are
+created inside `flow-go/` at run time, beside the binary, because those paths are
+resolved against the working directory — they are gitignored and never committed.
 
 Not in this module: `cdp-control/{bridge,cdp,cookiejar}` and the generic
 `Browser-cdp/extension/`. Both belong to the separate

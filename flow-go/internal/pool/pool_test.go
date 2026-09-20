@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kodelyx/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 )
 
 // newTestWorker builds a worker with no client. The pool never dereferences

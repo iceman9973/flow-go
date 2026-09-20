@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kodelyx/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 )
 
 // State is a worker's availability.

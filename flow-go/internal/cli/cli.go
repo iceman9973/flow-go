@@ -15,13 +15,13 @@ import (
 	"time"
 
 	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
-	"github.com/kodelyx/flow-go/internal/app"
-	"github.com/kodelyx/flow-go/internal/auth"
-	"github.com/kodelyx/flow-go/internal/batchexecute"
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/engine"
-	"github.com/kodelyx/flow-go/internal/flowapi"
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/app"
+	"github.com/kodelyx/flow-go/flow-go/internal/auth"
+	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/engine"
+	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 // Version is the build version.

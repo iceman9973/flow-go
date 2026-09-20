@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/kodelyx/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 )
 
 // TestThrottleParksOnTheFirstFailure pins the rule that separates a throttle from

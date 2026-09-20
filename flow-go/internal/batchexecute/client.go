@@ -36,7 +36,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 // EndpointPath is the Flow app's batchexecute path.

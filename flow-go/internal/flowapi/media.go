@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kodelyx/flow-go/internal/config"
-	"github.com/kodelyx/flow-go/internal/httpx"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 /* ------------------------------------------------------------------ *

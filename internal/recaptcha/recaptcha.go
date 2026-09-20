@@ -33,7 +33,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/kodelyx/cdp-control/cdp"
@@ -137,11 +136,6 @@ type HTTPProvider struct {
 	siteKey   string
 	origin    string
 	userAgent string
-	cacheTTL  time.Duration
-
-	mu     sync.Mutex
-	token  string
-	expiry time.Time
 }
 
 // NewHTTP builds an HTTP provider.
@@ -163,10 +157,6 @@ func NewHTTP(hc *httpx.Client, siteKey, origin string) *HTTPProvider {
 		// real client — which a process with a browser, or one that took a
 		// fingerprint from a process that had one, always does.
 		userAgent: recaptchaUA,
-		// Enterprise tokens are short-lived; two minutes is comfortably inside
-		// their validity window and still removes the per-call round trip when a
-		// batch is submitted.
-		cacheTTL: 2 * time.Minute,
 	}
 }
 
@@ -187,26 +177,21 @@ func (p *HTTPProvider) WithUserAgent(userAgent string) *HTTPProvider {
 	return p
 }
 
-// Token returns a token, using a short-lived cache.
+// Token returns a fresh token.
+//
+// It used to cache one for two minutes, on the reasoning that Enterprise tokens
+// are short-lived and a batch should not pay for a round trip per item. That
+// reasoning is wrong in the way that matters: **a reCAPTCHA token is
+// single-use**. It is verified once, and any later call that presents the same
+// one is rejected — silently, with an empty frame rather than an error, which is
+// why this survived so long.
+//
+// The cache made every generation after the first inside a two-minute window
+// fail. It was only ever survivable because a CLI run is a fresh process, so the
+// command line accidentally minted a new token every time; a server, which is
+// where this was meant to be used, did not.
 func (p *HTTPProvider) Token(ctx context.Context, action string) (string, error) {
-	p.mu.Lock()
-	if p.token != "" && time.Now().Before(p.expiry) {
-		tok := p.token
-		p.mu.Unlock()
-		return tok, nil
-	}
-	p.mu.Unlock()
-
-	tok, err := p.fetch(ctx, action)
-	if err != nil {
-		return "", err
-	}
-
-	p.mu.Lock()
-	p.token = tok
-	p.expiry = time.Now().Add(p.cacheTTL)
-	p.mu.Unlock()
-	return tok, nil
+	return p.fetch(ctx, action)
 }
 
 func (p *HTTPProvider) fetch(ctx context.Context, action string) (string, error) {

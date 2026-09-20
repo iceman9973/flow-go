@@ -624,22 +624,21 @@ What used to need a loaded page, and what still does:
 
 | What | State |
 | --- | --- |
+| reCAPTCHA token | **avoidable** — the HTTP provider works server-side, once it stops reusing a single-use token |
 | Project id | **avoidable** — listed and created over the transport |
-| `at` and `f.sid` | avoidable in principle; now persisted so a browserless run can present them |
+| `at` and `f.sid` | avoidable — persisted, and the client primes for `at` without them |
 | Current cookies | not avoidable, but a snapshot or the cache carries them across processes |
-| Browser identity | not avoidable, but now persisted (`data/fingerprint.json`) |
-| **reCAPTCHA token** | **not avoidable in practice** — the HTTP provider is intermittent and the page token is the dependable one. See below |
+| Browser identity | not avoidable, but persisted (`data/fingerprint.json`) |
 | **Image upscale (`SPrCad`)** | **not avoidable** — the one call that has to be made by the page |
 
-So the browserless surface is narrower than it looked for a few hours: a run with
-no browser can create a project, list projects, read credits, upload, poll and
-resolve — and its generation will work when the HTTP provider's assessment happens
-to be accepted, which is not something to rely on. The honest summary is that
-**generation still wants the browser**, for the token rather than for the payload.
+So a run with no browser can create a project, list projects, read credits, upload,
+generate an image, generate a video, poll it, resolve it and download it. Verified:
+`acct-dd4c92d5-9b5.mp4`, `status: "ready"`, with `flow.captcha failed: no extension
+attached` in the log — the browser was not consulted.
 
 The one call that can *never* be made without a page is image upscaling, documented
-under "The image upscale runs in the browser, deliberately" — it is a stricter
-check on that RPC rather than a missing credential, and it is not the fingerprint.
+under "The image upscale runs in the browser, deliberately" — it is a stricter check
+on that RPC rather than a missing credential, and it is not the fingerprint.
 
 Note that `ensureProjectTab` still runs before every generation and navigates a
 tab when a bridge is attached. It is now belt-and-braces rather than a
@@ -788,56 +787,83 @@ file:    output/acct-460ddc37-2e6.jpg   89864 bytes   1376x768 JPEG
 
 No API key. No bearer token. No `aisandbox-pa.googleapis.com`.
 
-### The reCAPTCHA token is still a browser dependency in practice
+### The reCAPTCHA token: server-side works, and a cache made it look broken
 
-> **Correction.** An earlier revision of this section claimed the HTTP provider
-> was fixed by presenting the browser's own user agent, on the strength of two
-> successes. That did not reproduce. See "What actually happened" below. The
-> conclusion is the opposite of what was written: **the page token is the only
-> dependable one, and the browser is still required for generation.**
+> **Correction, twice over.** An earlier revision claimed the user agent was the
+> fix; that did not reproduce and was retracted. The retraction then claimed the
+> HTTP provider was inherently intermittent and the page token was the only
+> dependable one. **That was also wrong.** The real cause was a token cache in
+> `HTTPProvider`, and with it removed the server-side path works — image, video,
+> and a run with no browser attached at all.
 
-The token can be minted two ways:
+The token can be minted two ways, and both work:
 
-| Provider | Needs a browser |
+| Provider | Needs a browser | State |
+| --- | --- | --- |
+| `flow.captcha` (page) | yes | works |
+| `http` (anchor/reload protocol) | no | **works** — and is the one that matters for a headless setup |
+
+#### What was actually wrong
+
+`HTTPProvider` cached its token for two minutes:
+
+```go
+if p.token != "" && time.Now().Before(p.expiry) {
+        return p.token, nil
+}
+```
+
+**A reCAPTCHA token is single-use.** It is verified once and every later call
+presenting it is rejected — with an empty frame and no error, which is why this
+survived so long and why it was mistaken for a scoring problem. The cache meant
+that in a long-lived process, the first generation succeeded and every one after
+it inside the window silently did nothing.
+
+The command line hid it completely: a CLI run is a fresh process, so it minted a
+new token every time and appeared fine. The server — the thing this was built
+for — did not. Two consecutive calls now return real media ids where they used to
+return `[null]`:
+
+```
+call 1: captcha_len 2361 -> 392023ba-5f57-4cf0-…
+call 2: captcha_len 2297 -> 64daa2f5-ecc4-49cd-…
+```
+
+#### Verified server-side, no browser involved
+
+```
+recaptcha: provider flow.captcha failed: recaptcha: no extension attached
+recaptcha: token acquired via http (2340 chars)
+engine: saved acct-7f3d13f8-874.jpg (0.1 MB, image/jpeg)
+engine: generated 1 image(s) in 26.7s
+```
+
+and through the server, into a project created over the transport:
+
+| | Result |
 | --- | --- |
-| `flow.captcha` (page) | yes |
-| `http` (anchor/reload protocol) | no — but intermittent |
+| image | `acct-02dec3f7-b35.jpg`, `status: succeeded`, 25.7s |
+| video | `acct-dd4c92d5-9b5.mp4`, `status: **ready**`, 28.7s, 4 credits |
 
-#### What actually happened
+#### What is still not explained
 
-The HTTP provider succeeded twice, then stopped, and nothing about the request
-changed. Every attempt below reports a token of a plausible length; only the
-outcome differs.
+The failures at 08:46–08:48 — a fresh CLI process, one call, so no cache involved
+— are **not** accounted for by this. Between those runs and the working ones the
+account, its cookies and its project all changed, and the old account's project
+listing had gone empty more than once, so a generation against a project that no
+longer existed would have produced exactly the same empty frame. That is the
+likeliest explanation and it is not proven; the honest statement is that the
+cache was a real bug, fixing it made the server-side path work, and the earlier
+standalone failures have a separate and untested cause.
 
-| Time | User agent | Token | Result |
-| --- | --- | --- | --- |
-| 01:34 | macOS Chrome 153 | 2318 chars | **succeeded** |
-| 01:36 | macOS Chrome 153 | 2297 chars | **succeeded** |
-| 08:46 | macOS Chrome 153 (persisted) | 2318 chars | empty |
-| 08:47 | macOS Chrome 153 (persisted) | 2340 chars | empty |
-| 08:48 | macOS Chrome 153 (snapshot) | 2318 chars | empty |
-| 08:48 | macOS Chrome 153 (snapshot) | 2318 chars | empty |
-| 08:49 | Windows Chrome 124 | 2318 chars | empty |
-| 08:48 | **page captcha** (control) | — | **succeeded** |
+#### The user agent, kept
 
-The 2×2 that motivated the claim varied the origin and the user agent and got two
-clean successes with the macOS agent. It was a two-sample result, and when the
-same configuration was re-run seven hours later it failed — as did the pinned
-Windows agent, at the identical token length. **So the user agent is not the
-discriminator, and the earlier conclusion was wrong.**
+`WithUserAgent` stays. A captcha-bearing call is checked against the client its
+token was minted for, so presenting the browser's own identity is right on
+principle even though it was not what unblocked anything. Same for the origin
+parameter, which is derived from `recaptchaOrigin` so the two cannot drift apart.
 
-The control matters more than any of it: the page token succeeded on the same
-account, the same project and the same prompt, minutes later. The account is not
-flagged, the render pipeline is fine, and the credits are there. It is the HTTP
-provider's assessment that is unreliable.
-
-What changed between 01:36 and 08:46 is not established. The candidates are the
-widget's release version (fetched live, so it tracks Google), the account's
-standing with the assessment, and something about the token the anchor/reload
-flow produces that Flow accepts only sometimes. None of them is testable from
-here without a second account to compare against.
-
-#### What was tried and ruled out
+#### What does not work, and why it is worth knowing
 
 The page mints through `POST https://www.google.com/recaptcha/enterprise/clr?k=<siteKey>`
 with a 1908-byte protobuf body — field 1 is the site key, field 2 is 1864 bytes of
@@ -846,26 +872,14 @@ obviously viable.
 
 It is not. The response is empty, **including for the page itself**. The token is
 assembled in JS by `enterprise.js` from that challenge plus client-side signals;
-no request returns it. There is no cookie to carry and no request to replay, which
-is why the client has to match instead — and matching turned out not to be enough
-on its own.
+no request returns it. There is no cookie to carry and no request to replay —
+but none of that matters, because the anchor/reload flow the provider already
+uses is sufficient.
 
-#### What is kept anyway
-
-- **Presenting the browser's own user agent** is still right on principle: the
-  token is checked against the client it was minted for. It is simply not
-  sufficient, and it is not what made the two runs succeed.
-- **The fingerprint and page tokens are now persisted** beside the cookie cache
-  (`data/fingerprint.json`, `data/page-tokens.json`), so a run with no browser at
-  all can present the same opening request the page would have. That makes a
-  browserless attempt possible rather than doomed, and it is what the earlier
-  "standalone" test was exercising when it failed.
-- **The origin parameter is derived from `recaptchaOrigin`** so the two cannot
-  drift apart again. It makes no measurable difference either way.
-
-So `--captcha http` is a real option for images and for the read-only calls, and a
-coin-flip for video. The failure is silent — Flow answers `200`, returns an empty
-frame and charges nothing — so the diagnostic names the provider:
+This matters because the failure is otherwise silent. Flow accepts the request,
+answers `200`, returns an empty frame and charges nothing. There is no error to
+catch and no status to check, so it reads exactly like a wrong model key or a
+wrong RPC id. The diagnostic now names the provider:
 
 ```
 engine: nothing submitted for abra_t2v_4s_360p — it costs 4 credits at 360p and the

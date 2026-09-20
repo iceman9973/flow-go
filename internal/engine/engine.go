@@ -1096,19 +1096,71 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 // can present it. Returns nil when the browser cannot be reached, in which case
 // the client falls back to a generic Chrome profile — fine for read-only calls,
 // but generation requests will be rejected as unusual activity.
+// pageTokensFile is where the page's anti-CSRF token and session id are kept
+// between runs, beside the cookie cache and for the same reason: a process with
+// no browser has to present the same opening request the page would have made.
+func pageTokensFile() string {
+	return filepath.Join(config.DataDir(), "page-tokens.json")
+}
+
+// pageTokenSet is the pair of page-only values every batchexecute request
+// carries, in the shape they are persisted.
+type pageTokenSet struct {
+	At   string `json:"at,omitempty"`
+	Fsid string `json:"fsid,omitempty"`
+}
+
+func savePageTokens(tokens pageTokenSet) {
+	if tokens.At == "" && tokens.Fsid == "" {
+		return
+	}
+	data, err := json.MarshalIndent(tokens, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(pageTokensFile(), data, 0o600); err != nil {
+		log.Printf("engine: could not persist the page tokens: %v", err)
+	}
+}
+
+func loadPageTokens() pageTokenSet {
+	data, err := os.ReadFile(pageTokensFile())
+	if err != nil {
+		return pageTokenSet{}
+	}
+	var tokens pageTokenSet
+	if err := json.Unmarshal(data, &tokens); err != nil {
+		return pageTokenSet{}
+	}
+	return tokens
+}
+
 // pageTokens reads the two values the app puts on every batchexecute request:
 // the anti-CSRF token it sends in the body, and the session id it sends in the
 // query string. Only the page has either.
 //
-// Both are optional. Without the token the client primes for one, which is what
-// it did before the extension could answer this; without the session id the call
-// goes out as it always did. A generic extension leaves both behaviours intact.
+// Both are optional in principle — without the token the client primes for one,
+// which is what it did before the extension could answer this; without the
+// session id the call goes out as it always did. In practice the priming path is
+// not a substitute for a captcha-bearing generation: a browserless run that had
+// the fingerprint and the cookies but neither of these came back empty, and the
+// same run with both from a session snapshot succeeded. So they are persisted
+// alongside the fingerprint rather than left to be re-derived.
 func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	if e.bridge == nil || !e.bridge.Connected() {
-		// No browser to read from, so fall back to whatever a SessionSnapshot
-		// supplied. A live page always wins over this — it is the same values,
-		// read from their source rather than relayed.
-		return e.opts.AtToken, e.opts.Fsid
+		// No browser to read from. A SessionSnapshot is the best source, because
+		// whoever supplied it is running right now.
+		if e.opts.AtToken != "" || e.opts.Fsid != "" {
+			return e.opts.AtToken, e.opts.Fsid
+		}
+		// Then the persisted copy, which is what lets a run with no browser at
+		// all present the same opening request the page would have.
+		if persisted := loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
+			log.Printf("engine: adopting the persisted page tokens (at %d chars, f.sid %d chars)",
+				len(persisted.At), len(persisted.Fsid))
+			return persisted.At, persisted.Fsid
+		}
+		return "", ""
 	}
 	client := e.bridge.Current()
 	if client == nil || !client.Connected() {
@@ -1134,6 +1186,9 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 		return "", ""
 	}
 
+	// Persist so the next run does not need this page.
+	savePageTokens(pageTokenSet{At: out.At, Fsid: out.Fsid})
+
 	if out.At == "" {
 		log.Printf("engine: the page did not carry an anti-CSRF token; " +
 			"batchexecute will prime for one instead")
@@ -1148,17 +1203,65 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	return out.At, out.Fsid
 }
 
+// fingerprintFile is where the browser identity is kept between runs, beside the
+// cookie cache for the same reason: a process with no browser has to be able to
+// present the client its token was minted for, and a session snapshot is only
+// available while another process is running to hand one over.
+func fingerprintFile() string {
+	return filepath.Join(config.DataDir(), "fingerprint.json")
+}
+
+// saveFingerprint persists the browser identity, best-effort.
+func saveFingerprint(fp *flowapi.BrowserFingerprint) {
+	if fp == nil || fp.UserAgent == "" {
+		return
+	}
+	data, err := json.MarshalIndent(fp, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(fingerprintFile(), data, 0o600); err != nil {
+		log.Printf("engine: could not persist the fingerprint: %v", err)
+	}
+}
+
+// loadFingerprint reads a previously persisted browser identity.
+func loadFingerprint() *flowapi.BrowserFingerprint {
+	data, err := os.ReadFile(fingerprintFile())
+	if err != nil {
+		return nil
+	}
+	var fp flowapi.BrowserFingerprint
+	if err := json.Unmarshal(data, &fp); err != nil || fp.UserAgent == "" {
+		return nil
+	}
+	return &fp
+}
+
 func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerprint {
 	if e.bridge == nil || !e.bridge.Connected() {
-		// No browser to read from, so fall back to whatever a SessionSnapshot
-		// supplied. A generic Chrome profile is the last resort and is the one
-		// thing a captcha-bearing call cannot use, so it is worth carrying the
-		// real one across processes rather than leaving it at nil.
+		// No browser to read from. A SessionSnapshot is the best source, because
+		// whoever supplied it is running right now.
 		if e.opts.Fingerprint != nil {
 			log.Printf("engine: adopting the fingerprint from the session snapshot — %s",
 				truncate(e.opts.Fingerprint.UserAgent, 70))
 			return e.opts.Fingerprint
 		}
+
+		// Then the persisted copy, which is what makes a standalone run possible
+		// at all. Without it the provider falls back to its pinned user agent,
+		// which is a *different machine* from this one — and a captcha token
+		// minted under one client and spent under another is rejected with no
+		// error at all, just an empty result.
+		if fp := loadFingerprint(); fp != nil {
+			log.Printf("engine: adopting the persisted fingerprint — %s",
+				truncate(fp.UserAgent, 70))
+			return fp
+		}
+
+		log.Printf("engine: no browser, no snapshot and no persisted fingerprint; " +
+			"a captcha-bearing call will present the pinned default and is likely to " +
+			"come back empty. Run once with the browser attached to record one")
 		return nil
 	}
 
@@ -1172,14 +1275,18 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 		return nil
 	}
 
-	log.Printf("engine: adopting the browser fingerprint — %s", truncate(fp.UserAgent, 70))
-	return &flowapi.BrowserFingerprint{
+	adopted := &flowapi.BrowserFingerprint{
 		UserAgent: fp.UserAgent,
 		Language:  fp.Language,
 		SecChUa:   fp.Brands,
 		Platform:  fp.PlatformFull,
 		Mobile:    fp.Mobile,
 	}
+	// Persist it so the next run does not need this browser at all.
+	saveFingerprint(adopted)
+
+	log.Printf("engine: adopting the browser fingerprint — %s", truncate(fp.UserAgent, 70))
+	return adopted
 }
 
 func truncate(value string, max int) string {

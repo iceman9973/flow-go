@@ -537,6 +537,51 @@ backend tells them apart from the `ops` list each reports on `ping`, and prefers
 narrow one as `current` when both are attached. The generic one is still reachable
 by address — `/v1/debug/cookies {"all": true}` lists every attached client.
 
+### Two browser profiles must not both be connected
+
+This is the one setup that silently produces nonsense, and it is easy to walk into:
+load the extension in a second Chrome profile and now **two narrow extensions** are
+attached, from two different Google accounts.
+
+The bridge holds **one** cookie jar, and `Current()` is whichever client connected
+last. So the account and the project flip depending on who synced most recently, and
+the engine is left holding a client it built at boot while the jar underneath it has
+changed. Observed directly, same process, same minute:
+
+```
+09:12:15 auth: minted access token for kiak9622@gmail.com      <- the old profile
+09:12:16 engine: 1 project(s) listed; taking d57b3c78-…        <- the old account's
+09:12:17 GET /v1/projects -> the new account's 16 projects      <- the new profile
+```
+
+and then a generation that reported the **old** account id and the **old** project
+while the jar held the **new** account's cookies.
+
+`/v1/debug/cookies {"all": true, "domain": "flow.google.com"}` is how to see it —
+three clients, two of them with `flow_operations: true`:
+
+| addr | flow operations |
+| --- | --- |
+| `127.0.0.1:62783` | yes |
+| `127.0.0.1:62784` | no — the generic bridge |
+| `127.0.0.1:62788` | yes |
+
+**Close the extension, or the Flow tab, in every profile but one.** Until then every
+result is unreliable, and the failures look like bugs in this engine rather than like
+two accounts taking turns.
+
+A second profile also has no bridge token, so its first connection is refused:
+
+```
+cdp: rejected an upgrade from 127.0.0.1:62587 — no token was presented and pairing is
+closed, so the extension has none stored.
+```
+
+Paste the contents of `data/bridge-token` into that profile's extension popup. The
+alternative — deleting `data/bridge-token.claimed` and restarting — reopens a
+one-connection tokenless window, but whichever extension reconnects first wins that
+race, so pasting is the deterministic fix.
+
 The bridge itself is **not part of this module**. `cdp-control/{bridge,cdp,cookiejar}`
 live in the `browser-Cdp` project and are pulled in by a relative `replace` in
 `go.mod`, which means flow-go cannot be built without that checkout beside it.

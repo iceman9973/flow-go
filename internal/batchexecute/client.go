@@ -2229,12 +2229,49 @@ type ImageUpscaleRequest struct {
 // The download menu's "2K / Upscaled" choice runs this before fetching the file,
 // which is why no new project asset appears: the image is served bigger, not
 // re-created.
+// upscaleArgs builds the SPrCad payload and the source path it goes out under.
+//
+// Two things here are the opposite of every other call in this file, and both
+// were wrong in the same direction for a long time.
+//
+// **Position [0] is the media id, not the content id.** The generation calls take
+// content ids in startImage/endImage, so sending one here looks consistent and is
+// not. Getting it backwards returns a null payload rather than an error — which
+// is exactly how it presented, and why it was blamed on the transport for so
+// long. The in-page implementation learned this from the app's own request and
+// was fixed; the transport was not.
+//
+// **The source path names the project and nothing else.** An earlier version
+// appended "/edit/<mediaID>"; the app's own request does not, and the media id
+// travels in position [0] instead.
+//
+// Shared by both entry points deliberately: they had already drifted apart once,
+// and a second copy of this is a second chance to get it wrong.
+func upscaleArgs(req ImageUpscaleRequest, resolution int, contextBlock []any) ([]any, string) {
+	mediaID := req.MediaID
+	if mediaID == "" {
+		// A caller holding only the content id still gets a request rather than
+		// an empty position; for an image the two are usually the same value.
+		mediaID = req.ContentID
+	}
+
+	sourcePath := req.SourcePath
+	if sourcePath == "" {
+		sourcePath = "/project/" + req.ProjectID
+	}
+	return []any{mediaID, resolution, contextBlock}, sourcePath
+}
+
 func (c *Client) UpscaleImage(ctx context.Context, req ImageUpscaleRequest) ([]GeneratedMedia, error) {
 	if req.ProjectID == "" {
 		return nil, fmt.Errorf("batchexecute: a project id is required")
 	}
-	if req.ContentID == "" {
-		return nil, fmt.Errorf("batchexecute: a content id is required")
+	// Either id will do: position [0] carries the media id, and a caller holding
+	// only the content id still gets a request rather than a rejection. This used
+	// to demand the content id specifically, which is the belief that made the
+	// position wrong in the first place.
+	if req.MediaID == "" && req.ContentID == "" {
+		return nil, fmt.Errorf("batchexecute: a media id is required")
 	}
 	if req.CaptchaToken == "" {
 		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
@@ -2254,16 +2291,9 @@ func (c *Client) UpscaleImage(ctx context.Context, req ImageUpscaleRequest) ([]G
 		[]any{req.CaptchaToken, 1},
 	}
 
-	sourcePath := req.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project/" + req.ProjectID
-		if req.MediaID != "" {
-			sourcePath += "/edit/" + req.MediaID
-		}
-	}
+	args, sourcePath := upscaleArgs(req, resolution, contextBlock)
 
-	frames, err := c.CallWith(ctx, RPCIDImageUpscale,
-		[]any{req.ContentID, resolution, contextBlock},
+	frames, err := c.CallWith(ctx, RPCIDImageUpscale, args,
 		CallOptions{SourcePath: sourcePath, BuildLabel: req.BuildLabel, SessionID: req.SessionID})
 	if err != nil {
 		return nil, err
@@ -2754,16 +2784,10 @@ func (c *Client) UpscaleImageRaw(ctx context.Context, req ImageUpscaleRequest) (
 		nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
 		[]any{req.CaptchaToken, 1},
 	}
-	sourcePath := req.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project/" + req.ProjectID
-		if req.MediaID != "" {
-			sourcePath += "/edit/" + req.MediaID
-		}
-	}
 
-	frames, err := c.CallWith(ctx, RPCIDImageUpscale,
-		[]any{req.ContentID, resolution, contextBlock},
+	args, sourcePath := upscaleArgs(req, resolution, contextBlock)
+
+	frames, err := c.CallWith(ctx, RPCIDImageUpscale, args,
 		CallOptions{SourcePath: sourcePath, BuildLabel: req.BuildLabel, SessionID: req.SessionID})
 	if err != nil {
 		return nil, err

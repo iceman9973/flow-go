@@ -609,14 +609,18 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			req.ProjectID = eng.ProjectID()
 		}
 		// A caller normally holds the media id — it is what a generation returns
-		// and what the editor URL carries — while SPrCad takes the content id.
-		// Resolve it rather than making every caller know both.
+		// and what the editor URL carries — and SPrCad takes the media id too.
+		// This used to resolve the content id and hand that over instead, on the
+		// belief that SPrCad wanted it; the app's own request says otherwise, and
+		// the wrong position returns a null payload rather than an error.
+		//
+		// Best-effort now rather than required. Nothing depends on it — the arg
+		// carries the media id — and as a precondition it failed the whole call
+		// for a freshly generated asset the listing had not caught up with.
 		if req.ContentID == "" {
-			contentID, err := eng.ResolveContentID(c.Context(), req.MediaID)
-			if err != nil {
-				return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+			if contentID, err := eng.ResolveContentID(c.Context(), req.MediaID); err == nil {
+				req.ContentID = contentID
 			}
-			req.ContentID = contentID
 		}
 		if req.Resolution == 0 {
 			req.Resolution = 1
@@ -1784,14 +1788,18 @@ func handleImageUpscale(eng *engine.Engine) fiber.Handler {
 			req.ProjectID = eng.ProjectID()
 		}
 		// A caller normally holds the media id — it is what a generation returns
-		// and what the editor URL carries — while SPrCad takes the content id.
-		// Resolve it rather than making every caller know both.
+		// and what the editor URL carries — and SPrCad takes the media id too.
+		// This used to resolve the content id and hand that over instead, on the
+		// belief that SPrCad wanted it; the app's own request says otherwise, and
+		// the wrong position returns a null payload rather than an error.
+		//
+		// Best-effort now rather than required. Nothing depends on it — the arg
+		// carries the media id — and as a precondition it failed the whole call
+		// for a freshly generated asset the listing had not caught up with.
 		if req.ContentID == "" {
-			contentID, err := eng.ResolveContentID(c.Context(), req.MediaID)
-			if err != nil {
-				return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+			if contentID, err := eng.ResolveContentID(c.Context(), req.MediaID); err == nil {
+				req.ContentID = contentID
 			}
-			req.ContentID = contentID
 		}
 
 		resolution, label, err := imageResolution(req.Resolution)

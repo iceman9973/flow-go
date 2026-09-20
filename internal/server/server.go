@@ -64,7 +64,12 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			// call.
 			"bearer_path_available": eng.BearerPathAvailable(),
 			"bridge":                br.Status(),
-			"error":                 eng.LastError(),
+			// More than one is a configuration the engine cannot serve
+			// coherently: the bridge holds one cookie jar, so two signed-in
+			// profiles take turns owning it and calls report the wrong account.
+			// Empty is the normal case.
+			"flow_extensions": eng.CompetingExtensions(),
+			"error":           eng.LastError(),
 		})
 	})
 

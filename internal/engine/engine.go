@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,6 +132,59 @@ func (e *Engine) BearerPathAvailable() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.hasSession
+}
+
+// CompetingExtensions reports the narrow (Flow-capable) extensions attached at
+// once, sorted by address.
+//
+// More than one is a configuration the engine cannot serve coherently, and it is
+// easy to walk into: load the extension in a second Chrome profile and both
+// profiles are now attached, each signed into a different Google account.
+//
+// The bridge holds one cookie jar and `Current()` is whichever client connected
+// last, so the account and the project move under a process that has already
+// built its client. That is worse than an error — calls succeed and report the
+// wrong account — which is why this is worth naming rather than tolerating.
+//
+// Surface() is used rather than a probe: it is a cached answer, so a health check
+// does not pay a round trip to ask.
+func (e *Engine) CompetingExtensions() []string {
+	if e.bridge == nil {
+		return nil
+	}
+	var narrow []string
+	for addr, client := range e.bridge.Clients() {
+		if client != nil && client.Surface().FlowOperations {
+			narrow = append(narrow, addr)
+		}
+	}
+	sort.Strings(narrow)
+	return narrow
+}
+
+// warnOnCompetingExtensions says so once, loudly, when more than one narrow
+// extension is attached.
+func (e *Engine) warnOnCompetingExtensions() {
+	narrow := e.CompetingExtensions()
+	if len(narrow) < 2 {
+		return
+	}
+
+	current := ""
+	if client := e.bridge.Current(); client != nil {
+		for _, addr := range narrow {
+			if e.bridge.Clients()[addr] == client {
+				current = addr
+				break
+			}
+		}
+	}
+
+	log.Printf("engine: %d Flow extensions are attached at once (%s). The bridge holds "+
+		"one cookie jar and uses whichever connected last, so the account and the project "+
+		"will move under this process — results will look right and belong to the other "+
+		"account. Close the extension, or the Flow tab, in every browser profile but one. "+
+		"Using %s.", len(narrow), strings.Join(narrow, ", "), current)
 }
 
 // Fingerprint returns the browser identity adopted at start-up, or nil when the
@@ -902,6 +956,11 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	log.Printf("engine: ready — account %s, %d cookies (%s), project %s, captcha %s",
 		accountID, jar.Count(), source,
 		projectID, captchaProvider.Name())
+
+	// Last, so every extension that is going to connect has. A second narrow
+	// extension makes everything above provisional, and the operator needs to
+	// know before they read a result rather than after.
+	e.warnOnCompetingExtensions()
 
 	return nil
 }

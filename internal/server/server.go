@@ -657,12 +657,24 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 		client := eng.NewBatchexecuteClient(jar, hc)
 		client.SetHeaderOverrides(req.HeaderOverrides)
 		client.SetHeaderOrder(req.HeaderOrder)
+
+		// The app's own SPrCad request carries `bl` and `f.sid`; this route sent
+		// neither, because it passed empty CallOptions and nothing had put a
+		// default on the client. Every diagnostic run was therefore missing two
+		// parameters the real request always has — and the capture that settled
+		// the payload questions showed both of them present.
+		if snapshot, snapErr := eng.SessionSnapshot(ctx); snapErr == nil {
+			client.SetSessionID(snapshot.Fsid)
+		}
+		buildLabel := config.BuildLabel()
+
 		media, err := client.UpscaleImage(ctx, batchexecute.ImageUpscaleRequest{
 			ProjectID:    req.ProjectID,
 			MediaID:      req.MediaID,
 			ContentID:    req.ContentID,
 			Resolution:   req.Resolution,
 			CaptchaToken: captcha,
+			BuildLabel:   buildLabel,
 		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{
@@ -679,6 +691,7 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			ContentID:    req.ContentID,
 			Resolution:   req.Resolution,
 			CaptchaToken: captcha,
+			BuildLabel:   buildLabel,
 		})
 
 		// The verbatim body: when the parsed view is nil this is the only place
@@ -689,6 +702,7 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			ContentID:    req.ContentID,
 			Resolution:   req.Resolution,
 			CaptchaToken: captcha,
+			BuildLabel:   buildLabel,
 		})
 		if len(body) > 3000 {
 			body = body[:3000]

@@ -1214,7 +1214,7 @@ func buildVideoArgument(req GenerateVideoRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	return []any{
@@ -1239,7 +1239,7 @@ func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	request := []any{
@@ -1725,7 +1725,7 @@ func (c *Client) UploadMedia(ctx context.Context, req UploadMediaRequest) (media
 	arg := []any{
 		[]any{
 			nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-			[]any{req.CaptchaToken, 1},
+			captchaPair(req.CaptchaToken),
 		},
 		base64.StdEncoding.EncodeToString(req.Data),
 		req.MimeType,
@@ -1900,7 +1900,7 @@ func buildEditArgument(req EditVideoRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	return []any{
@@ -2014,7 +2014,7 @@ func buildReferenceArgument(req ReferenceVideoRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	return []any{
@@ -2170,7 +2170,7 @@ func buildUpscaleArgument(req UpscaleRequest) []any {
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	// The third element is a bare uuid in its own array. It is easy to miss —
@@ -2262,6 +2262,20 @@ func upscaleArgs(req ImageUpscaleRequest, resolution int, contextBlock []any) ([
 	return []any{mediaID, resolution, contextBlock}, sourcePath
 }
 
+// captchaPair is the [token, timestamp] pair the app puts in the context block.
+//
+// The second element is a millisecond clock reading, not a constant. This sent a
+// literal 1 for a long time — a value that decodes to 1970 — while the app sends
+// the time the request was made, and a token paired with a timestamp that cannot
+// be right is exactly the shape a forged request has.
+//
+// Taken from the app's own SPrCad request, captured through the page:
+//
+//	[...,["0cAFcWeA…",1789878183099]]
+func captchaPair(token string) []any {
+	return []any{token, time.Now().UnixMilli()}
+}
+
 func (c *Client) UpscaleImage(ctx context.Context, req ImageUpscaleRequest) ([]GeneratedMedia, error) {
 	if req.ProjectID == "" {
 		return nil, fmt.Errorf("batchexecute: a project id is required")
@@ -2288,7 +2302,7 @@ func (c *Client) UpscaleImage(ctx context.Context, req ImageUpscaleRequest) ([]G
 		nil, nil, nil,
 		req.ProjectID,
 		nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	args, sourcePath := upscaleArgs(req, resolution, contextBlock)
@@ -2782,7 +2796,7 @@ func (c *Client) UpscaleImageRaw(ctx context.Context, req ImageUpscaleRequest) (
 	}
 	contextBlock := []any{
 		nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 
 	args, sourcePath := upscaleArgs(req, resolution, contextBlock)
@@ -2808,7 +2822,7 @@ func (c *Client) UpscaleImageRawBody(ctx context.Context, req ImageUpscaleReques
 	}
 	contextBlock := []any{
 		nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-		[]any{req.CaptchaToken, 1},
+		captchaPair(req.CaptchaToken),
 	}
 	sourcePath := req.SourcePath
 	if sourcePath == "" {

@@ -1002,6 +1002,16 @@ The full elimination is in git history —
 `git log --all --oneline -- '*upscale*'` — and is worth reading before anyone
 tries to bring the transport path back.
 
+**Two things survived the removal on purpose.** `httpx.WithProfile` and
+`httpx.WithProtocolRacing` are now called by nothing but their own tests, and they
+are kept: they are the only way to vary the TLS fingerprint and the protocol at
+runtime, and this project has hit that question twice already. A rejection that
+does not move when the fingerprint changes is not a fingerprint check, and without
+these there is no way to establish that. Everything else the upscale diagnosis
+needed — the per-request header order and QUIC toggles on the batchexecute client,
+the raw-body helper, the operation poller, the credential-stripping jar — went with
+the routes that used it.
+
 **One thing that outlived the feature and still matters:** an asset and its
 upscales share one media id, so a media-id lookup returns whichever row comes
 first. `ResolveContentID` has to pick by type code — `CAE` for the original — and

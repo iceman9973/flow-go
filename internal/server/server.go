@@ -1535,29 +1535,6 @@ func handleVideoEdit(eng *engine.Engine) fiber.Handler {
 	}
 }
 
-// withoutAuthCookies rebuilds a jar with the session cookies removed.
-//
-// Diagnostics only. It exists so a 401 can be produced on demand: the recovery
-// path that handles one is otherwise unreachable until a session happens to
-// expire, which is exactly when it must work.
-func withoutAuthCookies(jar *cookiejar.Jar) *cookiejar.Jar {
-	if jar == nil {
-		return nil
-	}
-	auth := make(map[string]bool, len(cookiejar.AuthCookieNames))
-	for _, name := range cookiejar.AuthCookieNames {
-		auth[name] = true
-	}
-	kept := make([]cookiejar.Cookie, 0, len(jar.Cookies()))
-	for _, ck := range jar.Cookies() {
-		if auth[ck.Name] {
-			continue
-		}
-		kept = append(kept, ck)
-	}
-	return cookiejar.FromCookies(kept, "diagnostic-no-credentials")
-}
-
 // shortID trims an id to something usable in a filename.
 func shortID(id string) string {
 	if len(id) > 8 {

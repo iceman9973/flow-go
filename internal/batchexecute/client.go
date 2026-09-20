@@ -378,13 +378,6 @@ type Client struct {
 	// removed instead of set. Diagnostics only: it exists so a request can be
 	// compared against the browser's own, header by header.
 	overrides map[string]string
-	// useQUIC allows the HTTP/3 path on these POSTs. The app's own batchexecute
-	// calls go out over h3; the default transport keeps POSTs on HTTP/2.
-	useQUIC bool
-	// headerOrder overrides the header ordering. Diagnostics only: a header that
-	// is absent from the order list is emitted in an arbitrary position, so a
-	// faithful replay has to supply the order as well as the headers.
-	headerOrder []string
 	// onUnauthorized refreshes an expired session. Nil means a 401 is terminal.
 	onUnauthorized UnauthorizedHandler
 	// authUser selects which signed-in Google account these calls act as.
@@ -427,27 +420,6 @@ func (c *Client) endpointURL(rawQuery string) string {
 		endpoint += "&authuser=" + strconv.Itoa(index)
 	}
 	return endpoint
-}
-
-// SetHeaderOrder overrides the order headers are sent in.
-//
-// Diagnostics only. The default list omits headers the app sends (sec-fetch-*,
-// x-same-domain), and an unlisted header lands wherever the map iterates to —
-// which is not reproducible and not what the browser sends.
-func (c *Client) SetHeaderOrder(order []string) {
-	c.mu.Lock()
-	c.headerOrder = order
-	c.mu.Unlock()
-}
-
-// SetUseQUIC allows these calls to go out over HTTP/3.
-//
-// Only for calls that are safe to repeat: the QUIC path falls back to HTTP/2,
-// which would submit a write twice.
-func (c *Client) SetUseQUIC(enabled bool) {
-	c.mu.Lock()
-	c.useQUIC = enabled
-	c.mu.Unlock()
 }
 
 // SetHeaderOverrides installs headers to apply after the built-in set. Mapping a
@@ -754,60 +726,6 @@ func (c *Client) CallWith(ctx context.Context, rpcID string, payload any, opts C
 	return ParseFrames(resp.Text())
 }
 
-// CallRaw performs the same call as CallWith but returns the response body
-// verbatim.
-//
-// Diagnostics only. ParseFrames keeps only the wrb.fr frames and drops the
-// payload of any frame whose data element is not a non-empty string, so an RPC
-// that answers with an error frame and an RPC that genuinely returns nothing
-// both look like a nil Payload. When that happens the raw body is the only place
-// the reason is still visible.
-func (c *Client) CallRaw(ctx context.Context, rpcID string, payload any, opts CallOptions) (string, error) {
-	auth, err := c.Authorization()
-	if err != nil {
-		return "", err
-	}
-
-	arg := "[]"
-	if payload != nil {
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return "", fmt.Errorf("batchexecute: could not encode the payload: %w", err)
-		}
-		arg = string(encoded)
-	}
-
-	envelope := [][][]any{{{rpcID, arg, nil, "generic"}}}
-	envelopeJSON, err := json.Marshal(envelope)
-	if err != nil {
-		return "", fmt.Errorf("batchexecute: could not encode the envelope: %w", err)
-	}
-
-	sourcePath := opts.SourcePath
-	if sourcePath == "" {
-		sourcePath = "/project"
-	}
-
-	query := url.Values{}
-	query.Set("rpcids", rpcID)
-	query.Set("source-path", sourcePath)
-	query.Set("hl", "en")
-	query.Set("rt", "c")
-	query.Set("_reqid", strconv.FormatInt(atomic.AddInt64(&c.reqs, 1)*100000+1000, 10))
-	if opts.BuildLabel != "" {
-		query.Set("bl", opts.BuildLabel)
-	}
-	if sid := c.sessionIDFor(opts); sid != "" {
-		query.Set("f.sid", sid)
-	}
-
-	resp, err := c.post(ctx, rpcID, string(envelopeJSON), query.Encode(), auth)
-	if err != nil {
-		return "", err
-	}
-	return resp.Text(), nil
-}
-
 // UnauthorizedHandler refreshes a session the server has rejected.
 //
 // It returns the fresh cookie jar so the client can swap it in, or nil to keep
@@ -851,23 +769,21 @@ func (c *Client) post(ctx context.Context, rpcID, envelopeJSON, rawQuery, auth s
 				body.Set("at", token)
 			}
 
-			c.mu.Lock()
-			useQUIC := c.useQUIC
-			order := c.headerOrder
-			c.mu.Unlock()
-			if len(order) == 0 {
-				order = httpx.ChromeHeaderOrder
-			}
-
+			// QUIC is off and the header order is Chrome's, always. Both used to
+			// be settable for the image-upscale diagnosis — the app's own
+			// batchexecute calls go out over h3, and a faithful replay has to
+			// supply the header order as well as the headers — and neither made
+			// any difference to that rejection. The setters went with the
+			// upscale code; the values are what they always resolved to.
 			resp, err := c.hc.Do(ctx, &httpx.Request{
 				Method:      "POST",
 				URL:         fullURL,
 				Body:        []byte(body.Encode()),
 				Headers:     headers,
-				HeaderOrder: order,
+				HeaderOrder: httpx.ChromeHeaderOrder,
 				Cookies:     c.jar.HeaderForDomain(Origin + "/"),
-				DisableQUIC: !useQUIC,
-				AllowQUIC:   useQUIC,
+				DisableQUIC: true,
+				AllowQUIC:   false,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("batchexecute: %s request failed: %w", rpcID, err)
@@ -2002,16 +1918,6 @@ const ()
 // acting on it, which is the worst kind of failure — no error, no output.
 
 // upscaleModelIndex is where the upsampler model key goes.
-
-// OperationStatus polls a long-running operation.
-func (c *Client) OperationStatus(ctx context.Context, projectID, operationID string) ([]Frame, error) {
-	if operationID == "" {
-		return nil, fmt.Errorf("batchexecute: an operation id is required")
-	}
-	return c.CallWith(ctx, RPCIDOperation,
-		[]any{nil, nil, []any{[]any{operationID}}},
-		CallOptions{SourcePath: "/project/" + projectID})
-}
 
 // GeneratedMedia is one asset returned by a generation call.
 type GeneratedMedia struct {

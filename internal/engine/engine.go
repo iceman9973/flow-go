@@ -781,18 +781,15 @@ func (e *Engine) CreateProject(ctx context.Context, label string) (batchexecute.
 // emptySubmissionHint explains the most likely cause of a video submission that
 // comes back empty.
 //
-// The old wording sent the reader to "the model key and the RPC it went to".
-// Those are worth ruling out — a wrong model or a wrong RPC id is also accepted
-// with an empty result — but they are the *less* common cause, and the message
-// named neither the captcha provider nor the fact that the provider is knowable.
+// The old wording sent the reader to "the model key and the RPC it went to", and
+// a later revision told them to attach the extension so the page could mint a
+// token. Both were wrong, and the second was actively misleading: the transport
+// mints a perfectly good token, and the thing that made it look broken was that
+// the provider reused one.
 //
-// Measured, same server, same project, same prompt and model, only the provider
-// varied: a token from the page submitted and charged; a token from the HTTP
-// provider came back empty and charged nothing, twice out of two. The HTTP
-// provider speaks the Enterprise anchor/reload protocol with no browser, which
-// yields a lower-scoring assessment, and Flow answers an empty result rather
-// than an error — so this reads as a payload problem when it is an assessment
-// problem.
+// An empty frame means Flow accepted the request and did nothing, so the causes
+// are all of that shape — something about the request was understood and
+// declined, silently.
 func (e *Engine) emptySubmissionHint() string {
 	e.mu.RLock()
 	provider := e.captcha
@@ -803,14 +800,12 @@ func (e *Engine) emptySubmissionHint() string {
 		name = provider.Name()
 	}
 
-	hint := fmt.Sprintf("The reCAPTCHA token came from %q. ", name)
-	if name == "http" {
-		return hint + "A token minted without a browser scores lower and Flow answers an " +
-			"empty result rather than an error, which is the usual cause here — attach the " +
-			"extension so the page can mint one. Otherwise check the model key and the RPC " +
-			"it went to."
-	}
-	return hint + "Also check the model key and the RPC it went to."
+	// Ordered by how often each has been the answer.
+	return fmt.Sprintf("The reCAPTCHA token came from %q. A token is single-use, so a "+
+		"reused or cached one produces exactly this — Flow verifies it once and answers "+
+		"an empty frame on every later call. Check next that the project exists on the "+
+		"account in use: generating into a project that is not there is accepted the same "+
+		"silent way. Only then suspect the model key and the RPC it went to.", name)
 }
 
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.
@@ -1355,6 +1350,15 @@ func truncate(value string, max int) string {
 	return value[:max] + "..."
 }
 
+// captchaNeedsPage reports whether the configured captcha mode asks the browser
+// for its token rather than minting one over the transport.
+//
+// Only `broker` does. The default mints server-side, which is why a generation
+// no longer has to have a Flow tab open anywhere.
+func (e *Engine) captchaNeedsPage() bool {
+	return strings.EqualFold(strings.TrimSpace(e.opts.CaptchaMode), "broker")
+}
+
 // ensureProjectTab makes sure the browser is on a Flow editor before a
 // generation is submitted. Best effort: if it fails, the HTTP reCAPTCHA provider
 // still runs, but the higher-scoring broker path will not.
@@ -1492,9 +1496,16 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 
 	cost := config.CreditsPerVideo[req.Duration] * req.Count
 
-	// The generation call needs a reCAPTCHA token, and the widget only exists in
-	// the Flow editor. Make sure the browser is on one before submitting.
-	e.ensureProjectTab(ctx)
+	// The widget only exists in a Flow editor, so the browser has to be sitting
+	// on one before a page-minted token can be asked for.
+	//
+	// This used to run unconditionally, which meant every generation navigated a
+	// tab whether or not the token needed a page. The default chain mints over
+	// the transport and needs nothing from the browser, so the navigation is now
+	// tied to the mode that actually wants it.
+	if e.captchaNeedsPage() {
+		e.ensureProjectTab(ctx)
+	}
 
 	var outcome *flowapi.VideoResult
 	var accountID string

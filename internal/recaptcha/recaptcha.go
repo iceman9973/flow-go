@@ -53,7 +53,9 @@ const DefaultSiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
 
 // Enterprise endpoints and the origin the token is scoped to.
 const (
-	recaptchaBase = "https://www.google.com/recaptcha/enterprise"
+	// recaptchaBase is a var rather than a const so a test can point it at a
+	// local server. Without that, exercising the anchor/reload exchange means
+	// talking to Google, which is neither hermetic nor free.
 	// recaptchaOrigin is the site the widget is embedded in. The token is scoped
 	// to it, so a wrong value is a mismatch the assessment can see.
 	//
@@ -67,6 +69,8 @@ const (
 	recaptchaUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+var recaptchaBase = "https://www.google.com/recaptcha/enterprise"
 
 // recaptchaCO is the base64-encoded origin the widget expects, derived from
 // recaptchaOrigin so the two cannot drift apart again.
@@ -594,14 +598,9 @@ func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLRes
 	case "http":
 		return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 	case "broker":
-		if broker == nil {
-			return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
-		}
-		return NewChain(NewBroker(broker, "", pageURL), EmptyProvider{})
-	default: // "auto"
-		// The Flow operation goes first because it is the one that works with the
-		// extension this backend prefers. The broker follows for the case where a
-		// generic bridge is what is attached.
+		// The explicit opt-in to the browser. Kept because it is the only path
+		// that scores from a real page, and because a caller who asks for it
+		// should get it rather than a silent fallback to the transport.
 		providers := make([]Provider, 0, 4)
 		if current != nil {
 			providers = append(providers, NewFlow(current))
@@ -611,6 +610,18 @@ func Build(mode string, hc *httpx.Client, broker *cdp.Client, pageURL PageURLRes
 		}
 		providers = append(providers, NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 		return NewChain(providers...)
+	default: // "auto"
+		// The transport, and only the transport.
+		//
+		// This used to try `flow.captcha` and the broker first, on the belief
+		// that a page-minted token scored better. It does, and it was also the
+		// reason a browser had to be attached and a tab had to be sitting on a
+		// Flow project for every generation. The HTTP provider turns out to be
+		// sufficient — the real defect was that it reused a single-use token —
+		// so the browser is no longer asked for anything on this path.
+		//
+		// Anyone who wants the page token can still have it: `--captcha broker`.
+		return NewChain(NewHTTP(hc, "", "").WithUserAgent(userAgent), EmptyProvider{})
 	}
 }
 

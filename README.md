@@ -603,7 +603,7 @@ The settings that matter most:
 | Setting | Purpose |
 | --- | --- |
 | `--proxy` | CLI flag. Route upstream traffic through one exit IP. Flow scores on IP consistency, so a stable proxy measurably improves success. |
-| `--captcha` | CLI flag, **not** an environment variable: `auto` (default), `broker`, `http`, or `off`. Setting `FLOW_RECAPTCHA` does nothing. |
+| `--captcha` | CLI flag, **not** an environment variable: `auto` (default), `broker`, `http`, or `off`. Setting `FLOW_RECAPTCHA` does nothing. `auto` and `http` both mint over the transport and need no browser; `broker` opts into the page token. |
 | `WS_PORT` / `HTTP_PORT` | Environment variables. Extension bridge and API ports. |
 | `ACCOUNT_INDEX` | Environment variable. Seeds which signed-in account to act as. Only a seed — once `/v1/accounts/switch` has been used, the stored index wins, so a deliberate choice survives a restart. |
 | `ACCOUNT_SCAN_LIMIT` | Environment variable, default 6. How many account indices are examined when looking for one that can pay. Chrome permits ten, but the scan costs a session, a profile and a balance read per index and runs on the request path. |
@@ -796,12 +796,19 @@ No API key. No bearer token. No `aisandbox-pa.googleapis.com`.
 > `HTTPProvider`, and with it removed the server-side path works — image, video,
 > and a run with no browser attached at all.
 
-The token can be minted two ways, and both work:
+The token can be minted two ways, and the default is the one that needs nothing:
 
-| Provider | Needs a browser | State |
+| Provider | Needs a browser | Used by |
 | --- | --- | --- |
-| `flow.captcha` (page) | yes | works |
-| `http` (anchor/reload protocol) | no | **works** — and is the one that matters for a headless setup |
+| `http` (anchor/reload protocol) | **no** | `auto` (the default) and `http` |
+| `flow.captcha` (page) | yes | `broker`, and only when asked for |
+
+`auto` used to lead with `flow.captcha` and the broker, on the belief that a
+page-minted token scored better. It does — and it was also why every generation
+needed an extension attached and a tab parked on a Flow project. The transport
+turns out to be sufficient, so the default now asks the browser for nothing, and
+`ensureProjectTab` only runs in `broker` mode. Anyone who wants the page token can
+still have it with `--captcha broker`.
 
 #### What was actually wrong
 
@@ -879,14 +886,17 @@ uses is sufficient.
 This matters because the failure is otherwise silent. Flow accepts the request,
 answers `200`, returns an empty frame and charges nothing. There is no error to
 catch and no status to check, so it reads exactly like a wrong model key or a
-wrong RPC id. The diagnostic now names the provider:
+wrong RPC id. The diagnostic now names the provider and the two causes that have
+actually produced it:
 
 ```
 engine: nothing submitted for abra_t2v_4s_360p — it costs 4 credits at 360p and the
 account has 31, which was checked and covers it; so the balance is not the cause.
-The reCAPTCHA token came from "http". A token minted without a browser scores lower
-and Flow answers an empty result rather than an error, which is the usual cause here
-— attach the extension so the page can mint one.
+The reCAPTCHA token came from "http". A token is single-use, so a reused or cached
+one produces exactly this — Flow verifies it once and answers an empty frame on
+every later call. Check next that the project exists on the account in use:
+generating into a project that is not there is accepted the same silent way. Only
+then suspect the model key and the RPC it went to.
 ```
 
 ### Video

@@ -54,7 +54,7 @@ this is worth a document.
 | Symptom | Means |
 | --- | --- |
 | `frames: [null]`, `status: submitted`, no charge | the request was understood and declined, silently |
-| `PUBLIC_ERROR_UNUSUAL_ACTIVITY` | a client check, on the RPC itself — see `SPrCad` below |
+| `PUBLIC_ERROR_UNUSUAL_ACTIVITY` | a client check, on the RPC itself — `SPrCad` was the only one, and it has been removed |
 | `401` | the session, not the captcha |
 | an error from the provider | the mint failed; the chain will have fallen through to `empty` |
 
@@ -275,13 +275,12 @@ generation whether or not the token needed a page.
 
 ## What still needs a browser
 
-**Image upscale (`SPrCad`) — and only that.**
+**Nothing.** Project list, project create, image generation, video generation,
+poll, resolve and download all run with no browser attached.
 
-It is rejected with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` over the Go transport while the
-same captcha token and payload succeed from the page. That is a stricter check on
-that one RPC, not a credential problem and not the fingerprint: the request now
-goes out under the browser's real identity, echoed back in the response, and is
-still rejected. `use_quic` makes no difference either.
-
-Everything else — project list, project create, image generation, video
-generation, poll, resolve, download — runs with no browser attached.
+Image upscaling was the last holdout and has been removed. It was the one RPC that
+answered `PUBLIC_ERROR_UNUSUAL_ACTIVITY` over the transport while the identical
+call succeeded from the page — a stricter client check on that RPC, not a
+credential problem and not the fingerprint, since the request went out under the
+browser's real identity, echoed back in the response, and was still rejected.
+`use_quic` made no difference either.

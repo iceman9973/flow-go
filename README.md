@@ -31,7 +31,7 @@ token. That made the browser a hard dependency on the critical path, and when th
 token went stale the pipeline deadlocked.
 
 This port keeps the browser only where it is genuinely required — cookies, page
-tokens, a reCAPTCHA token, and one in-page upscale call — and does the rest in Go.
+tokens and a reCAPTCHA token — and does the rest in Go.
 
 ## Quick start
 
@@ -126,8 +126,6 @@ popup has no editor by design, so clear `browserCdp.config` from
 | GET | `/v1/credits` | Refresh and return account balances |
 | POST | `/v1/videos/generations` | Submit a video generation |
 | POST | `/v1/images/generations` | Submit an image generation |
-| POST | `/v1/videos/upscale` | Upscale a finished video to 1080p (`p0UkFb`, submit then poll) |
-| POST | `/v1/images/upscale` | Resolve an image at 2K or 4K (`SPrCad`, run in the browser) |
 | POST | `/v1/bridge/refresh` | Ask the browser to renew its session, then re-sync |
 | GET | `/v1/jobs` | Recent jobs |
 | GET | `/v1/jobs/:id` | One job |
@@ -237,8 +235,6 @@ row[2] = media id     ← what the UI and the editor URL use
 
 | Call | Takes |
 |---|---|
-| `SPrCad` (image upscale) | content id |
-| `p0UkFb` (video upscale) | **both** — content at `request[0]`, media at `request[4]` |
 | `nprQif` / `eb1hJf` (image-to-video) | content id, in `startImage`/`endImage` |
 | `as29s` (media detail) | content id |
 | `/project/<id>/edit/<X>` | media id |
@@ -401,8 +397,6 @@ was wrong, so the only way through is to vary one thing at a time:
 | POST | `/v1/debug/headers` | The exact headers and Cookie a call would send, so they can be diffed against the browser's |
 | POST | `/v1/debug/captcha` | Mint a reCAPTCHA token and hand it back, to replay it from the page |
 | POST | `/v1/debug/events-raw` | Raw CDP events. `requestWillBeSentExtraInfo` is the only place the browser's *real* headers, Cookie included, are visible |
-| POST | `/v1/debug/image-upscale` | `SPrCad` over the Go transport, with the raw response body. Takes `header_overrides`, `header_order`, `tls_profile`, `protocol_racing`, `build_label`, `at_token`, `source_path`, `session_id`, `use_quic`, `drop_credentials` |
-| POST | `/v1/debug/video-upscale` | `p0UkFb` over the Go transport, returning the queued asset id |
 | GET | `/v1/debug/credits-rpc` | The raw **batchexecute** credits payload for one account (`?authuser=N`). Unlike `/v1/debug/credits-raw`, which hits the legacy endpoint and reports whichever account that credential belongs to, this uses the transport and `authuser` a real balance read uses — so it can be pointed at a specific account. It is how the tier question was settled: the payload is `[[7,3,8,1,null,7]]`, numbers only, no tier |
 | POST | `/v1/bridge/eval` | Evaluate an expression in the attached tab |
 | POST | `/v1/bridge/cdp` | Issue an arbitrary CDP command |
@@ -518,13 +512,13 @@ fine and is the normal debugging setup.
 | --- | --- | --- |
 | Chrome name | **Flow Go Bridge** | **browser-Cdp** |
 | Belongs to | this repo | the `browser-Cdp` project |
-| Surface | a fixed list of Flow operations (`flow.at`, `flow.captcha`, `flow.upscale`, …) | arbitrary CDP: `cdp.call`, `cdp.evaluate` |
+| Surface | a fixed list of Flow operations (`flow.at`, `flow.captcha`, …) | arbitrary CDP: `cdp.call`, `cdp.evaluate` |
 | `debugger` permission | **no** | yes |
 | Host access | Google hosts only | `<all_urls>` |
 | Empty scope means | refuse (fail-closed) | allow (fail-open) |
 
 **flow-go uses the narrow one.** It needs cookies, a page token, a reCAPTCHA token
-and one in-page upscale call — all of which are named operations. Arbitrary CDP is a
+and the page-minted captcha — all of which are named operations. Arbitrary CDP is a
 debugging convenience, not a requirement, and the narrow extension is the one that
 cannot be talked into driving an unrelated site.
 
@@ -629,16 +623,15 @@ What used to need a loaded page, and what still does:
 | `at` and `f.sid` | avoidable — persisted, and the client primes for `at` without them |
 | Current cookies | not avoidable, but a snapshot or the cache carries them across processes |
 | Browser identity | not avoidable, but persisted (`data/fingerprint.json`) |
-| **Image upscale (`SPrCad`)** | **not avoidable** — the one call that has to be made by the page |
 
 So a run with no browser can create a project, list projects, read credits, upload,
 generate an image, generate a video, poll it, resolve it and download it. Verified:
 `acct-dd4c92d5-9b5.mp4`, `status: "ready"`, with `flow.captcha failed: no extension
 attached` in the log — the browser was not consulted.
 
-The one call that can *never* be made without a page is image upscaling, documented
-under "The image upscale runs in the browser, deliberately" — it is a stricter check
-on that RPC rather than a missing credential, and it is not the fingerprint.
+Nothing on this list needs a page any more. Upscaling was the last holdout and it
+has been removed — see "Upscaling — removed" for what it cost and why it could not
+be moved to the transport.
 
 Note that `ensureProjectTab` still runs before every generation and navigates a
 tab when a bridge is attached. It is now belt-and-braces rather than a
@@ -782,8 +775,6 @@ file:    output/acct-460ddc37-2e6.jpg   89864 bytes   1376x768 JPEG
 | **Image generation + download** (`/v1/images/generations`) | **works** |
 | **Video generation + download** (`/v1/videos/generations`) | **works** — text-to-video, first-frame-only, and first+last |
 | Media listed back out of the project | works |
-| **Image upscale** (`/v1/images/upscale`) | **works** — 1376x768 -> 2752x1536, verified with ffprobe |
-| **Video upscale** (`/v1/videos/upscale`) | **works** — 1280x720 -> 1920x1080, verified with ffprobe |
 
 No API key. No bearer token. No `aisandbox-pa.googleapis.com`.
 
@@ -991,245 +982,36 @@ credits: 11  (18 → 11, so a 4s 720p video costs 7)
 elapsed: 41.6s
 ```
 
-### Upscaling — solved
+### Upscaling — removed
 
-The media viewer's download menu is what gave this away — it offers **270p
-(Animated GIF)**, **720p (Original size)** and **1080p (Upscaled)**. (Images also
-offer 4K; this account's video menu does not.) Clicking 1080p captures the RPC:
-**`p0UkFb`**.
+Image and video upscaling were removed. Both worked; the reason for removing them
+is worth one paragraph each, because the shape of the work is not obvious from the
+absence of the code.
 
-```
-[[[ [null, "<content-id>"], null, 2, null,
-     [null, "<media-id>", null, null, "<uuid>"],
-     null, 2, null × 24,
-     "<upsampler-model>" ]],
- [null, 22, null, null, null, "<project-id>", null, null, null, null,
-  ["<recaptcha-token>", 1]],
- ["<call-uuid>"]]
-```
+**`SPrCad` (image, 2K / 4K) ran inside the attached tab.** The Go transport was
+rejected with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` even with the payload, the URL, the
+query parameters and both ids matching a request captured from the app itself,
+byte for byte — including the media id in position 0, a source path naming only
+the project, a timestamped captcha pair, and `bl` and `f.sid` present. So it was a
+client-level check, not a malformed request, and nothing the client could vary got
+past it. The browser was genuinely required.
 
-Four details in that payload are load-bearing, and every one of them was wrong in
-the first attempt:
+**`p0UkFb` (video, 1080p / 4K) ran over the transport** and needed no browser.
 
-| | Correct | First attempt |
-|---|---|---|
-| request array length | **32** (model at index 31) | 35 (model at 34) |
-| `request[0][1]` | the source asset's **content id** | a fresh uuid |
-| `request[2]` | `2` | `1` |
-| third top-level element | **`["<call-uuid>"]`** | absent |
+The full elimination is in git history —
+`git log --all --oneline -- '*upscale*'` — and is worth reading before anyone
+tries to bring the transport path back.
 
-The failure mode is what made this hard: with the wrong shape the server returns
-`200`, a well-formed empty result, and renders nothing. There is no error to
-notice. The model keys are `veo_3_1_upsampler_1080p` and `veo_3_1_upsampler_4k`.
+**One thing that outlived the feature and still matters:** an asset and its
+upscales share one media id, so a media-id lookup returns whichever row comes
+first. `ResolveContentID` has to pick by type code — `CAE` for the original — and
+`MediaDetail` still depends on that. The listing parser and the URL regex were both
+broken in ways that only showed up through the upscale path, and both are still
+covered by tests in `internal/batchexecute`.
 
-**The reply is a submission acknowledgement, not a result.** It carries no URL — it
-names the render it queued, `<content-id>_upsampled`. That id is then polled for in
-the project listing until it appears, and resolved to a URL like any other video.
-Reading that reply as "no output" is exactly what made this RPC look broken.
-
-Measured end to end with `ffprobe`:
-
-| | Width × Height |
-|---|---|
-| Original (720p) | 1280 × 720 |
-| `p0UkFb` 1080p | **1920 × 1080** |
-
-Unlike the image upscale, this one runs **over the Go transport** — no browser
-needed beyond the captcha broker.
-
-#### The project-listing parser was broken, and it hid the whole thing
-
-Worth recording because it caused a silent 7-minute timeout rather than an error.
-
-A listing row is:
-
-```
-[content-id, project-id, media-id, type-code, null, detail, ...]
-```
-
-The parser had two faults. It read the media id from `row[0]` (that is the
-*content* id) and the content id from `row[3][4]` (that is a string, `"CAE"` for an
-original or `"CAI"` for a derived asset). Worse, `findEntryList` *identified rows*
-by requiring `row[3]` to be an array — which no row is — so every listing parsed
-to **nothing at all**.
-
-The consequence was invisible: `waitForNewVideo` and `waitForUpscaledAsset` simply
-polled an empty list until their timeout, and the only symptom was a job that
-stayed `submitted`. Anything that resolves a media id to a URL was affected, since
-`ResolveVideoURL` reads the same listing.
-
-#### …and the URL regex could not match an upscaled asset
-
-Fixing the listing exposed a third fault. The signed-URL matcher captured the
-content id as exactly 36 hex-or-dash characters:
-
-```go
-`https://flow-content\.google/(image|video)/([0-9a-fA-F-]{36})\?[^"\\\s]*`
-```
-
-An upscaled asset's id is `451f2cef-…_upsampled` — 46 characters, with an
-underscore — so **no upscaled URL ever matched**, and `MediaDetail` kept reporting
-"still rendering". The fix allows the optional suffix:
-
-```go
-`https://flow-content\.google/(image|video)/([0-9a-fA-F-]{36}(?:_[a-z]+)?)\?[^"\\\s]*`
-```
-
-#### The last trap: an asset and its upscales share one media id
-
-With the URL resolving, the endpoint reported success and downloaded the **source**
-video — 1.9 MB at 720p. Both rows carry the same media id, so a media-id lookup
-returns whichever comes first, which is the original. The upscale has to be
-resolved by its own *content* id.
-
-That is three independent faults stacked on one feature, and none of them produced
-an error. The end-to-end result is now 1280×720 → **1920×1080** in about 8 seconds.
-
-### Image resolution — solved, and it is not a download-URL trick
-
-An image's download menu offers exactly three choices:
-
-```
-1K | Original size
-2K | Upscaled
-4K | Upscaled
-```
-
-The labels are literal. **1K is the size the asset already has** and needs no call
-at all; only the two "Upscaled" entries do anything.
-
-Clicking **2K** sends one RPC: **`SPrCad`**.
-
-```
-["<content-id>", <selector>, [null, 22, null, null, null, "<project-id>",
-                              null, null, null, null, ["<captcha>", 1]]]
-```
-
-**The response carries the image itself**, as base64 JPEG inside the frame — not a
-URL. That is the whole mechanism, and it explains two things that had looked
-contradictory: why no new project asset appears (nothing is re-created), and why
-the download is a `blob:` (the page decodes the base64 and saves it). There is no
-higher-resolution URL variant to request; the bytes arrive in the RPC response.
-
-Measured with `ffprobe`, on an image generated at 1376x768:
-
-| | Width x Height | Bytes |
-|---|---|---|
-| Original (the asset's own URL) | 1376 x 768 | 89,864 |
-| `SPrCad` selector `1` ("2K") | **2752 x 1536** | 315,871 |
-
-2752 = 1376 x 2 exactly.
-
-The selector is 1-based over the *upscaled* options, not an index over the menu:
-
-| Selector | Menu item | Result |
-|---|---|---|
-| `1` | 2K \| Upscaled | works — 2x the original |
-| `2` | 4K \| Upscaled | `PUBLIC_ERROR_MODEL_ACCESS_DENIED` — 4K is gated, this account has no entitlement |
-| `0` | never sent by the app | returns the same 2752x1536 image as `1` |
-
-Only 2K has been produced end to end. 4K is unverified beyond confirming it is
-refused for want of entitlement.
-
-`POST /v1/images/upscale` implements this. See below for why it runs in the page.
-
-#### Both upscales need the source's *content* id, and rows are not interchangeable
-
-A caller holds a media id — it is what a generation returns and what the editor
-URL carries — while `SPrCad` takes a **content id**. They are different values, so
-the upscale endpoints resolve the content id from the project listing when only a
-media id is given. (`as29s` takes the content id too — it was the *listing parser*
-that had the two swapped, not the RPC table. See "Which field is the content id
-depends on the listing shape" above.)
-
-That resolution has a trap. One media id can have **several rows**: the original
-and each derived asset share it. They are not interchangeable, and picking the
-wrong one fails silently:
-
-| Row for media `8e637e6c…` | Type code | `SPrCad` |
-|---|---|---|
-| `036d5a66-…` | `CAE` | works — returns the image |
-| `003fe030-…` | `CAI` | **no image data at all** |
-
-So the original is selected explicitly by its type code, `CAE`, rather than by
-taking the first row that matches. The meaning of the codes is inferred from
-behaviour, not documented: for the same media id, `SPrCad` answers the `CAE` row
-and returns nothing for the `CAI` one.
-
-### The image upscale runs in the browser, deliberately
-
-The Go transport **cannot** make this call. Sending the identical request from Go
-is rejected with `PUBLIC_ERROR_UNUSUAL_ACTIVITY` while the same captcha token and
-payload succeed from the page. That was established by elimination — each of the
-following was varied in turn and made no difference:
-
-- the `bl` build label (absent, present, and the browser's own value)
-- the `f.sid` session id
-- the `at` anti-CSRF token, including the page's own `SNlM0e`
-- the `source-path` shape
-- the header set, including a byte-for-byte replica of **every** header the
-  browser sends (`accept-encoding`, `priority`, `sec-ch-ua-*`, `x-browser-*`,
-  `x-client-data`), and separately with `Authorization` removed
-- the cookie jar (the same jar the browser produced)
-- HTTP/2 and HTTP/3
-
-The captcha token is not the problem: a token minted by this engine's own provider
-was replayed from the page and returned the image.
-
-The **TLS fingerprint** was the obvious next suspect and it is **not** the cause
-either — six profiles including a Firefox one, HTTP/3, and the browser's exact
-header order all produce the identical rejection. The full table is under "What is
-not done yet" below. Tellingly, the generation RPC over the same Go transport
-*does* succeed, so `SPrCad` applies a stricter client check than generation does.
-
-Confirmed again after the reCAPTCHA fix, because that fix changed exactly the kind
-of thing this list is about: the request now goes out under the browser's real
-identity — macOS Chrome 153, `sec-ch-ua` and all, echoed back in the response — and
-it is still rejected. `use_quic` makes no difference either. So this is not the
-fingerprint mismatch that was blocking the captcha, and it is not the transport
-version. It is a stricter check on this RPC specifically, and nothing the client
-can currently vary gets past it.
-
-So the request is made by the page, which is already required for the captcha
-broker. This is a real constraint, not a shortcut: **image upscaling needs the
-browser attached** — and as of the reCAPTCHA fix it is the *only* thing that does.
-The Go-side implementation is kept in `internal/batchexecute/client.go`
-(`UpscaleImage`) and is correct as far as the protocol goes, but it will be
-rejected until the transport can match whatever else this RPC checks.
 
 ### What is not done yet
 
-- **4K, on both kinds of asset.** The code path is wired (`Resolution4K`,
-  `UpscaleModel4K`) but cannot be exercised on this account: an image 4K upscale is
-  refused with `PUBLIC_ERROR_MODEL_ACCESS_DENIED`, and the video download menu does
-  not offer 4K at all. 4K is gated on a higher plan, so this is entitlement rather
-  than a missing RPC.
-- **The image upscale needs the browser attached.** `SPrCad` is rejected over the
-  Go transport while the identical call succeeds from the page. This is the only
-  place the Go transport is not sufficient, and it is a property of the RPC, not a
-  gap in the implementation: `p0UkFb` over the same transport works.
-
-  The obvious theory — that the transport's fingerprint is simply too old — was
-  tested and does **not** hold. Do not spend time advancing the TLS profile:
-
-  | Varied | Result |
-  |---|---|
-  | TLS profile: `chrome_152`, `chrome_144`, `chrome_133`, `chrome_120` | `UNUSUAL_ACTIVITY` |
-  | TLS profile: `firefox_135`, `firefox_120` — a *completely different* fingerprint | `UNUSUAL_ACTIVITY`, identical |
-  | HTTP/3 via `WithProtocolRacing` (the library's own h3, not Go's stdlib) | `UNUSUAL_ACTIVITY` |
-  | The browser's **exact** header order, plus its complete header set | `UNUSUAL_ACTIVITY` |
-
-  A rejection that does not move when the fingerprint changes by that much is not a
-  fingerprint check. Note also that `tls-client` ships no Chrome 153 profile —
-  `chrome_152` is its newest — but adjacent Chrome releases have effectively
-  identical ClientHellos, so there would be nothing to gain even if it did.
-
-  What remains is something in the transport this code does not control: the
-  frame-level details of a real Chrome connection, or a check that ties the
-  captcha assessment to the connection that minted it — which a different process
-  cannot satisfy by construction. `httpx.WithProfile` and
-  `httpx.WithProtocolRacing` are kept because they are how this was established,
-  and they are useful for any future fingerprint question.
 - **Aspect ratio and resolution.** The app's composer exposes them (16:9 / 9:16,
   360p / 720p, and an Image/Video and Frames/Ingredients toggle), so the UI
   mapping is known — the payload positions are not. Until they are, the endpoints
@@ -1331,7 +1113,7 @@ abra_i2v_*                              image to video, first frame only ← use
 omni_flash_i2v_8s_first_last_360p       image to video, first + last     ← used
 abra_r2v_*                              reference images
 abra_edit / abra_edit_360p              video edit
-veo_3_1_upsampler_1080p / _4k           upscalers                       ← used
+                                        (no upsampler keys — upscaling removed)
 ```
 
 **The engine selects from `abra_*` and `omni_flash_*` only.** The catalog also holds
@@ -1342,7 +1124,7 @@ and, for some, an aspect pair via a `_portrait` suffix. None of those are wired 
 and naming one outright is not a supported path. The only `veo_*` keys in use are
 the two upsamplers, which are a second pass rather than a generation model.
 
-**Resolution is the `_360p` suffix**, which is why the upscalers are separate keys
+**Resolution is the `_360p` suffix**, which is why the model keys carry it
 rather than a parameter.
 
 #### Aspect is decided by the model family; `_360p` is only resolution
@@ -1463,7 +1245,6 @@ image-to-video. Everything else is the `abra` family.
 | Image to video, first + last | **`omni_flash_i2v_*_first_last*`** | — |
 | Reference images | — | `abra_r2v_*` |
 | Video edit | — | `abra_edit` |
-| Upscaler | `omni_upsampler_360p` | — |
 
 **Nothing in this implementation uses a `veo` model.** Text-to-video is
 `abra_t2v_*` and image-to-video is `abra_i2v_*` / `omni_flash_i2v_*_first_last_*`.
@@ -1539,7 +1320,7 @@ checkout:
 | Video input (edit) | `videoInput.mediaId` + `startFrameIndex`/`endFrameIndex` | `abra_edit` |
 | Video model keys | `videoModelKey` | `abra_t2v_{4,6,8,10}s`, `abra_edit` |
 | Image models | — | `NARWHAL`, `HARBOR_SEAL`, `GEM_PIX_2` |
-| Cost | — | 4s=7, 6s=10, 8s=12, 10s=15 credits; 1080p upscale free, 4K=50 |
+| Cost | — | 4s=7, 6s=10, 8s=12, 10s=15 credits |
 
 That reference gives the **semantics** of every missing feature. It does not give the
 batchexecute wire format, which is positional and still needs a capture.
@@ -1630,7 +1411,7 @@ flow-go/
 │   ├── engine/                 orchestration
 │   ├── flowapi/                legacy aisandbox REST client
 │   ├── httpx/                  Chrome-impersonating transport
-│   ├── pool/                   worker pool (images, uploads, upscales)
+│   ├── pool/                   worker pool (images, uploads)
 │   ├── recaptcha/              reCAPTCHA Enterprise strategies
 │   ├── server/                 HTTP API
 │   └── store/                  SQLite persistence

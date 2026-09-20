@@ -43,7 +43,7 @@ This port inverts that. The browser supplies cookies; Go derives everything else
                                     ▼
    internal/auth       ── Labs session endpoint → access token, cached by jar hash
    internal/httpx      ── Chrome-impersonating transport (uTLS + HTTP/3 → HTTP/2)
-   internal/recaptcha  ── flow.captcha → broker → http → empty
+   internal/recaptcha  ── http → empty (flow.captcha and the broker are opt-in)
    internal/batchexecute ── the RPC transport the app actually uses
    internal/flowapi    ── legacy aisandbox REST, error classification, retry
    internal/pool       ── account routing, failover, circuit breaking

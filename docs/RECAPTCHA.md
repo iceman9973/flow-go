@@ -122,6 +122,19 @@ like a scoring problem, then like a user-agent problem, then like an account
 problem, because the evidence available (the CLI) was the one place the bug could
 not appear.
 
+### What this does not explain
+
+The failures at 08:46–08:48 were a **fresh process making one call**, so no cache
+was involved, and they still came back as an empty frame. Between those runs and the
+working ones the account, its cookies and its project all changed, and the old
+account's project listing had gone empty more than once.
+
+A generation against a project that is not on the account is accepted the same
+silent way, which is the likeliest explanation — but it is **untested**, and it is
+recorded here as a gap rather than folded into the story. The cache is a real bug
+and removing it is what made the server-side path work; those standalone failures
+have a separate cause that was never isolated.
+
 ### The fix
 
 `Token` now mints on every call. There is no cache, and no fields left to add one
@@ -155,7 +168,9 @@ And end to end, with `flow.captcha failed: no extension attached` in the log:
 
 ## Checklist: a generation came back empty
 
-Work down this list. The first three have each been the answer.
+Work down this list. The first and third have been the answer and were confirmed;
+the second is the likeliest explanation for a case that was never isolated, and is
+marked as such.
 
 1. **Was the token reused?** A cache, a retry, a batch, a stored token — anything
    that presents the same one twice. Check that `Token` is called per submission.

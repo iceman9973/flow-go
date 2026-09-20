@@ -7,9 +7,12 @@
 > bugs no longer exist.**
 >
 > **The code moved.** `internal/bridge/` and `internal/cdp/` are not in this module.
-> The bridge, the CDP client and the cookie jar live in the sibling `browser-Cdp`
-> project as `cdp-control/{bridge,cdp,cookiejar}` and are imported by a relative
-> `replace` in `go.mod`. Line numbers below refer to that code before it moved.
+> The bridge, the CDP client and the cookie jar live in the separate
+> [Browser-cdp](https://github.com/kodelyx/Browser-cdp) repo as
+> `cdp-control/{bridge,cdp,cookiejar}`, and this module requires it as
+> `github.com/kodelyx/Browser-cdp/cdp-control`. It used to be a relative `replace`
+> against a sibling checkout; it is now an ordinary dependency and needs no folder
+> beside this one. Line numbers below refer to that code before it moved.
 >
 > | Finding | Status |
 > |---|---|

@@ -65,10 +65,11 @@ otherwise. The browser identity is read once and persisted to
 1. Chrome, signed in to the Google account that has Flow access.
 2. **The Flow Go Bridge extension loaded** — `flow-go/flow-go-extension/`. That is
    the narrow one and the one this backend is built against: Flow hosts only, no
-   `debugger` permission, and a fixed list of operations. The generic
-   `../browser-Cdp/extension/` also works and is what you load when you need
-   `cdp.evaluate` for debugging, but it is a separate project and flow-go does not
-   require it. Both dial `ws://127.0.0.1:9222`.
+   `debugger` permission, and a fixed list of operations. The generic extension in
+   the [Browser-cdp](https://github.com/kodelyx/Browser-cdp) repo also works and is
+   what you load when you need `cdp.evaluate` for debugging, but it is a separate
+   project and flow-go does not require it — clone that repo anywhere and load its
+   `extension/` directory. Both dial `ws://127.0.0.1:9222`.
 3. `flow-go serve`.
 
 No Flow tab has to be open, and the extension can disconnect once the cookies have

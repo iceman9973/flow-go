@@ -1,5 +1,14 @@
 # Improvement prompt v2 — browser-Cdp / flow-go bridge
 
+> **Where the extension is now.** This prompt refers to the extension at
+> `../browser-Cdp/extension/`, which assumed a checkout beside this repo. The
+> code now lives in the [Browser-cdp](https://github.com/kodelyx/Browser-cdp)
+> repo and can be cloned anywhere; the relative paths below are kept as they
+> were written, because this is a record of a task that was already run.
+>
+> The Go half is no longer a sibling either — it is the module dependency
+> `github.com/kodelyx/Browser-cdp/cdp-control`.
+
 Revised 2026-09-18. Replaces v1, which went stale within minutes: v1's Problem 1
 (`blockedMethods` deny-list) and Problem 2's backend half were implemented by a concurrent
 session while v1 was being written. Evidence: `docs/BRIDGE-TOKEN-FINDINGS.md`.

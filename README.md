@@ -41,7 +41,8 @@ go build -o flow-go .
 
 # 2. Load flow-go-extension/ as an unpacked extension
 #    chrome://extensions -> Developer mode -> Load unpacked -> select flow-go-extension/
-#    (Optionally also load ../browser-Cdp/extension/ — see "The two extensions".)
+#    (Optionally also load the generic extension — clone github.com/kodelyx/Browser-cdp
+#     and load its extension/ directory; see "The two extensions".)
 
 # 3. Run
 ./flow-go serve
@@ -508,10 +509,10 @@ same signed-in user.
 They are **separate projects** and neither is a subset of the other. Loading both is
 fine and is the normal debugging setup.
 
-| | `flow-go-extension/` | `../browser-Cdp/extension/` |
+| | `flow-go-extension/` | `Browser-cdp/extension/` |
 | --- | --- | --- |
 | Chrome name | **Flow Go Bridge** | **browser-Cdp** |
-| Belongs to | this repo | the `browser-Cdp` project |
+| Belongs to | this repo | the [Browser-cdp](https://github.com/kodelyx/Browser-cdp) repo |
 | Surface | a fixed list of Flow operations (`flow.at`, `flow.captcha`, …) | arbitrary CDP: `cdp.call`, `cdp.evaluate` |
 | `debugger` permission | **no** | yes |
 | Host access | Google hosts only | `<all_urls>` |
@@ -1430,8 +1431,17 @@ flow-go/
 ```
 
 Not in this module: `cdp-control/{bridge,cdp,cookiejar}` and the generic
-`browser-Cdp/extension/`. Both belong to the sibling `browser-Cdp` project and are
-consumed through a relative `replace` in `go.mod`.
+`Browser-cdp/extension/`. Both belong to the separate
+[Browser-cdp](https://github.com/kodelyx/Browser-cdp) project.
+
+The Go half is an ordinary module dependency —
+`github.com/kodelyx/Browser-cdp/cdp-control`, required at a revision, with no
+`replace` and no sibling checkout. It used to be a relative `replace`, which meant
+this repository only built when that checkout happened to sit beside it; the module
+declared a path that matched no repository, so there was no other way to reach it.
+
+The extension is loaded from a checkout of that repo. It does not have to be beside
+this one — any directory will do — and this module does not need it at all.
 
 ## Responsible use
 

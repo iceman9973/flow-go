@@ -8,9 +8,11 @@
 > is against the actual shipped code rather than a spec document.
 >
 > **Path note.** The backend side audited here was `flow-go/internal/{cdp,bridge}` at the
-> time. It has since moved out of this module into the sibling `browser-Cdp` project, and
-> is imported by a relative `replace` in `go.mod`. The findings are unchanged; only the
-> paths are.
+> time. It has since moved out of this module into the separate
+> [Browser-cdp](https://github.com/kodelyx/Browser-cdp) repo, where it is
+> `cdp-control/{cdp,bridge}`, and this module requires it as
+> `github.com/kodelyx/Browser-cdp/cdp-control`. The findings are unchanged; only the
+> paths are, and the relative `replace` this note used to describe is gone.
 >
 > **Two extensions, not one.** This audits the **generic** one
 > (`browser-Cdp/extension/`, `chrome.debugger`, `<all_urls>`). flow-go also ships its own

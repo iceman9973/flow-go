@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Flow Go Bridge",
   "version": "1.0.0",
-  "description": "Flow-specific browser bridge for the flow-go backend. Supplies the cookies, identity, reCAPTCHA token and in-page upscale it needs — and nothing else.",
+  "description": "Flow-specific browser bridge for the flow-go backend. Supplies the cookies and the browser identity it needs — and, when asked, the page's own reCAPTCHA token.",
   "minimum_chrome_version": "116",
   "permissions": [
     "tabs",

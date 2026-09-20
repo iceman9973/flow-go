@@ -518,8 +518,10 @@ fine and is the normal debugging setup.
 | Host access | Google hosts only | `<all_urls>` |
 | Empty scope means | refuse (fail-closed) | allow (fail-open) |
 
-**flow-go uses the narrow one.** It needs cookies, a page token, a reCAPTCHA token
-and the page-minted captcha — all of which are named operations. Arbitrary CDP is a
+**flow-go uses the narrow one, and for less than it used to.** What it asks for now is
+cookies, the browser identity and the page tokens — all named operations. The page's
+own reCAPTCHA token is still available and is used when `--captcha broker` is set, but
+the default mints over the transport and never asks for it. Arbitrary CDP is a
 debugging convenience, not a requirement, and the narrow extension is the one that
 cannot be talked into driving an unrelated site.
 

@@ -164,6 +164,45 @@ And end to end, with `flow.captcha failed: no extension attached` in the log:
 | video, server | `status: **ready**`, 28.7s, 4 credits |
 | image, standalone CLI, no server and no bridge | `status: succeeded`, 26.7s |
 
+### The second single-use trap: the retry
+
+The cache was not the only way to present a token twice. `post` has two paths that
+send a request more than once, and **both resent the payload they were handed** —
+which has the token baked into it:
+
+- **the priming handshake.** The first attempt to a fresh process is answered `400`
+  with an anti-CSRF token, and the second attempt echoes it. Two requests, one
+  payload, one token.
+- **the session refresh.** A `401` runs the installed refresher and repeats the
+  priming sequence. Same shape, hit less often.
+
+The first one is why **the first generation after every restart produced nothing**.
+The seeded `at` is stale by the time the process boots, so the first call always
+primed — and always spent its single-use token on the attempt that primed. It read
+as flakiness because it was intermittent in the only way that mattered: it happened
+once per boot, then stopped.
+
+This is the same failure signature as the cache and it was fixed separately, so if
+you are reading this because a generation came back empty, **check both**. A retry
+that carries a token is the one that is easy to miss, because the retry is in the
+transport and the token is in the payload.
+
+`post` now takes a builder rather than a built envelope, and `call` has two forms:
+`CallWith` for a payload that does not change, and the builder form for one that
+does. Every attempt after the first asks `CallOptions.RefreshCaptcha` for a fresh
+token and rebuilds the payload with it. A refresher that fails fails the call rather
+than falling back to the spent token — a silent retry with a dead token is worse than
+an error, because there is nothing to read.
+
+```go
+envelopeJSON, err := envelope(ctx, sent > 0)   // sent > 0 means "this is a retry"
+```
+
+The five captcha-carrying requests have `withCaptcha` setters, and each engine call
+site wires the refresher to the action that matches: `ActionVideo` for video,
+`ActionImage` for upload and image generation. **The action has to match** — a token
+minted for the wrong action is rejected, which is the same silent empty frame.
+
 ---
 
 ## Checklist: a generation came back empty
@@ -172,9 +211,12 @@ Work down this list. The first and third have been the answer and were confirmed
 the second is the likeliest explanation for a case that was never isolated, and is
 marked as such.
 
-1. **Was the token reused?** A cache, a retry, a batch, a stored token — anything
-   that presents the same one twice. Check that `Token` is called per submission.
-   *This is the one that cost hours.*
+1. **Was the token presented twice?** A cache, a retry, a batch, a stored token —
+   anything that sends the same one twice. Two distinct mechanisms have caused this
+   and both are fixed: `Token` caching for two minutes, and the transport resending
+   a payload on a retry. Check that `Token` is called per submission **and** that a
+   captcha-carrying call has `RefreshCaptcha` set.
+   *This is the one that cost hours, twice.*
 2. **Does the project exist on the account in use?** Generating into a project that
    is not there is accepted the same silent way. Confirm with `flow-go projects`,
    and remember the account is whichever the jar holds.
@@ -203,6 +245,13 @@ engine: generated 1 image(s) in 25.7s
   roughly 2300–2500.
 - `provider http failed: …` followed by another provider — the transport could not
   mint and something else answered. Read the error.
+- `batchexecute: <rpc> primed; retrying` — the priming handshake fired and the retry
+  went out. **This is normal on the first call after a boot.** When the call carries
+  a captcha, the retry has rebuilt its payload with a freshly minted token — that is
+  the fix, and this is the line that says the retry path was taken.
+- `batchexecute: <rpc> returned 401; refreshing the session and retrying` — the
+  session expired and the refresher ran. If this repeats on every call the cookies
+  are not being replaced; reload the extension.
 
 ---
 
@@ -252,10 +301,24 @@ on the second call"**. A cache passes the first assertion and fails the second.
 | `TestBrokerModeOptsIntoThePage` | the page path stays reachable, and in the order that works |
 | `TestOriginParameterMatchesTheOrigin` | `co` stays derived from the origin |
 
+`internal/batchexecute/captcha_retry_test.go` covers the other half — the retry that
+used to resend a spent token. `Origin` is a `var` there for the same reason
+`recaptchaBase` is: the priming handshake is driven against an `httptest.Server`
+rather than against Google.
+
+| Test | Guards |
+| --- | --- |
+| `TestARetryCarriesAFreshCaptchaToken` | the retry rebuilds the payload, and mints exactly once |
+| `TestWithoutARefresherTheRetryResendsTheToken` | the old behaviour, pinned — a captcha-carrying call with no refresher still resends |
+| `TestTheRefresherIsOfferedToEveryRetry` | a builder that ignores its token produces the same payload, so offering the refresher unconditionally is safe |
+| `TestAFailingRefresherFailsTheCall` | a failed mint fails the call instead of retrying with a dead token, and the retry does not go out |
+
 ### Verify the tests have teeth
 
-A test for a silent bug must be shown to fail. Temporarily reintroduce a cache in
-`Token` and run them:
+A test for a silent bug must be shown to fail. Both suites were checked this way;
+do the same if you change either.
+
+**The cache** — temporarily reintroduce one in `Token` and run them:
 
 ```
 --- FAIL: TestTokenMintsFreshOnEveryCall
@@ -266,7 +329,23 @@ A test for a silent bug must be shown to fail. Temporarily reintroduce a cache i
     call 2 repeated a token
 ```
 
-If they pass with the cache restored, they are not testing anything.
+**The retry** — change `envelope(ctx, sent > 0)` to `envelope(ctx, false)` in
+`post`. Three of the four fail; the fourth passes either way by design, because it
+pins the fallback:
+
+```
+2026/09/21 10:30:53 batchexecute: UpteDb primed; retrying
+--- FAIL: TestARetryCarriesAFreshCaptchaToken
+    the retry resent the payload it was given, captcha token and all. A reCAPTCHA
+    token is single-use, so the server answers an empty frame rather than an error
+    and the generation silently produces nothing
+--- FAIL: TestTheRefresherIsOfferedToEveryRetry
+    the refresher ran 0 times, want 1 — once, for the retry
+--- FAIL: TestAFailingRefresherFailsTheCall
+    a failing refresher should fail the call, not resend the spent token
+```
+
+If they pass with either bug restored, they are not testing anything.
 
 ---
 

@@ -869,6 +869,12 @@ func (c *Client) post(ctx context.Context, rpcID string,
 			if attempt == 1 {
 				if token := extractXSRF(resp.Text()); token != "" {
 					c.setToken(token)
+					// Worth a line: this resend is the path that used to
+					// present a spent captcha token, and the symptom it
+					// produced was a generation that quietly did nothing. The
+					// retry rebuilds its payload, so a call that carries a
+					// captcha is minting a fresh one here.
+					log.Printf("batchexecute: %s primed; retrying", rpcID)
 					continue
 				}
 			}

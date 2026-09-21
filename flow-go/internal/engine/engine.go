@@ -785,7 +785,10 @@ func (e *Engine) CreateProject(ctx context.Context, label string) (batchexecute.
 // a later revision told them to attach the extension so the page could mint a
 // token. Both were wrong, and the second was actively misleading: the transport
 // mints a perfectly good token, and the thing that made it look broken was that
-// the provider reused one.
+// the token was presented twice — once by a cache in the provider, and once by a
+// retry in the transport that resent a payload with the token already inside it.
+// Both are fixed, and the hint names both so the next person does not have to
+// rediscover the class.
 //
 // An empty frame means Flow accepted the request and did nothing, so the causes
 // are all of that shape — something about the request was understood and
@@ -801,11 +804,15 @@ func (e *Engine) emptySubmissionHint() string {
 	}
 
 	// Ordered by how often each has been the answer.
-	return fmt.Sprintf("The reCAPTCHA token came from %q. A token is single-use, so a "+
-		"reused or cached one produces exactly this — Flow verifies it once and answers "+
-		"an empty frame on every later call. Check next that the project exists on the "+
-		"account in use: generating into a project that is not there is accepted the same "+
-		"silent way. Only then suspect the model key and the RPC it went to.", name)
+	return fmt.Sprintf("The reCAPTCHA token came from %q. A token is single-use, so one "+
+		"presented twice produces exactly this — Flow verifies it once and answers an "+
+		"empty frame on every later call. That has happened two ways: a cache in the "+
+		"provider, and a retry that resent a payload with the token already inside it. "+
+		"Both are fixed, so if this is a token problem it is a new one of the same "+
+		"shape: something is handing out or resending a token it has already used. "+
+		"Check next that the project exists on the account in use: generating into a "+
+		"project that is not there is accepted the same silent way. Only then suspect "+
+		"the model key and the RPC it went to.", name)
 }
 
 // CaptchaToken obtains a fresh reCAPTCHA token for the given action.

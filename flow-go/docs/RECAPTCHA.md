@@ -33,9 +33,12 @@ This is the shape of almost every problem in this area:
 ```
 engine: nothing submitted for abra_t2v_4s_360p — it costs 4 credits at 360p and the
 account has 31, which was checked and covers it; so the balance is not the cause.
-The reCAPTCHA token came from "http". A token is single-use, so a reused or cached
-one produces exactly this — Flow verifies it once and answers an empty frame on
-every later call. ...
+The reCAPTCHA token came from "http". A token is single-use, so one presented twice
+produces exactly this — Flow verifies it once and answers an empty frame on every
+later call. That has happened two ways: a cache in the provider, and a retry that
+resent a payload with the token already inside it. Both are fixed, so if this is a
+token problem it is a new one of the same shape: something is handing out or
+resending a token it has already used. ...
 ```
 
 The response is:

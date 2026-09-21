@@ -246,6 +246,13 @@ recaptcha: token acquired via http (2361 chars)
 engine: generated 1 image(s) in 25.7s
 ```
 
+**`ready` does not mean the session works.** A stale cookie jar bootstraps fine — the
+engine reads the cookies off disk, marks itself ready, and every upstream call then
+answers `401`. Seen live: `/health` reported `ready: true, status: ok` while
+`/v1/credits` was `502`, `/v1/projects` was `502`, and an image request failed with
+`engine: no project id resolved` — there was no project because the listing that
+would supply one was refused. Do not read `ready` as healthy; read the calls.
+
 - `captcha chain(http,empty)` — server-side. **This is the default and it is what
   you want.**
 - `captcha chain(flow.captcha,broker,http,empty)` — `--captcha broker`; the browser

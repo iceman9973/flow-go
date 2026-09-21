@@ -2351,6 +2351,9 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		StartFrame:   req.StartFrame,
 		EndFrame:     req.EndFrame,
 	}, batchexecute.CallOptions{
+		RefreshCaptcha: func(ctx context.Context) (string, error) {
+			return e.CaptchaToken(ctx, recaptcha.ActionVideo)
+		},
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
 	})
@@ -2549,6 +2552,9 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 		Model:        model,
 		CaptchaToken: captcha,
 	}, batchexecute.CallOptions{
+		RefreshCaptcha: func(ctx context.Context) (string, error) {
+			return e.CaptchaToken(ctx, recaptcha.ActionVideo)
+		},
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
 	})
@@ -2697,6 +2703,9 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 		References:   refs,
 		CaptchaToken: captcha,
 	}, batchexecute.CallOptions{
+		RefreshCaptcha: func(ctx context.Context) (string, error) {
+			return e.CaptchaToken(ctx, recaptcha.ActionVideo)
+		},
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
 	})
@@ -2793,6 +2802,10 @@ func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType,
 		MimeType:     mimeType,
 		FileName:     fileName,
 		CaptchaToken: captcha,
+	}, batchexecute.CallOptions{
+		RefreshCaptcha: func(ctx context.Context) (string, error) {
+			return e.CaptchaToken(ctx, recaptcha.ActionImage)
+		},
 	})
 	if err != nil {
 		return "", "", err
@@ -3194,6 +3207,9 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Prompt:       req.Prompt,
 		CaptchaToken: captcha,
 	}, batchexecute.CallOptions{
+		RefreshCaptcha: func(ctx context.Context) (string, error) {
+			return e.CaptchaToken(ctx, recaptcha.ActionImage)
+		},
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
 	})

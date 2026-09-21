@@ -43,7 +43,11 @@ import (
 const EndpointPath = "/_/AiSandboxAngularFrontend/data/batchexecute"
 
 // Origin is the host the RPC is served from and bound to.
-const Origin = "https://flow.google.com"
+// Origin is a var rather than a const so a test can point the client at a local
+// server. Without that, exercising the priming handshake means talking to
+// Google — which is neither hermetic nor free, and the handshake is exactly
+// where a retry can resend something it should not.
+var Origin = "https://flow.google.com"
 
 // RPCIDProjectList returns the account's projects.
 //
@@ -664,6 +668,23 @@ type CallOptions struct {
 	// a submission's shape to its RPC is what several models hinge on, so it has
 	// to be overridable to test one against another.
 	RPCID string
+	// RefreshCaptcha re-mints the captcha token a payload carries.
+	//
+	// **A reCAPTCHA token is single-use**, so a retry that resends the previous
+	// payload presents a spent one — and the server answers an empty frame
+	// rather than an error, which is why this was invisible for so long. When
+	// this is set, every attempt after the first asks for a fresh token and
+	// rebuilds the payload with it.
+	//
+	// It matters on two paths, not one. The priming handshake resends when the
+	// server answers with an anti-CSRF token, and a session refresh resends
+	// after a 401. Both went out with the token the first attempt had already
+	// spent. The second is rare; the first happens on every boot, because the
+	// seeded `at` is stale by then — so the first generation after a restart
+	// failed, every time.
+	//
+	// Nil means "this call carries no captcha", and a resend is safe.
+	RefreshCaptcha func(ctx context.Context) (string, error)
 }
 
 // Call issues one RPC and returns its frames.
@@ -676,27 +697,64 @@ func (c *Client) Call(ctx context.Context, rpcID string, payload any) ([]Frame, 
 }
 
 // CallWith is Call with the app's request parameters supplied explicitly.
+// CallWith performs a call whose payload does not change between attempts.
+//
+// A call that carries a captcha token must use the builder form instead — see
+// call — because a reCAPTCHA token is single-use and a resend presents a spent
+// one.
 func (c *Client) CallWith(ctx context.Context, rpcID string, payload any, opts CallOptions) ([]Frame, error) {
+	return c.call(ctx, rpcID, opts, func(string) (any, error) { return payload, nil })
+}
+
+// call performs one batchexecute call, building the payload per attempt.
+//
+// build receives the captcha token to use: empty means "the one you already
+// have", and a non-empty value is a freshly minted replacement. That is what
+// makes a retry safe. The priming handshake resends when the server answers with
+// an anti-CSRF token, and a session refresh resends after a 401 — and both used
+// to go out with the token the first attempt had already spent, which the server
+// answers with an empty frame rather than an error.
+func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
+	build func(token string) (any, error)) ([]Frame, error) {
 	auth, err := c.Authorization()
 	if err != nil {
 		return nil, err
 	}
 
-	arg := "[]"
-	if payload != nil {
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("batchexecute: could not encode the payload: %w", err)
-		}
-		arg = string(encoded)
-	}
-
 	// The envelope is [[[rpcid, "<args>", null, "generic"]]]. The arguments are a
 	// string, not an object — that nesting is part of the protocol.
-	envelope := [][][]any{{{rpcID, arg, nil, "generic"}}}
-	envelopeJSON, err := json.Marshal(envelope)
-	if err != nil {
-		return nil, fmt.Errorf("batchexecute: could not encode the envelope: %w", err)
+	envelopeFor := func(ctx context.Context, retry bool) (string, error) {
+		token := ""
+		if retry && opts.RefreshCaptcha != nil {
+			fresh, err := opts.RefreshCaptcha(ctx)
+			if err != nil {
+				return "", fmt.Errorf(
+					"batchexecute: %s is retrying and could not obtain a fresh captcha token: %w",
+					rpcID, err)
+			}
+			token = fresh
+		}
+
+		payload, err := build(token)
+		if err != nil {
+			return "", err
+		}
+
+		arg := "[]"
+		if payload != nil {
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				return "", fmt.Errorf("batchexecute: could not encode the payload: %w", err)
+			}
+			arg = string(encoded)
+		}
+
+		envelope := [][][]any{{{rpcID, arg, nil, "generic"}}}
+		out, err := json.Marshal(envelope)
+		if err != nil {
+			return "", fmt.Errorf("batchexecute: could not encode the envelope: %w", err)
+		}
+		return string(out), nil
 	}
 
 	reqID := atomic.AddInt64(&c.reqs, 1)*100000 + 1000
@@ -719,7 +777,7 @@ func (c *Client) CallWith(ctx context.Context, rpcID string, payload any, opts C
 		query.Set("f.sid", sid)
 	}
 
-	resp, err := c.post(ctx, rpcID, string(envelopeJSON), query.Encode(), auth)
+	resp, err := c.post(ctx, rpcID, envelopeFor, query.Encode(), auth)
 	if err != nil {
 		return nil, err
 	}
@@ -755,14 +813,27 @@ func (c *Client) SetUnauthorizedHandler(fn UnauthorizedHandler) {
 //
 // Both are bounded: at most two priming sequences, so four requests, and the
 // refresh is attempted at most once per call.
-func (c *Client) post(ctx context.Context, rpcID, envelopeJSON, rawQuery, auth string) (*httpx.Response, error) {
+func (c *Client) post(ctx context.Context, rpcID string,
+	envelope func(ctx context.Context, retry bool) (string, error),
+	rawQuery, auth string) (*httpx.Response, error) {
 	fullURL := c.endpointURL(rawQuery)
 	headers := c.requestHeaders(auth)
+
+	// sent counts every request this call has made, across both retry paths, so
+	// the builder knows whether it is building the first payload or rebuilding
+	// one whose single-use token has already been spent.
+	sent := 0
 
 	// send runs the priming sequence: the first attempt usually comes back 400
 	// carrying the anti-CSRF token, which the second echoes back.
 	send := func() (*httpx.Response, error) {
 		for attempt := 1; attempt <= 2; attempt++ {
+			envelopeJSON, err := envelope(ctx, sent > 0)
+			if err != nil {
+				return nil, err
+			}
+			sent++
+
 			body := url.Values{}
 			body.Set("f.req", envelopeJSON)
 			if token := c.Token(); token != "" {
@@ -932,13 +1003,13 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, opts CallOpt
 		seed = time.Now().UnixNano() % 1000000000
 	}
 
-	arg := buildGenerateArgument(req, seed)
-
 	if opts.SourcePath == "" {
 		opts.SourcePath = "/project/" + req.ProjectID
 	}
 
-	return c.CallWith(ctx, RPCIDGenerate, arg, opts)
+	return c.call(ctx, RPCIDGenerate, opts, func(token string) (any, error) {
+		return buildGenerateArgument(req.withCaptcha(token), seed), nil
+	})
 }
 
 // GenerateMedia submits a generation and returns the assets it produced.
@@ -1536,7 +1607,7 @@ type UploadMediaRequest struct {
 //
 // The response carries the ids in its first row: [content-id, project,
 // media-id, "CAE", ...]. The media id is the third element.
-func (c *Client) UploadMedia(ctx context.Context, req UploadMediaRequest) (mediaID, contentID string, err error) {
+func (c *Client) UploadMedia(ctx context.Context, req UploadMediaRequest, opts CallOptions) (mediaID, contentID string, err error) {
 	if req.ProjectID == "" {
 		return "", "", fmt.Errorf("batchexecute: a project id is required")
 	}
@@ -1550,23 +1621,25 @@ func (c *Client) UploadMedia(ctx context.Context, req UploadMediaRequest) (media
 		return "", "", fmt.Errorf("batchexecute: a reCAPTCHA token is required")
 	}
 
-	arg := []any{
-		[]any{
-			nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
-			[]any{req.CaptchaToken, 1},
-		},
-		base64.StdEncoding.EncodeToString(req.Data),
-		req.MimeType,
-		1,
-		nil, nil, nil, nil,
-		req.FileName,
-		nil,
-		uuid.NewString(),
-		uuid.NewString(),
+	if opts.SourcePath == "" {
+		opts.SourcePath = "/project/" + req.ProjectID
 	}
 
-	frames, err := c.CallWith(ctx, RPCIDUploadMedia, arg, CallOptions{
-		SourcePath: "/project/" + req.ProjectID,
+	frames, err := c.call(ctx, RPCIDUploadMedia, opts, func(token string) (any, error) {
+		return []any{
+			[]any{
+				nil, toolContextID, nil, nil, nil, req.ProjectID, nil, nil, nil, nil,
+				[]any{req.withCaptcha(token).CaptchaToken, 1},
+			},
+			base64.StdEncoding.EncodeToString(req.Data),
+			req.MimeType,
+			1,
+			nil, nil, nil, nil,
+			req.FileName,
+			nil,
+			uuid.NewString(),
+			uuid.NewString(),
+		}, nil
 	})
 	if err != nil {
 		return "", "", err
@@ -1659,8 +1732,6 @@ func (c *Client) GenerateVideo(ctx context.Context, req GenerateVideoRequest, op
 		count = 1
 	}
 
-	arg := buildVideoArgument(req)
-
 	if opts.SourcePath == "" {
 		opts.SourcePath = "/project/" + req.ProjectID
 	}
@@ -1672,7 +1743,9 @@ func (c *Client) GenerateVideo(ctx context.Context, req GenerateVideoRequest, op
 	if opts.RPCID != "" {
 		rpcID = opts.RPCID
 	}
-	return c.CallWith(ctx, rpcID, arg, opts)
+	return c.call(ctx, rpcID, opts, func(token string) (any, error) {
+		return buildVideoArgument(req.withCaptcha(token)), nil
+	})
 }
 
 // EditVideoRequest describes a video edit submission.
@@ -1759,8 +1832,6 @@ func (c *Client) GenerateVideoEdit(ctx context.Context, req EditVideoRequest, op
 		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
 	}
 
-	arg := buildEditArgument(req)
-
 	if opts.SourcePath == "" {
 		opts.SourcePath = "/project/" + req.ProjectID
 	}
@@ -1768,7 +1839,9 @@ func (c *Client) GenerateVideoEdit(ctx context.Context, req EditVideoRequest, op
 	if opts.RPCID != "" {
 		rpcID = opts.RPCID
 	}
-	return c.CallWith(ctx, rpcID, arg, opts)
+	return c.call(ctx, rpcID, opts, func(token string) (any, error) {
+		return buildEditArgument(req.withCaptcha(token)), nil
+	})
 }
 
 // referenceTail is the value the app puts at request[0][0][10] of a
@@ -1795,6 +1868,52 @@ type ReferenceVideoRequest struct {
 	Count int
 	// CaptchaToken is a reCAPTCHA token, minted for the VIDEO_GENERATION action.
 	CaptchaToken string
+}
+
+/* ------------------------------------------------------------------ *
+ * Replacing a spent captcha token
+ * ------------------------------------------------------------------ */
+
+// Each request that carries a reCAPTCHA token gets a withCaptcha method rather
+// than a shared generic: the method returns the caller's own type, which one
+// interface cannot do, and it keeps the replacement beside the field it replaces.
+//
+// An empty token means "keep the one already there", so a caller with no
+// refresher configured behaves exactly as it did before.
+
+func (r GenerateRequest) withCaptcha(token string) GenerateRequest {
+	if token != "" {
+		r.CaptchaToken = token
+	}
+	return r
+}
+
+func (r UploadMediaRequest) withCaptcha(token string) UploadMediaRequest {
+	if token != "" {
+		r.CaptchaToken = token
+	}
+	return r
+}
+
+func (r GenerateVideoRequest) withCaptcha(token string) GenerateVideoRequest {
+	if token != "" {
+		r.CaptchaToken = token
+	}
+	return r
+}
+
+func (r EditVideoRequest) withCaptcha(token string) EditVideoRequest {
+	if token != "" {
+		r.CaptchaToken = token
+	}
+	return r
+}
+
+func (r ReferenceVideoRequest) withCaptcha(token string) ReferenceVideoRequest {
+	if token != "" {
+		r.CaptchaToken = token
+	}
+	return r
 }
 
 // buildReferenceArgument assembles the reference-image payload.
@@ -1876,8 +1995,6 @@ func (c *Client) GenerateVideoFromReferences(ctx context.Context, req ReferenceV
 		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
 	}
 
-	arg := buildReferenceArgument(req)
-
 	if opts.SourcePath == "" {
 		opts.SourcePath = "/project/" + req.ProjectID
 	}
@@ -1885,7 +2002,9 @@ func (c *Client) GenerateVideoFromReferences(ctx context.Context, req ReferenceV
 	if opts.RPCID != "" {
 		rpcID = opts.RPCID
 	}
-	return c.CallWith(ctx, rpcID, arg, opts)
+	return c.call(ctx, rpcID, opts, func(token string) (any, error) {
+		return buildReferenceArgument(req.withCaptcha(token)), nil
+	})
 }
 
 // VideoRPCID picks the RPC a video submission goes to from its conditioning.

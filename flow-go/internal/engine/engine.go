@@ -826,6 +826,33 @@ func (e *Engine) CaptchaToken(ctx context.Context, action string) (string, error
 	return provider.Token(ctx, action)
 }
 
+// captchaOptions adds the captcha refresher to a captcha-carrying call.
+//
+// The refresher is set here and nowhere else, and that is the point. A token is
+// single-use, so a retry that resends the payload presents a spent one and Flow
+// answers an empty frame rather than an error — no status to check, no message to
+// read, and the only symptom a generation that quietly did nothing. That is what
+// happened twice, once through a cache and once through a retry, and it cost hours
+// both times because nothing said so.
+//
+// So a captcha-carrying call does not hand-build its options. It passes them
+// through here, and the refresher is present by construction. A new call site that
+// builds batchexecute.CallOptions by hand now stands out against its neighbours
+// rather than looking like the other four.
+//
+// The caller keeps control of the rest: the four generation calls set a source path
+// and a build label, and the upload sets neither. Folding those into the helper
+// would have changed what the upload sends, which is not this refactor's business.
+//
+// The action must match the payload's: a token minted for the wrong action is
+// rejected, and rejected the same silent way.
+func (e *Engine) captchaOptions(action string, opts batchexecute.CallOptions) batchexecute.CallOptions {
+	opts.RefreshCaptcha = func(ctx context.Context) (string, error) {
+		return e.CaptchaToken(ctx, action)
+	}
+	return opts
+}
+
 /* ------------------------------------------------------------------ *
  * Bootstrap
  * ------------------------------------------------------------------ */
@@ -2357,13 +2384,10 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		EndImage:     endImage,
 		StartFrame:   req.StartFrame,
 		EndFrame:     req.EndFrame,
-	}, batchexecute.CallOptions{
-		RefreshCaptcha: func(ctx context.Context) (string, error) {
-			return e.CaptchaToken(ctx, recaptcha.ActionVideo)
-		},
+	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
-	})
+	}))
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
@@ -2558,13 +2582,10 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 		Prompt:       req.Prompt,
 		Model:        model,
 		CaptchaToken: captcha,
-	}, batchexecute.CallOptions{
-		RefreshCaptcha: func(ctx context.Context) (string, error) {
-			return e.CaptchaToken(ctx, recaptcha.ActionVideo)
-		},
+	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
-	})
+	}))
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
@@ -2709,13 +2730,10 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 		Prompt:       req.Prompt,
 		References:   refs,
 		CaptchaToken: captcha,
-	}, batchexecute.CallOptions{
-		RefreshCaptcha: func(ctx context.Context) (string, error) {
-			return e.CaptchaToken(ctx, recaptcha.ActionVideo)
-		},
+	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
-	})
+	}))
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
@@ -2809,11 +2827,7 @@ func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType,
 		MimeType:     mimeType,
 		FileName:     fileName,
 		CaptchaToken: captcha,
-	}, batchexecute.CallOptions{
-		RefreshCaptcha: func(ctx context.Context) (string, error) {
-			return e.CaptchaToken(ctx, recaptcha.ActionImage)
-		},
-	})
+	}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{}))
 	if err != nil {
 		return "", "", err
 	}
@@ -3213,13 +3227,10 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Model:        model,
 		Prompt:       req.Prompt,
 		CaptchaToken: captcha,
-	}, batchexecute.CallOptions{
-		RefreshCaptcha: func(ctx context.Context) (string, error) {
-			return e.CaptchaToken(ctx, recaptcha.ActionImage)
-		},
+	}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
-	})
+	}))
 	if err != nil {
 		e.finishJob(jobID, "failed", nil, start, err)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())

@@ -202,9 +202,15 @@ envelopeJSON, err := envelope(ctx, sent > 0)   // sent > 0 means "this is a retr
 ```
 
 The five captcha-carrying requests have `withCaptcha` setters, and each engine call
-site wires the refresher to the action that matches: `ActionVideo` for video,
-`ActionImage` for upload and image generation. **The action has to match** — a token
-minted for the wrong action is rejected, which is the same silent empty frame.
+site routes its options through `Engine.captchaOptions(action, opts)`, which sets the
+refresher and nothing else. **The action has to match** — `ActionVideo` for video,
+`ActionImage` for upload and image generation — because a token minted for the wrong
+action is rejected, the same silent way.
+
+The helper exists so a sixth captcha-carrying call cannot forget the refresher. It
+used to be five hand-copied closures; now there is one assignment in the package, and
+a call site that hand-builds `batchexecute.CallOptions` stands out against its
+neighbours. `internal/engine/captcha_options_test.go` pins it.
 
 ---
 

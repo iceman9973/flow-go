@@ -1058,6 +1058,12 @@ func (c *Client) GenerateMedia(ctx context.Context, req GenerateRequest, opts Ca
 // credits on a genuine failure. And it does not turn an empty retry into an
 // error — the empty frames are returned as they are, so the caller reports what
 // actually happened rather than something invented here.
+//
+// A mint *failure* is a different thing, and is returned. The empty response is
+// what an upstream refusal looks like, so passing it back without the reason
+// that explains it is how "nothing came back" became a symptom with no cause
+// attached. A provider that is deliberately off never reaches here: it answers
+// with an empty token and no error, and such a call carries no refresher at all.
 func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	empty func([]Frame) bool,
 	submit func(token string) ([]Frame, error)) ([]Frame, error) {
@@ -1068,9 +1074,11 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 
 	token, err := opts.RefreshCaptcha(ctx)
 	if err != nil {
-		log.Printf("batchexecute: nothing came back and a fresh captcha token could not "+
-			"be minted (%v); reporting the empty response as it stands", err)
-		return frames, nil
+		// Fail rather than returning the empty frames as though they were the
+		// answer. An empty response is what an upstream refusal looks like, and
+		// handing it back without the reason that explains it is how "nothing
+		// came back" became a symptom with no cause attached.
+		return nil, fmt.Errorf("captcha mint failed: %w", err)
 	}
 
 	log.Printf("batchexecute: nothing came back; retrying once with a fresh captcha token")
@@ -1414,9 +1422,9 @@ const projectToolCode = 22
 // ProjectList returns the projects belonging to the account this client acts as.
 //
 // This is how a project id is learned without a browser. Before it, the only
-// route was to open an editor tab and read the id off the URL — there is still
-// no project-*create* RPC, but the listing means a run no longer has to navigate
-// anywhere to find out where it is.
+// route was to open an editor tab and read the id off the URL. The listing means
+// a run no longer has to navigate anywhere to find out where it is, and
+// CreateProject above covers the account that has nothing to list yet.
 //
 // Ordering is the server's, which is most-recently-modified first; the caller
 // that wants "the project to use" can take the first entry rather than sorting.
@@ -1705,6 +1713,18 @@ func (c *Client) UploadMedia(ctx context.Context, req UploadMediaRequest, opts C
 	if req.CaptchaToken == "" {
 		return "", "", fmt.Errorf("batchexecute: a reCAPTCHA token is required")
 	}
+
+	// Bound the image before it is encoded, for the same reason the flowapi
+	// upload does: Flow refuses an oversized image with a failure that never
+	// mentions size. The content type has to come back out because this request
+	// carries it, and a downscale can change it — a WebP has to be re-encoded as
+	// PNG or JPEG, since x/image decodes WebP but cannot encode it.
+	normalized, normalizedType, normErr := httpx.NormalizeImage(req.Data, req.MimeType)
+	if normErr != nil {
+		return "", "", fmt.Errorf("batchexecute: %w", normErr)
+	}
+	req.Data = normalized
+	req.MimeType = normalizedType
 
 	if opts.SourcePath == "" {
 		opts.SourcePath = "/project/" + req.ProjectID

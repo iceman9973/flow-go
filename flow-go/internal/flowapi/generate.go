@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
 
 /* ------------------------------------------------------------------ *
@@ -319,6 +320,16 @@ func parseImages(items []MediaItem, model string) []ImageResult {
 func (c *Client) UploadImage(ctx context.Context, data []byte, mimeType string) (string, error) {
 	if len(data) == 0 {
 		return "", fmt.Errorf("flow: refusing to upload an empty file")
+	}
+
+	// Bound the image before it is encoded. Flow refuses an oversized one with a
+	// failure that never mentions size, so the check belongs here — the last
+	// point before the bytes go on the wire — rather than in each caller, where
+	// the next caller would be the one to forget. The returned content type is
+	// dropped because this endpoint carries only the bytes.
+	data, _, err := httpx.NormalizeImage(data, mimeType)
+	if err != nil {
+		return "", fmt.Errorf("flow: %w", err)
 	}
 
 	body := map[string]any{

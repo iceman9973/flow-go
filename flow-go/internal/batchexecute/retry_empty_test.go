@@ -180,7 +180,7 @@ func TestAnEmptyRetryIsReportedRatherThanFailed(t *testing.T) {
 
 // A refresher that fails leaves the empty response alone rather than sending a
 // spent token: the first attempt's token is gone, and there is no second one.
-func TestAnEmptyGenerationWithAFailingRefresherIsNotRetried(t *testing.T) {
+func TestAnEmptyGenerationWithAFailingRefresherFailsAndIsNotRetried(t *testing.T) {
 	server, requests := generationServer(t, RPCIDGenerate, emptyPayload, assetPayload())
 	pointAt(t, server)
 
@@ -188,8 +188,19 @@ func TestAnEmptyGenerationWithAFailingRefresherIsNotRetried(t *testing.T) {
 		return "", fmt.Errorf("the mint is down")
 	}}
 	media, err := testClient(t).GenerateMedia(context.Background(), imageRequest("token-0"), opts)
-	if err != nil {
-		t.Fatalf("GenerateMedia: %v", err)
+
+	// The mint failure is reported rather than swallowed. It used to come back as
+	// an empty success, and an empty response is exactly what an upstream refusal
+	// looks like — so the caller could not tell "nothing came back" from "the
+	// captcha could not be minted", which is the cause it actually needed.
+	if err == nil {
+		t.Fatal("a failed mint must be reported, not returned as an empty success")
+	}
+	if !strings.Contains(err.Error(), "captcha mint failed") {
+		t.Errorf("error %q should say the mint is what failed", err)
+	}
+	if !strings.Contains(err.Error(), "the mint is down") {
+		t.Errorf("error %q should carry the underlying cause", err)
 	}
 
 	if len(*requests) != 1 {

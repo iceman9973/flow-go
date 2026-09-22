@@ -1123,6 +1123,17 @@ func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index i
 	if projectSource == projectSourceConfigured {
 		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); no source was consulted", projectID)
 	}
+	if projectID == "" {
+		// Self-healing has already been tried: the listing was consulted, and an
+		// account with nothing in it would have had a project created for it by
+		// now. Reaching here means every source failed. The worker is registered
+		// anyway — the account can still serve cookie reads — so say plainly that
+		// it cannot generate. The alternative is a boot that looks healthy and a
+		// generation that fails much later at "no project id resolved".
+		log.Printf("engine: WARNING — no Flow project could be resolved for account %s. "+
+			"Generation will fail until one exists; open Flow once in the browser, or set "+
+			"FLOW_PROJECT_ID", identity.AccountID)
+	}
 
 	client := flowapi.New(provider, e.hc, flowapi.Options{
 		ProjectID:   projectID,
@@ -1411,8 +1422,13 @@ func (e *Engine) projectFromRPC(ctx context.Context, jar *cookiejar.Jar, index i
 		return ""
 	}
 	if len(projects) == 0 {
-		log.Printf("engine: the project listing is empty for this account")
-		return ""
+		// Self-heal rather than fall through. An account with no projects cannot
+		// generate at all: every generation call carries a project id, and one
+		// that names nothing is refused upstream. Falling through here is what
+		// made a fresh account look healthy at boot and then fail every request
+		// with "no project id resolved" — a message that names the symptom and
+		// not the cause.
+		return e.provisionProject(callCtx, client, index)
 	}
 
 	// The listing is most-recently-modified first, so the first row is the
@@ -1421,6 +1437,39 @@ func (e *Engine) projectFromRPC(ctx context.Context, jar *cookiejar.Jar, index i
 	log.Printf("engine: %d project(s) listed over the transport; taking %s (modified %s)",
 		len(projects), projects[0].ID, projects[0].Modified.Format(time.RFC3339))
 	return projects[0].ID
+}
+
+// provisionProject creates the account's first Flow project, returning its id or
+// "" when it could not be made.
+//
+// The label is left empty on purpose: CreateProject then applies the app's own
+// convention — the local date and time — so a project this engine created is not
+// conspicuous among ones created by hand. Pass a label to name it instead.
+//
+// This is the self-healing half of project resolution. It is only reached when
+// the account's own listing came back empty, which is a positive statement that
+// there is nothing to use rather than a failure to read; a listing that *errored*
+// returns before here, because creating a project on a transient read failure
+// would leave a trail of duplicates behind every network blip.
+func (e *Engine) provisionProject(ctx context.Context, client *batchexecute.Client, index int) string {
+	if client == nil {
+		return ""
+	}
+
+	createCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	project, err := client.CreateProject(createCtx, "")
+	if err != nil {
+		log.Printf("engine: account index %d has no projects and one could not be created (%v); "+
+			"generation will fail until a project exists — open Flow once in the browser, "+
+			"or set FLOW_PROJECT_ID", index, err)
+		return ""
+	}
+
+	log.Printf("engine: auto-provisioned project %s for account index %d — it had none",
+		project.ID, index)
+	return project.ID
 }
 
 // projectFromBrowser asks the extension to open a Flow project editor and reads
@@ -2200,7 +2249,9 @@ func (e *Engine) UploadImage(ctx context.Context, path string) (string, error) {
 		return upErr
 	})
 	if err != nil {
-		return "", err
+		// Name the file. The transport can say the bytes are not a decodable
+		// image, but only this frame knows which path they were read from.
+		return "", fmt.Errorf("engine: upload %s: %w", path, err)
 	}
 
 	_, _ = e.store.RecordMedia(store.Media{

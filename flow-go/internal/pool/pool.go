@@ -53,6 +53,15 @@ const (
 	// keeping the account out of rotation for longer than the throttle lasts
 	// only wastes capacity.
 	ThrottleCooldown = 45 * time.Second
+	// CreditsCooldown is how long an account that ran out of credits stays out of
+	// rotation.
+	//
+	// Far longer than the others, because this is not a transient condition: a
+	// balance does not recover on a timer, so re-admitting the worker quickly
+	// would only hand it another job it cannot pay for. The cooldown exists to
+	// name the reason in the pool's "nothing available" message; the balance
+	// itself is what actually keeps the worker out.
+	CreditsCooldown = 15 * time.Minute
 	// MaxInFlight is the per-worker concurrency ceiling.
 	MaxInFlight = 2
 )
@@ -253,6 +262,16 @@ func (w *Worker) release() {
 	}
 }
 
+// recordSuccess clears the failure streak and, when the caller measured one,
+// records the new balance.
+//
+// The `credits > 0` guard is load-bearing, and is not the discarded zero it
+// looks like. `Release` is called with 0 by every caller that did not read a
+// balance — `Execute` does so on both its success and failure paths — so a bare
+// 0 means "not measured", not "empty". Treating it as a balance would mark every
+// worker drained on its first job and empty the pool. A real zero arrives
+// through SetCredits, or through recordFailure when the server says the account
+// cannot pay.
 func (w *Worker) recordSuccess(credits int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -279,6 +298,26 @@ func (w *Worker) recordFailure(err error) {
 	defer w.mu.Unlock()
 	w.failed++
 	w.consecutiveFails++
+
+	// A drained account is the one failure that is a definite statement about the
+	// balance rather than about the request. Record it as a known zero — which is
+	// what actually keeps the worker out of `pick`, because `Affordable` answers
+	// false for a known balance below the cost — and park it so the pool can name
+	// the reason instead of letting the caller sit out the whole acquire deadline
+	// and then report a bare timeout.
+	//
+	// This is done here rather than by loosening `recordSuccess`'s guard on
+	// purpose. The zero that `Execute` passes to `Release` means "this job did
+	// not measure a balance", not "the balance is zero"; recording it would take
+	// every worker out of rotation on its first successful job. The balance is
+	// only written from a source that actually knows it — this, or SetCredits.
+	if flowapi.IsOutOfCredits(err) {
+		w.credits = 0
+		w.creditsKnown = true
+		w.circuitOpenUntil = time.Now().Add(CreditsCooldown)
+		log.Printf("pool: worker %s is out of credits — parked for %s", w.ID, CreditsCooldown)
+		return
+	}
 
 	var apiErr *flowapi.APIError
 	if errors.As(err, &apiErr) && apiErr.Throttled() {
@@ -410,7 +449,13 @@ func (p *Pool) Size() int {
 //  1. free-tier workers that can afford it, least busy first — spend the daily
 //     renewable credits before paid ones
 //  2. paid workers that can afford it, least busy first
-//  3. anything idle at all, as a last resort
+//
+// There is deliberately no "anything idle at all" step after those. There used
+// to be, and it is what handed jobs to an account known to have no credits —
+// work it could only fail, and a wasted round trip against an account the server
+// was already refusing. A worker whose balance is *unknown* is still selected,
+// because `Affordable` treats an unread balance as payable on purpose, so no
+// capacity that could pay is left idle by dropping it.
 func (p *Pool) Acquire(ctx context.Context, cost int) (*Worker, error) {
 	return p.acquireExcluding(ctx, cost, nil)
 }
@@ -460,7 +505,7 @@ func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[strin
 
 		// Waiting only helps if something could free up. Ask before paying for
 		// the wait rather than after it.
-		if err := p.whyNothingAvailable(exclude, deadline); err != nil {
+		if err := p.whyNothingAvailable(exclude, cost, deadline); err != nil {
 			return nil, err
 		}
 
@@ -488,16 +533,24 @@ func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[strin
 // possibly come back before the deadline, and waiting for it is a guaranteed
 // 30-second failure. Naming when it frees is more useful than making the caller
 // sit through the wait to find out.
-func (p *Pool) whyNothingAvailable(exclude map[string]bool, deadline time.Time) error {
+func (p *Pool) whyNothingAvailable(exclude map[string]bool, cost int, deadline time.Time) error {
 	workers := p.Workers()
 
-	var candidates, parked int
+	var candidates, parked, unaffordable int
 	var earliestFree time.Time
 	for _, w := range workers {
 		if exclude != nil && exclude[w.ID] {
 			continue
 		}
 		candidates++
+
+		// A worker that cannot pay is structural, like a parked one: waiting does
+		// not add credits. Counting it separately is what lets an exhausted pool
+		// say so immediately instead of making the caller sit out the whole
+		// acquire window and then report a bare timeout.
+		if !w.Affordable(cost) {
+			unaffordable++
+		}
 
 		until := w.parkedUntil()
 		if until.IsZero() {
@@ -519,6 +572,17 @@ func (p *Pool) whyNothingAvailable(exclude map[string]bool, deadline time.Time) 
 		return &NoWorkerError{
 			Reason: fmt.Sprintf("every registered worker (%d) has already been tried for this job",
 				len(workers)),
+		}
+	}
+
+	// Nothing to wait for: a balance does not recover on a timer. Reported ahead
+	// of the parked case because it is the more actionable of the two — an
+	// operator can add credits or register another account, whereas a cooldown
+	// only needs time.
+	if unaffordable == candidates {
+		return &NoWorkerError{
+			Reason: fmt.Sprintf("every registered worker (%d) is out of credits for a %d-credit "+
+				"job; add credits, or register another account", candidates, cost),
 		}
 	}
 
@@ -582,11 +646,17 @@ func (p *Pool) pick(cost int, exclude map[string]bool) *Worker {
 			return w
 		}
 	}
-	for _, w := range candidates {
-		if w.acquire() {
-			return w
-		}
-	}
+
+	// Deliberately no third pass.
+	//
+	// There used to be one that took any idle worker at all, and it is what let a
+	// drained account keep receiving jobs: `acquire` checks the circuit and the
+	// in-flight count but never the balance, so a worker known to be unable to
+	// pay was still handed work it could only fail. The two passes above already
+	// cover everything else — `Affordable` answers true for a worker whose
+	// balance has simply not been read yet, precisely so unchecked capacity is
+	// not stranded — so the only thing a third pass could ever add is a worker we
+	// already know cannot pay.
 	return nil
 }
 
@@ -648,9 +718,18 @@ func (p *Pool) Execute(ctx context.Context, cost int, op func(context.Context, *
 		}
 
 		lastErr = opErr
+		// Release records the outcome. For an out-of-credits error that is what
+		// marks the worker drained and parks it — see recordFailure.
 		p.Release(worker, 0, opErr)
 
-		if !flowapi.IsRetryable(opErr) {
+		// An account that cannot pay is a reason to try a *different* account, not
+		// a reason to fail the job. It is not `Retryable` — the same request to the
+		// same account would fail identically — but it is precisely what failover
+		// is for, so it is admitted here rather than by widening IsRetryable,
+		// which other callers rely on meaning "retrying the same thing is worth
+		// it". The next iteration excludes this worker by balance, so the job
+		// moves on instead of coming back to it.
+		if !flowapi.IsRetryable(opErr) && !flowapi.IsOutOfCredits(opErr) {
 			return opErr
 		}
 

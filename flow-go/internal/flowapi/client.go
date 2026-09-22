@@ -138,6 +138,30 @@ func (c *Client) Get(ctx context.Context, endpoint string, captchaAction string)
 	return c.call(ctx, "GET", endpoint, nil, captchaAction)
 }
 
+// mintCaptcha fetches the token an endpoint needs, when it needs one.
+//
+// The two ways this comes back empty are not the same thing, and the error is
+// what tells them apart:
+//
+//   - A provider that is deliberately off answers with an empty token and *no*
+//     error. That is a configuration the operator asked for, and the request
+//     goes out without one.
+//   - A provider that failed answers with an error, and that stops the request.
+//     It used to be logged and the call sent anyway, on the theory that Flow
+//     accepts an empty token for most endpoints — and it does, for most. When it
+//     does not, the refusal is a generic 400/403 that never mentions the
+//     captcha, so the cause is invisible and the generation is already spent.
+func mintCaptcha(ctx context.Context, provider recaptcha.Provider, action string) (string, error) {
+	if action == "" || provider == nil {
+		return "", nil
+	}
+	token, err := provider.Token(ctx, action)
+	if err != nil {
+		return "", fmt.Errorf("captcha mint failed: %w", err)
+	}
+	return token, nil
+}
+
 func (c *Client) call(ctx context.Context, method, endpoint string, body any, captchaAction string) (*Result, error) {
 	if !c.opts.DisableRateLimit {
 		if err := c.limiter.acquire(ctx); err != nil {
@@ -191,17 +215,12 @@ func (c *Client) attempt(ctx context.Context, method, endpoint string, body any,
 	projectID := session.ResolveProjectID(c.opts.ProjectID)
 	tier := c.resolveTier(session)
 
-	// A captcha token is only fetched when the endpoint actually uses one.
-	captchaToken := ""
-	if captchaAction != "" && c.opts.Captcha != nil {
-		if tok, capErr := c.opts.Captcha.Token(ctx, captchaAction); capErr != nil {
-			// Not fatal: Flow accepts an empty token for most calls, and the
-			// Python engine always sent one. Log and continue rather than
-			// failing a generation over a captcha the upstream may not check.
-			log.Printf("flow[%s]: captcha unavailable (%v), continuing without one", c.opts.AccountID, capErr)
-		} else {
-			captchaToken = tok
-		}
+	// Only fetched when the endpoint actually uses one, and fatal when it fails
+	// to arrive. See mintCaptcha for why "deliberately off" and "broken" are
+	// different states and only one of them may be quiet.
+	captchaToken, err := mintCaptcha(ctx, c.opts.Captcha, captchaAction)
+	if err != nil {
+		return nil, err
 	}
 
 	payload, err := c.injectContext(body, projectID, tier, captchaToken)

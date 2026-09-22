@@ -1023,16 +1023,95 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, opts CallOpt
 // A successful call returns the asset inline, so unlike the legacy REST path
 // there is no polling step for images.
 func (c *Client) GenerateMedia(ctx context.Context, req GenerateRequest, opts CallOptions) ([]GeneratedMedia, error) {
-	frames, err := c.Generate(ctx, req, opts)
+	submit := func(token string) ([]Frame, error) {
+		return c.Generate(ctx, req.withCaptcha(token), opts)
+	}
+
+	frames, err := submit("")
 	if err != nil {
 		return nil, err
 	}
+	if frames, err = retryIfEmpty(ctx, opts, frames, carriesNoMedia, submit); err != nil {
+		return nil, err
+	}
+	return parseMediaFrames(frames), nil
+}
 
+// retryIfEmpty resubmits a generation that Flow accepted and answered with
+// nothing.
+//
+// **The first generation after a boot comes back empty** — HTTP 200, no error,
+// no asset, and about a second where a real one takes twenty-odd. The same
+// submission sent again succeeds, and the captcha token is the only thing that
+// differs between the two, so the retry mints a fresh one rather than resending
+// the payload it already spent.
+//
+// empty reports whether a response carried nothing, and each RPC parses its own
+// shape, so the caller supplies it. submit is given the token to use: an empty
+// string means "the one already in the request", which is what the first attempt
+// passes.
+//
+// Three things it deliberately does not do. It does not retry a call with no
+// refresher — there is no token to re-mint, and such a call carries no captcha,
+// so an empty answer is the caller's to interpret. It does not retry twice; one
+// extra attempt is enough to cover the boot case and a second would only spend
+// credits on a genuine failure. And it does not turn an empty retry into an
+// error — the empty frames are returned as they are, so the caller reports what
+// actually happened rather than something invented here.
+func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
+	empty func([]Frame) bool,
+	submit func(token string) ([]Frame, error)) ([]Frame, error) {
+
+	if opts.RefreshCaptcha == nil || !empty(frames) {
+		return frames, nil
+	}
+
+	token, err := opts.RefreshCaptcha(ctx)
+	if err != nil {
+		log.Printf("batchexecute: nothing came back and a fresh captcha token could not "+
+			"be minted (%v); reporting the empty response as it stands", err)
+		return frames, nil
+	}
+
+	log.Printf("batchexecute: nothing came back; retrying once with a fresh captcha token")
+
+	retried, err := submit(token)
+	if err != nil {
+		return nil, err
+	}
+	if empty(retried) {
+		log.Printf("batchexecute: the retry came back empty too")
+	}
+	return retried, nil
+}
+
+// carriesNoMedia reports whether a response holds no asset URLs.
+func carriesNoMedia(frames []Frame) bool {
+	return len(parseMediaFrames(frames)) == 0
+}
+
+// carriesNoMediaIDs reports whether a response holds no asset ids.
+//
+// The video RPCs answer in a different shape from the image one — a listing row
+// per asset rather than a signed URL — so they need their own test rather than a
+// shared one. Using the URL test on a video response would report every
+// submission as empty and retry all of them.
+func carriesNoMediaIDs(frames []Frame) bool {
+	for _, frame := range frames {
+		if len(ParseGeneratedMediaIDs(frame.Payload)) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// parseMediaFrames pulls every asset out of a response's frames.
+func parseMediaFrames(frames []Frame) []GeneratedMedia {
 	var out []GeneratedMedia
 	for _, frame := range frames {
 		out = append(out, ParseGeneratedMedia(frame.Payload)...)
 	}
-	return out, nil
+	return out
 }
 
 // videoImageBlock is one condition image: the media id plus its crop rectangle.
@@ -1749,9 +1828,17 @@ func (c *Client) GenerateVideo(ctx context.Context, req GenerateVideoRequest, op
 	if opts.RPCID != "" {
 		rpcID = opts.RPCID
 	}
-	return c.call(ctx, rpcID, opts, func(token string) (any, error) {
-		return buildVideoArgument(req.withCaptcha(token)), nil
-	})
+	submit := func(token string) ([]Frame, error) {
+		return c.call(ctx, rpcID, opts, func(string) (any, error) {
+			return buildVideoArgument(req.withCaptcha(token)), nil
+		})
+	}
+
+	frames, err := submit("")
+	if err != nil {
+		return nil, err
+	}
+	return retryIfEmpty(ctx, opts, frames, carriesNoMediaIDs, submit)
 }
 
 // EditVideoRequest describes a video edit submission.
@@ -1845,9 +1932,17 @@ func (c *Client) GenerateVideoEdit(ctx context.Context, req EditVideoRequest, op
 	if opts.RPCID != "" {
 		rpcID = opts.RPCID
 	}
-	return c.call(ctx, rpcID, opts, func(token string) (any, error) {
-		return buildEditArgument(req.withCaptcha(token)), nil
-	})
+	submit := func(token string) ([]Frame, error) {
+		return c.call(ctx, rpcID, opts, func(string) (any, error) {
+			return buildEditArgument(req.withCaptcha(token)), nil
+		})
+	}
+
+	frames, err := submit("")
+	if err != nil {
+		return nil, err
+	}
+	return retryIfEmpty(ctx, opts, frames, carriesNoMediaIDs, submit)
 }
 
 // referenceTail is the value the app puts at request[0][0][10] of a
@@ -2008,9 +2103,17 @@ func (c *Client) GenerateVideoFromReferences(ctx context.Context, req ReferenceV
 	if opts.RPCID != "" {
 		rpcID = opts.RPCID
 	}
-	return c.call(ctx, rpcID, opts, func(token string) (any, error) {
-		return buildReferenceArgument(req.withCaptcha(token)), nil
-	})
+	submit := func(token string) ([]Frame, error) {
+		return c.call(ctx, rpcID, opts, func(string) (any, error) {
+			return buildReferenceArgument(req.withCaptcha(token)), nil
+		})
+	}
+
+	frames, err := submit("")
+	if err != nil {
+		return nil, err
+	}
+	return retryIfEmpty(ctx, opts, frames, carriesNoMediaIDs, submit)
 }
 
 // VideoRPCID picks the RPC a video submission goes to from its conditioning.

@@ -183,7 +183,7 @@ type runningSession struct {
 }
 
 func adoptRunningSession(ctx context.Context) (runningSession, bool) {
-	raw, err := os.ReadFile(filepath.Join(config.DataDir(), "bridge-token"))
+	raw, err := os.ReadFile(filepath.Join(config.CookieDir(), "bridge-token"))
 	if err != nil {
 		return runningSession{}, false
 	}
@@ -225,7 +225,7 @@ func adoptRunningSession(ctx context.Context) (runningSession, bool) {
 	// Persist where the engine looks for it, so the bootstrap below picks it up
 	// without needing a new path through the engine.
 	jar := cookiejar.FromCookies(snapshot.Cookies, "server session")
-	if err := jar.Save(filepath.Join(config.DataDir(), "cookies.json")); err != nil {
+	if err := jar.Save(filepath.Join(config.CookieDir(), "cookies.json")); err != nil {
 		return runningSession{}, false
 	}
 
@@ -738,8 +738,8 @@ func runCookies(args []string) int {
 	// reports the jar a run would actually use. Reading only CookieDir reported
 	// a file the engine never loaded once the bridge started writing its own.
 	candidates := []string{
-		filepath.Join(config.DataDir(), "cookies.json"),
 		filepath.Join(config.CookieDir(), "cookies.json"),
+		filepath.Join(config.DataDir(), "cookies.json"),
 	}
 
 	var (

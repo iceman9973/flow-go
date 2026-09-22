@@ -232,6 +232,77 @@ func TestCreditsAreNotInvented(t *testing.T) {
 	}
 }
 
+// TestUpsertAccountKeepsTheCookieHashWhenOmitted pins the partial-update
+// contract that cookie_hash used to break.
+//
+// The hash is the account's identity — Bootstrap writes jar.Hash() and derives
+// the account id from it — so a writer that only means to record a balance has
+// nothing to say about it and must not clear it. Engine.RefreshCredits passes an
+// empty CookieHash for exactly that reason, and because the column was assigned
+// unconditionally, that write erased the hash instead of leaving it alone. The
+// sibling columns (sku, credits, credits_checked_at) already guarded themselves,
+// which is what makes this an oversight rather than a decision.
+func TestUpsertAccountKeepsTheCookieHashWhenOmitted(t *testing.T) {
+	st := openTemp(t)
+
+	if err := st.UpsertAccount(Account{
+		AccountID:  "acct-1",
+		CookieHash: "hash-from-bootstrap",
+		SKU:        "G1_TIER1",
+		Status:     "active",
+	}); err != nil {
+		t.Fatalf("first UpsertAccount failed: %v", err)
+	}
+
+	// A balance-only update: no hash, no sku, nothing about identity.
+	credits := 1050
+	if err := st.UpsertAccount(Account{
+		AccountID: "acct-1",
+		Credits:   &credits,
+		Status:    "active",
+	}); err != nil {
+		t.Fatalf("second UpsertAccount failed: %v", err)
+	}
+
+	accounts, err := st.ListAccounts()
+	if err != nil {
+		t.Fatalf("ListAccounts failed: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accounts))
+	}
+	if accounts[0].CookieHash != "hash-from-bootstrap" {
+		t.Errorf("CookieHash = %q, want it left alone — an omitted hash must not clear the stored one",
+			accounts[0].CookieHash)
+	}
+	if accounts[0].SKU != "G1_TIER1" {
+		t.Errorf("SKU = %q, want it left alone", accounts[0].SKU)
+	}
+	if accounts[0].Credits == nil || *accounts[0].Credits != 1050 {
+		t.Errorf("Credits = %v, want 1050 — the update it was actually for", accounts[0].Credits)
+	}
+}
+
+// TestUpsertAccountStillOverwritesASuppliedHash checks the guard did not make the
+// column read-only: a supplied hash must still overwrite, or a re-signed-in
+// account would keep reporting the previous session's hash.
+func TestUpsertAccountStillOverwritesASuppliedHash(t *testing.T) {
+	st := openTemp(t)
+
+	if err := st.UpsertAccount(Account{AccountID: "acct-1", CookieHash: "old", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAccount(Account{AccountID: "acct-1", CookieHash: "new", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts, _ := st.ListAccounts()
+	if accounts[0].CookieHash != "new" {
+		t.Errorf("CookieHash = %q, want %q — a supplied hash must still overwrite",
+			accounts[0].CookieHash, "new")
+	}
+}
+
 // TestStoresAreIsolated proves that two stores never share data, which is the
 // property the Python tests lacked.
 func TestStoresAreIsolated(t *testing.T) {

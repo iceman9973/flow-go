@@ -102,7 +102,7 @@ func Build(cfg Config) (*App, error) {
 	// The bridge now owns where it keeps its files and where it listens; it used
 	// to reach into this package's config for both, which is what kept it from
 	// being a module of its own.
-	br := bridge.NewBridge(targets, domains, config.DataDir())
+	br := bridge.NewBridge(targets, domains, config.CookieDir())
 	br.ListenAddr = fmt.Sprintf("127.0.0.1:%d", config.WSPort)
 
 	eng, err := engine.New(st, br, engine.Options{

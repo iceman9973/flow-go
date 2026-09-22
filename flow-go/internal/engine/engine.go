@@ -620,6 +620,50 @@ func (e *Engine) Credits(ctx context.Context) (int, error) {
 	})
 }
 
+// creditsReader returns a pool.CreditsReader for one signed-in account.
+//
+// This is what connects the pool to the authoritative balance. Without it the
+// pool's only source was Worker.Client — the legacy aisandbox surface, whose
+// balance belongs to whichever account that credential is for — so the pool sat
+// with creditsKnown false and Worker.Affordable answering true for everything.
+//
+// Three details are deliberate:
+//
+//   - `authuser` travels with the read. Balances are per signed-in account and
+//     the accounts share one cookie jar, so without it every worker would report
+//     the first account's balance.
+//   - The seeded anti-CSRF token is dropped for a non-zero index. It was read
+//     from the page for the account the browser is showing, and sending it
+//     alongside a different `authuser` is answered with 400.
+//   - The client carries no 401 handler. The generation path installs one that
+//     re-bootstraps the engine, and this read runs from inside Bootstrap, so a
+//     401 there would re-enter Bootstrap from under itself. With no handler a
+//     401 is terminal for this one call, which is the right failure for a
+//     balance check — the refresh already happened by the time this runs.
+//
+// sku is what the caller already learned from the Labs session. The balance RPC
+// does not carry a tier, so an empty value leaves the worker's stored tier alone
+// rather than clearing it.
+func (e *Engine) creditsReader(index int, jar *cookiejar.Jar, sku string) pool.CreditsReader {
+	return func(ctx context.Context) (pool.Balance, error) {
+		client := e.newBatchexecuteClient(jar, e.hc)
+		client.SetAuthUser(index)
+		if index != 0 {
+			client.SeedToken("")
+		}
+		client.SetUnauthorizedHandler(nil)
+
+		credits, err := client.Credits(ctx, batchexecute.CallOptions{
+			SourcePath: "/",
+			BuildLabel: config.BuildLabel(),
+		})
+		if err != nil {
+			return pool.Balance{}, err
+		}
+		return pool.Balance{Credits: credits, SKU: sku}, nil
+	}
+}
+
 // RawCredits returns the upstream credits response unparsed.
 //
 // Exposed for the diagnostic endpoint: the field names are undocumented, so
@@ -951,6 +995,11 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	})
 
 	worker := pool.NewWorker(accountID, client)
+	// Install the authoritative balance reader before the worker is registered,
+	// so the pool never has a window in which it could read a balance from the
+	// worker's own client — which is the legacy aisandbox surface and reports
+	// whichever account that credential belongs to.
+	worker.SetCreditsReader(e.creditsReader(index, jar, session.Sku))
 	// Drop the previous account's worker first. Bootstrap runs again on every
 	// switch, and keeping the old one would leave the pool holding an account the
 	// engine can no longer route to — and reporting its balance as available.
@@ -991,6 +1040,18 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// know before they read a result rather than after.
 	e.warnOnCompetingExtensions()
 
+	// Fill in the balance, now that the identity the read depends on —
+	// fingerprint, page tokens, authuser — is in place. newBatchexecuteClient
+	// reads all three, so this has to come after the assignments above.
+	//
+	// Best effort and bounded. A failed read leaves creditsKnown false, which
+	// Worker.Affordable reads as affordable, so it costs no capacity and must
+	// never be allowed to fail the boot. It is placed after the warnings so a
+	// slow read cannot delay them.
+	creditCtx, cancelCredits := context.WithTimeout(ctx, creditsReadTimeout)
+	e.RefreshCredits(creditCtx)
+	cancelCredits()
+
 	return nil
 }
 
@@ -1019,8 +1080,8 @@ func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
 	// call answered 401. The synced file is tried first because it is the fresher
 	// of the two by construction.
 	candidates := []string{
-		filepath.Join(config.DataDir(), "cookies.json"),
 		filepath.Join(config.CookieDir(), "cookies.json"),
+		filepath.Join(config.DataDir(), "cookies.json"),
 	}
 
 	var tried []string
@@ -1188,7 +1249,7 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 // between runs, beside the cookie cache and for the same reason: a process with
 // no browser has to present the same opening request the page would have made.
 func pageTokensFile() string {
-	return filepath.Join(config.DataDir(), "page-tokens.json")
+	return filepath.Join(config.CookieDir(), "page-tokens.json")
 }
 
 // pageTokenSet is the pair of page-only values every batchexecute request
@@ -1260,8 +1321,21 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 
 	raw, err := client.FlowAt(atCtx, "")
 	if err != nil {
-		log.Printf("engine: could not read the page's batchexecute tokens (%v); "+
-			"batchexecute will prime for a token instead", err)
+		// Same fallback as the fingerprint, and it matters more here. The comment
+		// above says priming is not a substitute — a run with the cookies and the
+		// fingerprint but neither of these came back empty — so discarding the
+		// persisted pair because a page happens to be missing defeats the reason
+		// they are persisted at all. A connected bridge with no Flow tab is the
+		// ordinary case, not a failure worth losing them over.
+		if persisted := loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
+			log.Printf("engine: the page could not supply its batchexecute tokens (%v); "+
+				"adopting the persisted pair instead (at %d chars, f.sid %d chars)",
+				err, len(persisted.At), len(persisted.Fsid))
+			return persisted.At, persisted.Fsid
+		}
+
+		log.Printf("engine: could not read the page's batchexecute tokens (%v) and none are "+
+			"persisted; batchexecute will prime for a token instead", err)
 		return "", ""
 	}
 
@@ -1296,7 +1370,7 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 // present the client its token was minted for, and a session snapshot is only
 // available while another process is running to hand one over.
 func fingerprintFile() string {
-	return filepath.Join(config.DataDir(), "fingerprint.json")
+	return filepath.Join(config.CookieDir(), "fingerprint.json")
 }
 
 // saveFingerprint persists the browser identity, best-effort.
@@ -1358,8 +1432,25 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 
 	fp, err := e.bridge.Fingerprint(fpCtx)
 	if err != nil {
-		log.Printf("engine: could not read the browser fingerprint (%v); "+
-			"generation requests will not match the reCAPTCHA assessment", err)
+		// A connected bridge that cannot supply an identity is the ordinary
+		// case, not an exception: it means no Flow tab is open to read one from,
+		// and the tab is closed more often than not. That is what the persisted
+		// copy is for — the whole point of keeping it is to make a run possible
+		// with no page at all — so falling back here is the same decision as
+		// falling back above, and it used to not happen.
+		//
+		// The effect was that attaching the extension without a Flow tab was
+		// *worse* than not attaching it: the disconnected path found the
+		// persisted copy and the connected path threw it away, so every
+		// generation came back empty with nothing in the log to say why.
+		if persisted := loadFingerprint(); persisted != nil {
+			log.Printf("engine: the browser could not supply a fingerprint (%v); "+
+				"adopting the persisted one — %s", err, truncate(persisted.UserAgent, 70))
+			return persisted
+		}
+
+		log.Printf("engine: could not read the browser fingerprint (%v) and none is "+
+			"persisted; generation requests will not match the reCAPTCHA assessment", err)
 		return nil
 	}
 
@@ -1558,6 +1649,21 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 		}
 		if callErr == nil {
 			accountID = worker.ID
+
+			// Hand the pool the balance this call just read. The submission
+			// already fetches it after posting (the RemainingCredits reads
+			// below), so it is authoritative and already paid for — discarding
+			// it left the pool's affordability gate pinned to whatever Bootstrap
+			// saw, and that figure drifts by one render every time a job lands.
+			//
+			// Guarded on > 0 for the same reason recordSuccess is: SetCredits
+			// marks the balance as known, so writing a zero would tell pick() a
+			// healthy account is broke and stop routing to it. A failed read
+			// leaves RemainingCredits at zero, and that is not evidence of an
+			// empty wallet.
+			if outcome != nil && outcome.RemainingCredits > 0 {
+				worker.SetCredits(outcome.RemainingCredits, "")
+			}
 		}
 		return callErr
 	})
@@ -3467,22 +3573,39 @@ func (e *Engine) finishJob(jobID, status string, credits *int, start time.Time, 
  * Maintenance
  * ------------------------------------------------------------------ */
 
-// RefreshCredits updates every worker's balance from upstream.
+// RefreshCredits reads every worker's balance over the authoritative transport
+// and records it.
+//
+// Called from Bootstrap, so the pool starts with real numbers rather than an
+// unknown balance that Worker.Affordable can only read as affordable. The read
+// itself is in creditsReader; this only fans it out and persists the result.
+//
+// The account row is written with an empty CookieHash because a balance update
+// has nothing to say about identity. UpsertAccount guards that column against an
+// empty value, so the hash Bootstrap recorded survives — it did not always, and
+// this write is what would have erased it.
 func (e *Engine) RefreshCredits(ctx context.Context) {
 	e.pool.RefreshCredits(ctx)
 
 	for _, w := range e.pool.Workers() {
 		credits, known := w.Credits()
 		var value *int
+		var checkedAt *time.Time
 		if known {
 			value = &credits
+			// Only stamp the time when there is a reading to stamp it for.
+			// A timestamp beside a NULL balance claims a check that produced
+			// nothing, which is how an unchecked account starts looking checked.
+			t := time.Now()
+			checkedAt = &t
 		}
 		if err := e.store.UpsertAccount(store.Account{
-			AccountID:  w.ID,
-			SKU:        w.SKU(),
-			Credits:    value,
-			Status:     "active",
-			CookieHash: "",
+			AccountID:        w.ID,
+			SKU:              w.SKU(),
+			Credits:          value,
+			CreditsCheckedAt: checkedAt,
+			Status:           "active",
+			CookieHash:       "",
 		}); err != nil {
 			log.Printf("engine: could not record credits for %s: %v", w.ID, err)
 		}

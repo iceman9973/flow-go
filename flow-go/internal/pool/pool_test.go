@@ -339,3 +339,158 @@ func TestRegisterReplaces(t *testing.T) {
 		t.Errorf("re-registering an ID should replace, Size = %d", p.Size())
 	}
 }
+
+// TestRefreshCreditsUsesTheAuthoritativeReader covers the wiring that left the
+// pool's affordability layer inert.
+//
+// The workers here carry a nil Client, and that is the assertion: reading a
+// balance from the worker's own client would dereference nil and panic. Only a
+// read through the installed reader can make these tests pass.
+func TestRefreshCreditsUsesTheAuthoritativeReader(t *testing.T) {
+	p := New()
+	w := newTestWorker("w1")
+
+	calls := 0
+	w.SetCreditsReader(func(context.Context) (Balance, error) {
+		calls++
+		return Balance{Credits: 1050, SKU: "G1_TIER1"}, nil
+	})
+	p.Register(w)
+
+	p.RefreshCredits(context.Background())
+
+	if calls != 1 {
+		t.Errorf("reader called %d times, want 1", calls)
+	}
+	credits, known := w.Credits()
+	if !known {
+		t.Fatal("creditsKnown is false after a successful read — the balance reads as unknown")
+	}
+	if credits != 1050 {
+		t.Errorf("credits = %d, want 1050", credits)
+	}
+	if w.SKU() != "G1_TIER1" {
+		t.Errorf("SKU = %q, want G1_TIER1", w.SKU())
+	}
+}
+
+// TestRefreshCreditsInventsNothing covers both ways a balance stays unknown.
+// Neither may produce a number, because a fabricated balance is worse than an
+// absent one: the scheduler would route on it.
+func TestRefreshCreditsInventsNothing(t *testing.T) {
+	p := New()
+
+	noReader := newTestWorker("no-reader")
+	p.Register(noReader)
+
+	failing := newTestWorker("failing")
+	failing.SetCreditsReader(func(context.Context) (Balance, error) {
+		return Balance{Credits: 999}, errors.New("nzlxg answered 401")
+	})
+	p.Register(failing)
+
+	p.RefreshCredits(context.Background())
+
+	for _, w := range []*Worker{noReader, failing} {
+		if credits, known := w.Credits(); known {
+			t.Errorf("%s: creditsKnown is true with credits %d — a balance was invented", w.ID, credits)
+		}
+	}
+}
+
+// TestRefreshCreditsKeepsATierItWasNotToldAbout: the balance RPC carries no
+// subscription tier, so a reader with none to offer must not be read as claiming
+// the account has none. Clearing it would silently switch off the free-tier
+// routing preference.
+func TestRefreshCreditsKeepsATierItWasNotToldAbout(t *testing.T) {
+	p := New()
+	w := newTestWorker("w1")
+
+	offerSKU := true
+	w.SetCreditsReader(func(context.Context) (Balance, error) {
+		if offerSKU {
+			return Balance{Credits: 1050, SKU: "G1_TIER1"}, nil
+		}
+		return Balance{Credits: 900}, nil
+	})
+	p.Register(w)
+
+	p.RefreshCredits(context.Background())
+	if w.SKU() != "G1_TIER1" {
+		t.Fatalf("SKU = %q, want G1_TIER1 after the first read", w.SKU())
+	}
+
+	offerSKU = false
+	p.RefreshCredits(context.Background())
+
+	if w.SKU() != "G1_TIER1" {
+		t.Errorf("SKU = %q, want it preserved — an absent tier is not a claim of no tier", w.SKU())
+	}
+	if credits, _ := w.Credits(); credits != 900 {
+		t.Errorf("credits = %d, want 900 — the balance should still update", credits)
+	}
+}
+
+// TestRefreshCreditsMakesAffordabilityReal is the point of the whole change.
+// Before it nothing set creditsKnown, so Affordable answered true for every
+// worker and a job the account could not pay for was scheduled to it anyway.
+func TestRefreshCreditsMakesAffordabilityReal(t *testing.T) {
+	p := New()
+	w := newTestWorker("w1")
+
+	// Unknown is affordable on purpose: refusing would strand capacity.
+	if !w.Affordable(50) {
+		t.Fatal("an unknown balance should be treated as affordable")
+	}
+
+	w.SetCreditsReader(func(context.Context) (Balance, error) {
+		return Balance{Credits: 12}, nil
+	})
+	p.Register(w)
+	p.RefreshCredits(context.Background())
+
+	if w.Affordable(50) {
+		t.Error("a 12-credit balance should not be affordable for a 50-credit job")
+	}
+	if !w.Affordable(12) {
+		t.Error("a 12-credit balance should be affordable for a 12-credit job")
+	}
+}
+
+// TestExecuteKeepsABalanceSetDuringTheOp covers the contract the generation path
+// depends on.
+//
+// The video closure records the authoritative post-submit balance on its worker
+// from inside the op. Execute then finishes by calling Release(worker, 0, nil),
+// and that zero must not undo the write. If Release ever started recording its
+// argument unconditionally, every successful render would reset the pool to a
+// zero balance and pick() would stop routing to a perfectly healthy account —
+// the same class of failure as the inert gate this layer was fixed for.
+func TestExecuteKeepsABalanceSetDuringTheOp(t *testing.T) {
+	p := New()
+	w := newTestWorker("w1")
+	w.SetCredits(1050, "G1_TIER1")
+	p.Register(w)
+
+	err := p.Execute(context.Background(), 0, func(_ context.Context, worker *Worker) error {
+		worker.SetCredits(1040, "")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	credits, known := w.Credits()
+	if !known {
+		t.Fatal("creditsKnown is false after the op recorded a balance")
+	}
+	if credits != 1040 {
+		t.Errorf("credits = %d, want 1040 — Release(0) overwrote what the op recorded", credits)
+	}
+	if w.SKU() != "G1_TIER1" {
+		t.Errorf("SKU = %q, want it preserved — a balance carries no tier", w.SKU())
+	}
+	if got := p.Stats().CreditsAvailable; got != 1040 {
+		t.Errorf("CreditsAvailable = %d, want 1040 — the gate is reading a stale figure", got)
+	}
+}

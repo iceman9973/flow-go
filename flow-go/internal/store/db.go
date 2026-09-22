@@ -140,12 +140,23 @@ type Account struct {
 }
 
 // UpsertAccount records or refreshes an account row.
+//
+// Every column here is a partial update: a caller that supplies nothing for one
+// leaves the stored value alone. Three of the six guard themselves with
+// COALESCE(NULLIF(...)) and cookie_hash did not — it was assigned
+// unconditionally, so any caller that omitted it wiped the hash.
+//
+// That matters because the hash is the account's identity: Bootstrap writes
+// jar.Hash() and derives the account id from it. A writer that passes an empty
+// hash — Engine.RefreshCredits does, since it is only updating a balance —
+// would erase it and leave the row pointing at nothing. The guard is the same
+// one the neighbouring columns already use.
 func (s *Store) UpsertAccount(a Account) error {
 	_, err := s.db.Exec(`
 		INSERT INTO accounts (account_id, cookie_hash, sku, credits, credits_checked_at, status, last_error)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(account_id) DO UPDATE SET
-			cookie_hash        = excluded.cookie_hash,
+			cookie_hash        = COALESCE(NULLIF(excluded.cookie_hash, ''), accounts.cookie_hash),
 			sku                = COALESCE(NULLIF(excluded.sku, ''), accounts.sku),
 			credits            = COALESCE(excluded.credits, accounts.credits),
 			credits_checked_at = COALESCE(excluded.credits_checked_at, accounts.credits_checked_at),

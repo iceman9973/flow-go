@@ -57,6 +57,30 @@ const (
 	MaxInFlight = 2
 )
 
+// Balance is one authoritative credit reading for an account.
+type Balance struct {
+	// Credits is the account's spendable balance.
+	Credits int
+	// SKU is the subscription tier, when the reader knows it.
+	//
+	// Empty leaves the stored tier alone. The balance RPC does not carry one —
+	// it comes from the Labs session, which is the legacy bearer path and may
+	// itself be unavailable — so a reader that has no tier must not be read as
+	// claiming the account has none.
+	SKU string
+}
+
+// CreditsReader reads one account's authoritative balance.
+//
+// Supplied by the caller rather than taken from Worker.Client, and that is the
+// whole point. Client is the legacy aisandbox REST surface, so the balance it
+// reports belongs to whichever account that credential happens to be for —
+// Engine.Credits records that it "reports a different number, and the token used
+// for it can belong to a different signed-in account entirely, so it is not a
+// source to trust." Reading it here would record one account's credits against
+// another. The authoritative read is batchexecute `nzlxg`.
+type CreditsReader func(ctx context.Context) (Balance, error)
+
 // Worker is one account's client plus its scheduling state.
 type Worker struct {
 	ID     string
@@ -66,6 +90,7 @@ type Worker struct {
 	Concurrency int
 
 	mu               sync.Mutex
+	reader           CreditsReader
 	inFlight         int
 	credits          int
 	creditsKnown     bool
@@ -80,6 +105,24 @@ type Worker struct {
 // NewWorker wraps a client.
 func NewWorker(id string, client *flowapi.Client) *Worker {
 	return &Worker{ID: id, Client: client, Concurrency: MaxInFlight}
+}
+
+// SetCreditsReader installs the authoritative balance reader for this worker.
+//
+// Call it before the worker is registered. A worker with no reader keeps its
+// balance unknown, and the pool leaves it that way rather than substituting a
+// figure from the untrusted source.
+func (w *Worker) SetCreditsReader(fn CreditsReader) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.reader = fn
+}
+
+// creditsReader returns the installed reader, or nil when there is none.
+func (w *Worker) creditsReader() CreditsReader {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.reader
 }
 
 // SetCredits records a freshly observed balance.
@@ -467,16 +510,33 @@ func maxAttempts(size int) int {
 	return size + 1
 }
 
-// RefreshCredits queries every worker's balance. Used by the stats endpoint and
-// by the scheduler to keep affordability decisions current.
+// RefreshCredits asks every worker for its authoritative balance.
+//
+// The reader comes from the worker, not from Worker.Client. Client is the legacy
+// aisandbox REST surface, so its balance belongs to whichever account that
+// credential is for — reading it here would record one account's credits against
+// another, which is the failure the Python version had when it reported test
+// fixtures as live balances. That is why this sat uncalled: the wiring existed
+// but read the wrong source. With an authoritative reader installed — batchexecute
+// `nzlxg`, via Engine.creditsReader — these are the same numbers /v1/credits serves.
+//
+// A worker with no reader is skipped and stays unknown rather than being given a
+// figure from the untrusted source. Unknown is not zero: Worker.Affordable
+// answers true for an unknown balance, so skipping costs no capacity.
 func (p *Pool) RefreshCredits(ctx context.Context) {
 	for _, w := range p.Workers() {
-		credits, sku, err := w.Client.Credits(ctx)
+		reader := w.creditsReader()
+		if reader == nil {
+			log.Printf("pool: worker %s has no authoritative credits reader; "+
+				"leaving its balance unknown", w.ID)
+			continue
+		}
+		balance, err := reader(ctx)
 		if err != nil {
 			log.Printf("pool: credit check failed for %s: %v", w.ID, err)
 			continue
 		}
-		w.SetCredits(credits, sku)
+		w.SetCredits(balance.Credits, balance.SKU)
 	}
 }
 

@@ -1559,7 +1559,7 @@ const captchaPlaceholder = "__CAPTCHA__"
 // The comparison is constant-time. This is a shared secret standing in front of the
 // account's cookies, and a byte-at-a-time compare leaks its prefix.
 func bridgeTokenMatches(c fiber.Ctx) bool {
-	raw, err := os.ReadFile(filepath.Join(config.DataDir(), "bridge-token"))
+	raw, err := os.ReadFile(filepath.Join(config.CookieDir(), "bridge-token"))
 	if err != nil {
 		return false
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,146 @@ func TestNoWorkers(t *testing.T) {
 
 	if _, err := p.Acquire(ctx, 0); err == nil {
 		t.Error("Acquire with an empty pool should fail")
+	}
+}
+
+// TestAcquireWithNoWorkersFailsImmediately is the fast-fail regression test.
+//
+// An empty pool cannot become non-empty by waiting: a worker only appears when
+// Bootstrap registers one, which is not something the wait can cause. The loop
+// used to run regardless, so a request arriving after the engine dropped its
+// worker — which is what happens when the session is lost — sat for the full
+// 30-second deadline before reporting what was already known.
+func TestAcquireWithNoWorkersFailsImmediately(t *testing.T) {
+	p := New()
+
+	start := time.Now()
+	_, err := p.Acquire(context.Background(), 0)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Acquire with an empty pool should fail")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Acquire took %s to report an empty pool; it should not wait at all", elapsed)
+	}
+
+	var noWorker *NoWorkerError
+	if !errors.As(err, &noWorker) {
+		t.Fatalf("error is %T, want *NoWorkerError so the cause travels with it", err)
+	}
+	// statusFor maps this phrase to a 503. The reason is appended to it, so the
+	// phrase has to survive the append or the status silently changes.
+	if !strings.Contains(err.Error(), "no worker available") {
+		t.Errorf("error %q must keep the phrase statusFor matches on", err)
+	}
+	if !strings.Contains(err.Error(), "not bootstrapped") {
+		t.Errorf("error %q should name the likely cause, not just the symptom", err)
+	}
+}
+
+// TestAcquireFailsFastWhenEveryWorkerIsParked covers the other structural case.
+//
+// The circuit cooldown is 90 seconds and the acquire deadline is 30, so a parked
+// worker cannot possibly come back before the deadline — waiting for it is a
+// guaranteed 30-second failure. The error names when it does come back instead,
+// which is more useful than making the caller wait to find out.
+func TestAcquireFailsFastWhenEveryWorkerIsParked(t *testing.T) {
+	p := New()
+	w := newTestWorker("flaky")
+	p.Register(w)
+
+	for i := 0; i < FailureThreshold; i++ {
+		acquired, err := p.Acquire(context.Background(), 0)
+		if err != nil {
+			t.Fatalf("Acquire %d failed: %v", i, err)
+		}
+		p.Release(acquired, 0, errors.New("upstream said no"))
+	}
+	if w.State() != StateCircuitOpen {
+		t.Fatalf("the fixture did not park the worker: state = %s", w.State())
+	}
+
+	start := time.Now()
+	_, err := p.Acquire(context.Background(), 0)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a parked worker must not be handed out")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Acquire took %s on a worker parked for %s; the wait cannot succeed so it "+
+			"should not be paid", elapsed, CircuitCooldown)
+	}
+
+	var noWorker *NoWorkerError
+	if !errors.As(err, &noWorker) {
+		t.Fatalf("error is %T, want *NoWorkerError", err)
+	}
+	if noWorker.RetryAfter.IsZero() {
+		t.Error("a parked worker has a known return time; the error should carry it")
+	}
+	if !strings.Contains(err.Error(), "parked") {
+		t.Errorf("error %q should say the worker is parked rather than just absent", err)
+	}
+}
+
+// TestAcquireStillWaitsForABusyWorker guards the case the wait exists for.
+//
+// Fail-fast on the structural cases is only correct if it does not also break
+// the transient one: every worker busy is a wait worth paying, because one of
+// them is going to finish. Narrowing this too far would turn ordinary contention
+// into a spurious failure.
+func TestAcquireStillWaitsForABusyWorker(t *testing.T) {
+	p := New()
+	w := newTestWorker("w1")
+	p.Register(w)
+
+	// Fill the worker to its limit.
+	for i := 0; i < MaxInFlight; i++ {
+		if _, err := p.Acquire(context.Background(), 0); err != nil {
+			t.Fatalf("Acquire %d failed: %v", i, err)
+		}
+	}
+
+	// Free a slot shortly after the caller starts waiting.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		p.Release(w, 0, nil)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	got, err := p.Acquire(ctx, 0)
+	if err != nil {
+		t.Fatalf("Acquire should have waited for the busy worker and succeeded: %v", err)
+	}
+	if got.ID != "w1" {
+		t.Errorf("acquired %q, want w1", got.ID)
+	}
+}
+
+// TestExecuteOnAnEmptyPoolFailsImmediately covers the same defect one layer up,
+// on the entry point generation code is meant to use.
+func TestExecuteOnAnEmptyPoolFailsImmediately(t *testing.T) {
+	p := New()
+
+	start := time.Now()
+	err := p.Execute(context.Background(), 0, func(context.Context, *Worker) error {
+		t.Error("the op must not run when there is no worker")
+		return nil
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Execute on an empty pool should fail")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Execute took %s to report an empty pool", elapsed)
+	}
+	if !strings.Contains(err.Error(), "no worker available") {
+		t.Errorf("error %q must keep the phrase statusFor matches on", err)
 	}
 }
 

@@ -47,6 +47,8 @@ func Run(args []string) int {
 		return runProjects(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "doctor":
+		return runDoctor(args[1:])
 	case "export":
 		return runExport(args[1:])
 	case "cookies":
@@ -79,6 +81,7 @@ USAGE
 
 COMMANDS
   serve                 Start the HTTP API and the Flow Go Bridge extension bridge
+  doctor                Diagnose whether this machine can generate right now
   generate              Generate a video
   image                 Generate an image
   projects              List the account's Flow projects
@@ -93,6 +96,23 @@ COMMON FLAGS
   --captcha             reCAPTCHA strategy: auto | broker | http | off
   --db                  Database path
 
+DOCTOR FLAGS
+  --probe               Make one authenticated upstream call to prove the
+                        session works                        (default true)
+  --json                Print the diagnosis as JSON
+  --timeout             How long the whole diagnosis may take (default 90s)
+
+  Exits 0 when every required check passed and 1 when one did not, so it can
+  gate a script. Nothing that can be read off the disk waits behind a network
+  call, and a running server is asked rather than re-derived.
+
+  With a server running, nothing local is opened and nothing is written: the
+  server already holds the live jar and session, and it is the one asked. With
+  no server, doctor attaches the bridge and bootstraps the engine, which is the
+  same start-up a generation run performs — including the account identity it
+  adopts into the database. That write is idempotent, and it is the reason the
+  check can answer honestly rather than by inspection.
+
 GENERATE FLAGS
   --prompt              Prompt text (required)
   --duration            4 | 6 | 8 | 10                 (default 10)
@@ -102,13 +122,16 @@ GENERATE FLAGS
   --end-image           Local image path or media ID
   --no-download         Skip writing the result to output/
 
-  --aspect, --resolution, --reference and --seed exist on the legacy aisandbox
-  transport and not on the batchexecute one. Asking for one is an error naming
-  it, rather than a flag that is accepted and then ignored.
+  --aspect, --resolution, --seed and --reference exist on the legacy aisandbox
+  transport and not on the batchexecute one. Passing one is reported on stderr
+  and the run continues without it, so a script carrying a stale flag still
+  produces its video.
 
 IMAGE FLAGS
   --prompt              Prompt text (required)
   --model               harbor_seal | narwhal | gem_pix_2
+  --count               Accepted, but only 1 is honoured: the RPC returns one
+                        asset per call
   --no-download         Skip writing the result to output/
 
 EXAMPLES
@@ -283,17 +306,31 @@ const bridgeAttachWindow = 5 * time.Second
 // Best-effort and bounded: the extension may simply not be loaded, and the
 // persisted copy is still there when it is not.
 func attachBridge(ctx context.Context, a *app.App) bool {
+	return attachBridgeWithin(ctx, a, bridgeAttachWindow, false)
+}
+
+// attachBridgeWithin is attachBridge with the window and the reporting under the
+// caller's control.
+//
+// Two callers want two different things from the same sequence. A generation run
+// wants the progress lines, because a five-second pause with no output on it
+// reads as a hang. `doctor` wants silence: its output is a column-aligned
+// checklist, and a line printed from inside a goroutine lands wherever the
+// scheduler decides — which, in practice, is the middle of the checklist.
+func attachBridgeWithin(ctx context.Context, a *app.App, window time.Duration, quiet bool) bool {
 	go func() {
-		if err := a.Bridge.Listen(ctx); err != nil {
+		if err := a.Bridge.Listen(ctx); err != nil && !quiet {
 			// Expected whenever a server owns the port; the caller falls back.
 			fmt.Printf("  bridge           not started (%v)\n", err)
 		}
 	}()
 
-	deadline := time.Now().Add(bridgeAttachWindow)
+	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
 		if a.Bridge.Connected() {
-			fmt.Printf("  bridge           extension attached, cookies read live\n")
+			if !quiet {
+				fmt.Printf("  bridge           extension attached, cookies read live\n")
+			}
 			return true
 		}
 		select {
@@ -356,23 +393,21 @@ func runGenerate(args []string) int {
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
 	// These four exist on the legacy aisandbox transport and not on the
 	// batchexecute one, which is the only one that works. They are still
-	// declared so that asking for one is an error naming it, rather than a flag
-	// the parser accepts and the engine silently ignores — which is the failure
-	// this codebase keeps recording.
-	aspect := fs.String("aspect", "", "not implemented on the batchexecute transport")
-	resolution := fs.String("resolution", "", "not implemented on the batchexecute transport")
-	seed := fs.Int64("seed", 0, "not implemented on the batchexecute transport")
+	// declared, and still named when passed — but the run continues without
+	// them. Failing was defensible only while the alternative was silence, and
+	// the caller's next move was always to drop the flag and retry, which is a
+	// move this command can make for them.
+	aspect := fs.String("aspect", "", "ignored — not implemented on the batchexecute transport")
+	resolution := fs.String("resolution", "", "ignored — not implemented on the batchexecute transport")
+	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	var references stringList
-	fs.Var(&references, "reference", "not implemented on the batchexecute transport")
+	fs.Var(&references, "reference", "ignored — use the HTTP API's /v1/videos/reference instead")
 	_ = fs.Parse(args)
 
 	if *prompt == "" {
 		return fail(fmt.Errorf("--prompt is required"))
 	}
-	if unsupported := unsupportedGenerateFlags(*aspect, *resolution, *seed, references); len(unsupported) > 0 {
-		return fail(fmt.Errorf("not implemented on the batchexecute transport: %s",
-			strings.Join(unsupported, ", ")))
-	}
+	warnIgnoredFlags(ignoredGenerateFlags(*aspect, *resolution, *seed, references))
 
 	// Seed from a running server before building, because the engine reads its
 	// cookies and page tokens at construction.
@@ -421,10 +456,10 @@ func runGenerate(args []string) int {
 	return 0
 }
 
-// unsupportedGenerateFlags names the generate flags the batchexecute transport
-// does not implement, so asking for one fails with its name instead of being
-// quietly dropped.
-func unsupportedGenerateFlags(aspect, resolution string, seed int64, references []string) []string {
+// ignoredGenerateFlags names the generate flags the batchexecute transport does
+// not apply, so the caller is told rather than left to notice the result differs
+// from what they asked for.
+func ignoredGenerateFlags(aspect, resolution string, seed int64, references []string) []string {
 	var out []string
 	if strings.TrimSpace(aspect) != "" {
 		out = append(out, "--aspect")
@@ -441,6 +476,19 @@ func unsupportedGenerateFlags(aspect, resolution string, seed int64, references 
 	return out
 }
 
+// warnIgnoredFlags reports flags that will not be applied and lets the run
+// continue.
+//
+// To stderr, so a warning can never be mistaken for part of the result: the
+// stdout of these commands is JSON that callers pipe into jq.
+func warnIgnoredFlags(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  ignoring %s — not implemented on the batchexecute transport\n",
+		strings.Join(names, ", "))
+}
+
 /* ------------------------------------------------------------------ *
  * image
  * ------------------------------------------------------------------ */
@@ -453,24 +501,21 @@ func runImage(args []string) int {
 	count := fs.Int("count", 1, "number of variations")
 	model := fs.String("model", "", "harbor_seal, narwhal, or gem_pix_2")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
-	// Not implemented on the batchexecute transport; declared so asking for one
-	// is an error naming it rather than a silently ignored flag.
-	aspect := fs.String("aspect", "", "not implemented on the batchexecute transport")
-	seed := fs.Int64("seed", 0, "not implemented on the batchexecute transport")
+	// Not implemented on the batchexecute transport; declared, and named when
+	// passed, but the run continues without them.
+	aspect := fs.String("aspect", "", "ignored — not implemented on the batchexecute transport")
+	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	_ = fs.Parse(args)
 
 	if *prompt == "" {
 		return fail(fmt.Errorf("--prompt is required"))
 	}
-	if unsupported := unsupportedGenerateFlags(*aspect, "", *seed, nil); len(unsupported) > 0 {
-		return fail(fmt.Errorf("not implemented on the batchexecute transport: %s",
-			strings.Join(unsupported, ", ")))
-	}
+	warnIgnoredFlags(ignoredGenerateFlags(*aspect, "", *seed, nil))
 	if *count != 1 {
-		// The image RPC takes one prompt and returns one asset. Saying so is
-		// better than accepting the flag and returning a single image.
-		return fail(fmt.Errorf("--count is not implemented on the batchexecute transport; " +
-			"submit twice for two images"))
+		// The image RPC takes one prompt and returns one asset. Reporting it and
+		// continuing beats failing the run: the caller gets the image they asked
+		// for, plus a note that the other three are not coming.
+		warnIgnoredFlags([]string{fmt.Sprintf("--count %d (one asset per call)", *count)})
 	}
 
 	// Seed from a running server before building, because the engine reads its
@@ -735,25 +780,12 @@ func runCookies(args []string) int {
 	_ = fs.Parse(args)
 
 	// The same two candidates the engine tries, in the same order, so this
-	// reports the jar a run would actually use. Reading only CookieDir reported
-	// a file the engine never loaded once the bridge started writing its own.
-	candidates := []string{
-		filepath.Join(config.CookieDir(), "cookies.json"),
-		filepath.Join(config.DataDir(), "cookies.json"),
-	}
+	// reports the jar a run would actually use. The list lives in doctor.go now
+	// that two commands depend on it; keeping a second copy here is how the two
+	// would come to disagree.
+	candidates := cookieCandidates()
 
-	var (
-		path string
-		jar  *cookiejar.Jar
-		err  error
-	)
-	for _, candidate := range candidates {
-		jar, err = cookiejar.LoadFile(candidate)
-		if err == nil {
-			path = candidate
-			break
-		}
-	}
+	path, jar, _ := loadCookieJar()
 
 	if path == "" {
 		fmt.Printf("  no cookies at %s\n", strings.Join(candidates, " or "))
@@ -763,6 +795,8 @@ func runCookies(args []string) int {
 		fmt.Println("       the extension hands over cookies automatically.")
 		fmt.Println("    2. POST a cookie dump to /api/sync-cookies.")
 		fmt.Println("    3. Write a JSON array of cookies to one of those paths yourself.")
+		fmt.Println()
+		fmt.Println("  `flow-go doctor` checks this and everything downstream of it.")
 		return 1
 	}
 

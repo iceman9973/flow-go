@@ -4,8 +4,8 @@
  * The browser surface of the flow-go backend, and nothing more. Where the
  * generic CDP bridge this replaces exposes `cdp.call` and `cdp.evaluate` — that
  * is, arbitrary DevTools access to the whole browser — this extension exposes
- * the six things the backend actually needs from a page, each with its own
- * scope:
+ * the handful of things the backend actually needs from a page, each with its
+ * own scope:
  *
  *   cookies.list      the ~15 cookies Flow depends on, and only those
  *   flow.fingerprint  the identity a generation request has to present
@@ -13,6 +13,13 @@
  *   flow.projects     the project links on the current page
  *   flow.captcha      is the client loaded, and mint a token for an action
  *   flow.upscale      run the app's own SPrCad call and hand back the image
+ *
+ * Of those, flow.upscale is the one nothing calls. It is implemented and tested
+ * here and on the Go side, and the backend has no path that reaches it — the
+ * upscale chain there ends at Engine.SubmitVideo, which has no callers either.
+ * It is kept rather than deleted because the Go implementation is the last
+ * description of that wire shape, and it is flagged here so that finding it in
+ * the advertised ops list is not mistaken for the backend using it.
  *
  * Everything page-level runs through chrome.scripting.executeScript rather than
  * chrome.debugger. That is the substantive difference from the generic bridge:
@@ -265,16 +272,22 @@ async function mintCaptcha(siteKey, action) {
  * succeed from the page, and the difference is the TLS fingerprint. So the page
  * makes it.
  *
- * The request and the extraction both mirror the in-page expression the backend
- * used before this extension existed (internal/engine/upscale.go), because that
- * is the form the app accepts and the form the response actually takes.
+ * The request and the extraction mirror the in-page expression the backend used
+ * before this extension existed. That expression lived in an upscale.go the Go
+ * side no longer has — the file is gone from the tree, along with the
+ * TestUpscaleExpressionMatchesTheRequestTheAppExpects that used to pin it — so
+ * the claim this comment used to make, that changing one side fails the other's
+ * test, is no longer true and is not a property anyone should rely on.
  *
- * That request now exists twice — here and in that expression — and two
- * implementations of one wire contract drift unless both are pinned. So the
- * invariants are asserted on both sides: the expression is pinned by
- * TestUpscaleExpressionMatchesTheRequestTheAppExpects in
- * internal/engine/upscale_test.go, and the request made from here is pinned by
- * this extension's own harness. Change one and the other's test fails.
+ * What does hold it is this extension's own harness: the request made from here
+ * is pinned by the flow.upscale cases in test/dispatch.test.mjs. That covers the
+ * extension's half and nothing else.
+ *
+ * Be aware of what this operation is before wiring it to anything: it is
+ * implemented and tested at both ends and called by nothing in the engine. The
+ * Go-side upsample cluster is unreachable too — the chain ends at
+ * Engine.SubmitVideo, which has no callers. See the Upsampling section of
+ * internal/flowapi/generate.go.
  */
 async function runUpscale(cfg) {
   try {

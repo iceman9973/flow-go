@@ -368,24 +368,137 @@ func (p *Pool) Acquire(ctx context.Context, cost int) (*Worker, error) {
 	return p.acquireExcluding(ctx, cost, nil)
 }
 
+// AcquireTimeout bounds how long Acquire waits for a worker to become free.
+//
+// It is a wait for the *transient* case — every worker is busy and one will
+// finish — and it is deliberately not applied to the structural ones. A pool
+// with nothing registered, or with everything parked on a cooldown that outlasts
+// this window, cannot be fixed by waiting, and spending the full 30 seconds to
+// say so is what turned a clear failure into a slow one.
+const AcquireTimeout = 30 * time.Second
+
+// acquirePollInterval is how often a waiting Acquire re-checks for a free worker.
+const acquirePollInterval = 200 * time.Millisecond
+
+// NoWorkerError reports that no worker can take the job, and why.
+//
+// The wording leads with "no worker available" because that is the phrase
+// statusFor maps to a 503, and the reason is appended rather than replacing it —
+// the message used to be exactly "no worker available (registered=0)", which
+// says what happened but nothing about what to do.
+type NoWorkerError struct {
+	// Reason states the cause in the operator's terms.
+	Reason string
+	// RetryAfter is when a parked worker would come back, when that is known.
+	RetryAfter time.Time
+}
+
+func (e *NoWorkerError) Error() string {
+	msg := "pool: no worker available — " + e.Reason
+	if !e.RetryAfter.IsZero() {
+		msg += fmt.Sprintf("; the next one frees in %s", time.Until(e.RetryAfter).Round(time.Second))
+	}
+	return msg
+}
+
 // acquireExcluding is Acquire with a set of worker IDs to skip. Failover uses it
 // so a worker that already failed this job is not handed back again.
 func (p *Pool) acquireExcluding(ctx context.Context, cost int, exclude map[string]bool) (*Worker, error) {
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(AcquireTimeout)
 
 	for {
 		if w := p.pick(cost, exclude); w != nil {
 			return w, nil
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("pool: no worker available (registered=%d)", p.Size())
+
+		// Waiting only helps if something could free up. Ask before paying for
+		// the wait rather than after it.
+		if err := p.whyNothingAvailable(exclude, deadline); err != nil {
+			return nil, err
 		}
+
+		if time.Now().After(deadline) {
+			return nil, &NoWorkerError{
+				Reason: fmt.Sprintf("all %d registered worker(s) stayed busy for the full %s",
+					p.Size(), AcquireTimeout),
+			}
+		}
+
 		select {
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(acquirePollInterval):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// whyNothingAvailable explains why no worker can serve this request, and returns
+// nil when waiting could still change that.
+//
+// The distinction is the whole point: "busy" is worth waiting for, "absent" is
+// not. A worker parked by the circuit breaker is the interesting case — the
+// cooldown is 90 seconds against a 30-second wait, so a parked worker cannot
+// possibly come back before the deadline, and waiting for it is a guaranteed
+// 30-second failure. Naming when it frees is more useful than making the caller
+// sit through the wait to find out.
+func (p *Pool) whyNothingAvailable(exclude map[string]bool, deadline time.Time) error {
+	workers := p.Workers()
+
+	var candidates, parked int
+	var earliestFree time.Time
+	for _, w := range workers {
+		if exclude != nil && exclude[w.ID] {
+			continue
+		}
+		candidates++
+
+		until := w.parkedUntil()
+		if until.IsZero() {
+			continue
+		}
+		parked++
+		if earliestFree.IsZero() || until.Before(earliestFree) {
+			earliestFree = until
+		}
+	}
+
+	if candidates == 0 {
+		if len(workers) == 0 {
+			return &NoWorkerError{
+				Reason: "no account is registered — the engine has not bootstrapped, " +
+					"or its session was lost and its worker was dropped",
+			}
+		}
+		return &NoWorkerError{
+			Reason: fmt.Sprintf("every registered worker (%d) has already been tried for this job",
+				len(workers)),
+		}
+	}
+
+	// Every candidate is parked, so nothing can free up until a cooldown
+	// expires. If even the earliest of those expires after the deadline, the
+	// wait is guaranteed to fail.
+	if parked == candidates && !earliestFree.Before(deadline) {
+		return &NoWorkerError{
+			Reason: fmt.Sprintf("all %d worker(s) are parked after repeated failures and the "+
+				"cooldown outlasts this wait", candidates),
+			RetryAfter: earliestFree,
+		}
+	}
+
+	// At least one worker is merely busy, and will free up. Worth waiting for.
+	return nil
+}
+
+// parkedUntil returns when this worker's circuit closes, or the zero time when
+// it is not parked.
+func (w *Worker) parkedUntil() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if time.Now().Before(w.circuitOpenUntil) {
+		return w.circuitOpenUntil
+	}
+	return time.Time{}
 }
 
 func (p *Pool) pick(cost int, exclude map[string]bool) *Worker {
@@ -500,7 +613,12 @@ func (p *Pool) Execute(ctx context.Context, cost int, op func(context.Context, *
 	if lastErr != nil {
 		return fmt.Errorf("pool: all workers failed, last error: %w", lastErr)
 	}
-	return errors.New("pool: no worker could take the job")
+	// Reachable only when the loop exited without ever calling op, which the
+	// guard above prevents whenever a worker exists — so this is the empty pool.
+	return &NoWorkerError{
+		Reason: "no account is registered — the engine has not bootstrapped, " +
+			"or its session was lost and its worker was dropped",
+	}
 }
 
 func maxAttempts(size int) int {

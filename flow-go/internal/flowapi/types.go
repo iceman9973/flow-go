@@ -35,7 +35,9 @@ type GenerationContext struct {
 	AudioFailurePreference string `json:"audioFailurePreference,omitempty"`
 }
 
-// buildClientContext mirrors generators/common.py:build_client_context.
+// buildClientContext is the client-context block, as the Python engine built it.
+// The file it came from (generators/common.py) is no longer in this tree, so
+// there is nothing left to check this against — the shape is the record.
 func buildClientContext(projectID, tier, captchaToken string) *ClientContext {
 	return &ClientContext{
 		ProjectID:       projectID,
@@ -49,7 +51,8 @@ func buildClientContext(projectID, tier, captchaToken string) *ClientContext {
 	}
 }
 
-// buildGenerationContext mirrors generators/common.py:build_generation_context.
+// buildGenerationContext is the batch identity block, as the Python engine built
+// it. generators/common.py, the file it came from, is no longer in this tree.
 func buildGenerationContext(audioPref string) *GenerationContext {
 	return &GenerationContext{
 		BatchID:                uuid.NewString(),
@@ -57,11 +60,16 @@ func buildGenerationContext(audioPref string) *GenerationContext {
 	}
 }
 
-// resolveSeed mirrors generators/common.py:resolve_seed.
+// resolveSeed is the seed rule the Python engine used. generators/common.py, the
+// file it came from, is no longer in this tree.
 //
-// A nil seed yields a fresh random value per request, which is the Python
+// A nil seed yields a fresh random value per request, which was the Python
 // behaviour. An explicit seed is offset by the variation index so the takes in a
 // batch differ from each other while remaining reproducible as a set.
+//
+// Note that nothing on the working batchexecute path calls this: a seed is not
+// carried by that submission, which is why POST /v1/videos/generations reports
+// `seed` as ignored. It is reachable only from the legacy REST surface.
 func resolveSeed(seed *int64, index int) int64 {
 	if seed == nil {
 		return int64(randUint32()%9999) + 1

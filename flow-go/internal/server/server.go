@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -70,6 +71,12 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			// Empty is the normal case.
 			"flow_extensions": eng.CompetingExtensions(),
 			"error":           eng.LastError(),
+			// Why the engine cannot serve, or "" when it can. Reported here
+			// because it is the one state the caller cannot see from `ready`:
+			// that latch stays true once a bootstrap has succeeded, so an
+			// expired session with no browser attached reads as ready until a
+			// request fails. This is the field that says so first.
+			"session_failure": eng.SessionFailure(),
 		})
 	})
 
@@ -81,6 +88,7 @@ func RegisterRoutes(app *fiber.App, eng *engine.Engine, br *bridge.Bridge) {
 			"bridge":                br.Status(),
 			"pool":                  eng.Pool().Stats(),
 			"error":                 eng.LastError(),
+			"session_failure":       eng.SessionFailure(),
 		})
 	})
 
@@ -1315,6 +1323,12 @@ func recoverer(c fiber.Ctx) error {
 
 func healthStatus(eng *engine.Engine, br *bridge.Bridge) string {
 	switch {
+	case eng.SessionFailure() != "":
+		// Checked before ready, because ready stays true once a bootstrap has
+		// succeeded. Without this an engine whose session has expired and whose
+		// browser has gone still reports "ok" here, which is the one thing a
+		// health check must not do.
+		return "session_expired"
 	case eng.Ready():
 		return "ok"
 	case br.Connected():
@@ -1354,12 +1368,13 @@ func handleVideoGeneration(eng *engine.Engine) fiber.Handler {
 			return c.Status(400).JSON(fiber.Map{"error": "prompt is required"})
 		}
 
-		if unsupported := unsupportedVideoOptions(req); len(unsupported) > 0 {
-			return c.Status(400).JSON(fiber.Map{
-				"error": "unsupported option(s): " + strings.Join(unsupported, ", ") +
-					" — not implemented on the batchexecute transport",
-			})
-		}
+		// Fields the transport does not implement are reported, not refused.
+		// Refusing them failed a request that had nothing else wrong with it, and
+		// the caller's next move — drop the field and retry — was one the server
+		// could take for them. What the 400 protected against was a *silent*
+		// substitution, and naming the field in the response answers that without
+		// the failure.
+		ignored := ignoredVideoOptions(req)
 
 		// Video goes over the batchexecute transport, the same one the app uses.
 		// The aisandbox REST path this endpoint used to call is legacy and cannot
@@ -1379,31 +1394,39 @@ func handleVideoGeneration(eng *engine.Engine) fiber.Handler {
 			EndFrame:   req.EndFrame,
 		})
 		if err != nil {
-			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+			return generationFailure(c, outcome, err, ignored)
 		}
-		return c.JSON(outcome)
+		return generationSuccess(c, outcome, ignored)
 	}
 }
 
-// unsupportedVideoOptions names the video-generation fields the transport does not
-// implement. Note that `model` is *not* here: the engine accepts it and the
-// handler used to drop it, which made the field silently ineffective.
-func unsupportedVideoOptions(req VideoGenerationRequest) []string {
-	var out []string
+// ignoredVideoOptions names the video-generation fields the transport does not
+// apply, so the handler can report them instead of refusing the request.
+//
+// Note that `model` is *not* here: the engine accepts it and the handler used to
+// drop it, which made the field silently ineffective.
+func ignoredVideoOptions(req VideoGenerationRequest) []ignoredOption {
+	var out []ignoredOption
 	if strings.TrimSpace(req.Aspect) != "" {
-		out = append(out, "aspect")
+		out = append(out, ignoredOption{Field: "aspect"})
 	}
 	if strings.TrimSpace(req.Resolution) != "" {
-		out = append(out, "resolution")
+		out = append(out, ignoredOption{
+			Field: "resolution",
+			Hint:  "720p is what Flow renders on this transport; the model key encodes it",
+		})
 	}
 	if req.Seed != nil {
-		out = append(out, "seed")
+		out = append(out, ignoredOption{Field: "seed"})
 	}
 	if len(req.ReferenceImages) > 0 {
-		out = append(out, "reference_images")
+		out = append(out, ignoredOption{
+			Field: "reference_images",
+			Hint:  "POST /v1/videos/reference implements this, as a different RPC",
+		})
 	}
 	if strings.TrimSpace(req.AudioPreference) != "" {
-		out = append(out, "audio_preference")
+		out = append(out, ignoredOption{Field: "audio_preference"})
 	}
 	return out
 }
@@ -1417,15 +1440,13 @@ func handleImageGeneration(eng *engine.Engine) fiber.Handler {
 			return c.Status(400).JSON(fiber.Map{"error": "prompt is required"})
 		}
 
-		// The request type accepts more than the batchexecute path implements.
-		// Ignoring those fields returns a wrong result with a 200 — ask for four
-		// images and get one, with nothing to say why. Refuse them instead.
-		if unsupported := unsupportedImageOptions(req); len(unsupported) > 0 {
-			return c.Status(400).JSON(fiber.Map{
-				"error": "unsupported option(s): " + strings.Join(unsupported, ", ") +
-					" — not implemented on the batchexecute transport",
-			})
-		}
+		// The request type accepts more than the batchexecute path implements,
+		// and the old answer was to refuse the request. That is a 400 for a field
+		// that changed nothing about whether the generation could run, so the
+		// fields are named in the response instead. The failure that 400 was
+		// guarding against was asking for four images and getting one with
+		// nothing to say why — and the `ignored` list is what says why.
+		ignored := ignoredImageOptions(req)
 
 		// Images go over the batchexecute transport. The aisandbox REST path in
 		// internal/flowapi cannot work: the app moved to flow.google.com and the
@@ -1436,27 +1457,30 @@ func handleImageGeneration(eng *engine.Engine) fiber.Handler {
 			Download: boolOr(req.Download, true),
 		})
 		if err != nil {
-			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+			return generationFailure(c, outcome, err, ignored)
 		}
-		return c.JSON(outcome)
+		return generationSuccess(c, outcome, ignored)
 	}
 }
 
-// unsupportedImageOptions names the image-generation fields the transport does
-// not implement, so the caller is told rather than quietly given something else.
-func unsupportedImageOptions(req ImageGenerationRequest) []string {
-	var out []string
+// ignoredImageOptions names the image-generation fields the transport does not
+// apply, so the caller is told rather than quietly given something else.
+func ignoredImageOptions(req ImageGenerationRequest) []ignoredOption {
+	var out []ignoredOption
 	if req.Count > 1 {
-		out = append(out, "count")
+		out = append(out, ignoredOption{
+			Field: "count",
+			Hint:  "the image RPC takes one prompt and returns one asset; submit twice for two images",
+		})
 	}
 	if strings.TrimSpace(req.Aspect) != "" {
-		out = append(out, "aspect")
+		out = append(out, ignoredOption{Field: "aspect"})
 	}
 	if req.Seed != nil {
-		out = append(out, "seed")
+		out = append(out, ignoredOption{Field: "seed"})
 	}
 	if len(req.ReferenceIDs) > 0 {
-		out = append(out, "reference_images")
+		out = append(out, ignoredOption{Field: "reference_images"})
 	}
 	return out
 }
@@ -1489,9 +1513,9 @@ func handleVideoReference(eng *engine.Engine) fiber.Handler {
 			Download:   boolOr(req.Download, false),
 		})
 		if err != nil {
-			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+			return generationFailure(c, outcome, err, nil)
 		}
-		return c.JSON(outcome)
+		return generationSuccess(c, outcome, nil)
 	}
 }
 
@@ -1529,9 +1553,9 @@ func handleVideoEdit(eng *engine.Engine) fiber.Handler {
 			Download:  boolOr(req.Download, false),
 		})
 		if err != nil {
-			return c.Status(statusFor(err)).JSON(fiber.Map{"error": err.Error()})
+			return generationFailure(c, outcome, err, nil)
 		}
-		return c.JSON(outcome)
+		return generationSuccess(c, outcome, nil)
 	}
 }
 
@@ -1611,8 +1635,6 @@ func replacePlaceholder(value any, placeholder, with string) any {
 	}
 }
 
-// statusFor maps an engine error onto an HTTP status. A not-ready engine is a
-// 503 rather than a 500: the caller should retry once the browser has synced.
 // firstProjectID names the project a run would pick from a listing, or "" when
 // the account has none.
 func firstProjectID(projects []batchexecute.Project) string {
@@ -1622,10 +1644,36 @@ func firstProjectID(projects []batchexecute.Project) string {
 	return projects[0].ID
 }
 
+// statusFor maps an engine error onto an HTTP status. A not-ready engine is a
+// 503 rather than a 500: the caller should retry once the browser has synced.
+//
+// The typed checks come first, and they are the reason this is no longer purely
+// string matching. A reworded message used to change the status code silently,
+// and the two cases that matter most are exactly the ones where the caller's
+// next move differs: 503 means "fix the environment and retry", 502 means "the
+// upstream answered badly". Reading that off a substring is a coincidence rather
+// than a contract.
 func statusFor(err error) int {
 	if err == nil {
 		return 200
 	}
+
+	// The engine cannot serve, and retrying changes nothing until something
+	// outside the process is fixed — a browser attached, a session refreshed.
+	var unavailable *engine.UnavailableError
+	if errors.As(err, &unavailable) {
+		return 503
+	}
+
+	// The transport accepted the request and produced nothing. That is a bad
+	// response from a dependency rather than a bad request from the caller — and
+	// it used to be reported as a 200, which is the failure this type exists to
+	// end.
+	var empty *engine.EmptyResultError
+	if errors.As(err, &empty) {
+		return 502
+	}
+
 	message := err.Error()
 	switch {
 	// A refusal to spend money the account does not have is not an upstream
@@ -1644,6 +1692,79 @@ func statusFor(err error) int {
 	default:
 		return 502
 	}
+}
+
+// generationResponse carries a generation outcome plus what was asked for and not
+// applied.
+//
+// Two concrete types rather than one generic one, because Go does not allow
+// embedding a pointer to a type parameter and embedding is what keeps the
+// response shape identical: the outcome's fields are promoted to the top level,
+// so a caller who sends only supported fields sees exactly the response they saw
+// before `ignored` existed.
+type videoGenerationResponse struct {
+	*engine.BatchVideoOutcome
+	Ignored []ignoredOption `json:"ignored,omitempty"`
+}
+
+type batchGenerationResponse struct {
+	*engine.BatchOutcome
+	Ignored []ignoredOption `json:"ignored,omitempty"`
+}
+
+// generationSuccess writes a successful generation, naming any field that was
+// accepted and not applied.
+//
+// The type switch is the price of the two wrapper types, and the default branch
+// is what makes it safe to pay: a new outcome type that nobody taught this
+// function about fails loudly instead of having its `ignored` note dropped. A
+// dropped note is the exact failure this whole mechanism exists to end, so it
+// must not be reachable by adding a struct.
+func generationSuccess(c fiber.Ctx, outcome any, ignored []ignoredOption) error {
+	if len(ignored) == 0 {
+		return c.JSON(outcome)
+	}
+
+	switch o := outcome.(type) {
+	case *engine.BatchVideoOutcome:
+		return c.JSON(videoGenerationResponse{o, ignored})
+	case *engine.BatchOutcome:
+		return c.JSON(batchGenerationResponse{o, ignored})
+	default:
+		return c.Status(500).JSON(fiber.Map{
+			"error": fmt.Sprintf("generation: no response shape for %T", outcome),
+		})
+	}
+}
+
+// generationFailure writes the error response for a generation call.
+//
+// Shared rather than inlined four times because of the empty case, which is the
+// one that has to be got right. The engine returns the outcome *alongside* the
+// error when the transport accepted the request and produced nothing, and the
+// body carries both halves: the error says what happened, and the outcome carries
+// what the transport actually answered — the raw frames, the job id, the project
+// and the balance.
+//
+// Dropping either half leaves the caller with a 502 and no way to tell an expired
+// captcha from a project that does not exist. This is the response that used to
+// be a 200 with `status: "empty"` and `media: null`.
+//
+// ignored rides along on the failure too, and that is deliberate: a caller who
+// sent `aspect` and hit an empty result has two candidate explanations, and
+// saying which fields were dropped is what stops them from chasing the wrong one.
+func generationFailure(c fiber.Ctx, outcome any, err error, ignored []ignoredOption) error {
+	body := fiber.Map{"error": err.Error()}
+	if len(ignored) > 0 {
+		body["ignored"] = ignored
+	}
+
+	var empty *engine.EmptyResultError
+	if errors.As(err, &empty) && outcome != nil {
+		body["status"] = "empty"
+		body["outcome"] = outcome
+	}
+	return c.Status(statusFor(err)).JSON(body)
 }
 
 /* ------------------------------------------------------------------ *

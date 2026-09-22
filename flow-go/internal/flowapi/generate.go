@@ -358,10 +358,29 @@ func (c *Client) UploadImage(ctx context.Context, data []byte, mimeType string) 
  * Upsampling
  * ------------------------------------------------------------------ */
 
-// upsampleResolutionCandidates mirrors the ladder in generators/upsample.py.
-// The resolution enum is undocumented, so a rejected spelling is retried and
-// finally omitted entirely — the model key already encodes the target. A
-// rejected request never starts a generation, so the ladder cannot double-charge.
+// Everything under this heading is unreachable from the HTTP API and the CLI.
+//
+// The only caller is Engine.upsample, which is called only by Engine.GenerateVideo,
+// which is called only by Engine.SubmitVideo — and SubmitVideo has no callers at
+// all. It was kept as a record of the legacy aisandbox surface, and it is still
+// worth keeping for that: this file and config.go are the only surviving
+// description of how a second upscale pass was shaped, and the Python engine it
+// was ported from is gone from the tree.
+//
+// What it is not is wired up. Nothing here runs, no route reaches it, and the
+// upsample model keys are not on the batchexecute transport. A reader who finds
+// a `resolution` field on a request type and follows it here should leave with
+// that answer rather than with the impression that a 4k render is one call away.
+//
+// The extension's `flow.upscale` operation is the same situation from the other
+// end: implemented and tested in the browser, advertised in the extension's
+// capability list, and called by nothing in the engine.
+
+// upsampleResolutionCandidates is the retry ladder the Python engine used, whose
+// generators/upsample.py is no longer in this tree. The resolution enum is
+// undocumented, so a rejected spelling is retried and finally omitted entirely —
+// the model key already encodes the target. A rejected request never starts a
+// generation, so the ladder cannot double-charge.
 var upsampleResolutionCandidates = map[string][]string{
 	"1080p": {"VIDEO_RESOLUTION_1080P", "VIDEO_RESOLUTION_1080p", ""},
 	"4k":    {"VIDEO_RESOLUTION_4K", "VIDEO_RESOLUTION_4k", ""},
@@ -373,6 +392,8 @@ var schemaRejectionHints = []string{
 
 // NormalizeResolution maps a user-facing resolution to an upsample tier, or ""
 // for the native 720p output which needs no second pass.
+//
+// Unreachable — see the note at the head of this section.
 func NormalizeResolution(resolution string) (string, error) {
 	key := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(resolution), " ", ""))
 	switch key {
@@ -388,6 +409,9 @@ func NormalizeResolution(resolution string) (string, error) {
 
 // UpsampleVideo submits a second pass that renders a finished video at a higher
 // resolution. Returns the media IDs of the upsampled output.
+//
+// Unreachable — see the note at the head of the Upsampling section. The chain
+// that would reach it ends at Engine.SubmitVideo, which nothing calls.
 func (c *Client) UpsampleVideo(ctx context.Context, mediaID, aspect, resolution string, seed *int64, sceneID string) ([]string, error) {
 	tier, err := NormalizeResolution(resolution)
 	if err != nil {

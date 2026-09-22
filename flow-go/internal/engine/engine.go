@@ -119,6 +119,15 @@ type Engine struct {
 	hasSession bool
 	ready      bool
 	lastError  string
+
+	// sessionMu guards sessionDead, and is separate from mu on purpose.
+	//
+	// The 401 path sets this from inside an upstream call, and the caller that
+	// reached that call may already hold mu for reading. Reusing mu would make
+	// the lock ordering depend on which engine method happened to be in flight,
+	// which is the kind of thing that works until the day it does not.
+	sessionMu   sync.Mutex
+	sessionDead sessionDeath
 }
 
 // BearerPathAvailable reports whether the bearer path has a credential.
@@ -253,7 +262,15 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 	// an operator calls /v1/bridge/refresh by hand.
 	client.SetUnauthorizedHandler(func(ctx context.Context) (*cookiejar.Jar, error) {
 		if e.bridge == nil || !e.bridge.Connected() {
-			return nil, fmt.Errorf("engine: the session expired and no browser is attached to refresh it")
+			// The moment the engine learns the session cannot be recovered.
+			// Recorded, because the alternative is that every later request
+			// repeats this whole sequence — balance read, captcha mint, priming
+			// retries — to discover the same fact. See session.go.
+			e.markSessionDead(deadSessionReason())
+			return nil, &UnavailableError{
+				Reason: deadSessionReason(),
+				Hint:   sessionHint,
+			}
 		}
 		jar, err := e.bridge.RefreshSession(ctx)
 		if err != nil {
@@ -943,15 +960,16 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	}
 
 	// One browser can hold several signed-in accounts and they share a cookie
-	// jar, so the hash alone cannot tell them apart — the index is part of the
+	// jar, so the jar alone cannot tell them apart — the index is part of the
 	// identity, and without it two accounts collapse into one row.
-	accountID := e.opts.AccountID
-	if accountID == "" {
-		accountID = shortID(jar.Hash())
-		if index > 0 {
-			accountID += fmt.Sprintf("-u%d", index)
-		}
-	}
+	//
+	// The anchor is taken from the long-lived credential cookies rather than the
+	// whole jar, and a new anchor has to fail a continuity check before it is
+	// treated as a new account. See identity.go: keying on the whole jar made
+	// the identity a function of state that rotates, so one account became a new
+	// row every time a cookie moved.
+	identity := e.resolveIdentity(jar, session, index)
+	accountID := identity.AccountID
 
 	// Read the browser identity first, because two things below depend on it:
 	// the captcha provider presents it when it mints a token, and every call
@@ -1009,14 +1027,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// Record the account. Credits are left unknown until a real check runs —
 	// writing a plausible-looking number here is exactly how the Python version
 	// ended up reporting test fixtures as live balances.
-	if err := e.store.UpsertAccount(store.Account{
-		AccountID:  accountID,
-		CookieHash: jar.Hash(),
-		SKU:        session.Sku,
-		Status:     "active",
-	}); err != nil {
-		log.Printf("engine: could not record account: %v", err)
-	}
+	e.recordIdentity(identity, jar, session.Sku, index)
 
 	e.mu.Lock()
 	e.accountID = accountID
@@ -1034,6 +1045,18 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	log.Printf("engine: ready — account %s, %d cookies (%s), project %s, captcha %s",
 		accountID, jar.Count(), source,
 		projectID, captchaProvider.Name())
+
+	// A bootstrap that got this far is the evidence that the session works
+	// again, and the only evidence that clears a death record. Cleared here
+	// rather than on the extension reconnecting: an attached browser holding
+	// expired cookies is still a session that cannot serve, and clearing on
+	// connection would drop the engine straight back into the slow failure.
+	//
+	// Deliberately before the balance refresh below. That read is an
+	// authenticated call, so a 401 from it is real evidence the session is still
+	// dead — clearing afterwards would swallow exactly the signal this is here
+	// to record.
+	e.noteSessionRestored()
 
 	// Last, so every extension that is going to connect has. A second narrow
 	// extension makes everything above provisional, and the operator needs to
@@ -1669,7 +1692,7 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 	})
 
 	if poolErr != nil {
-		e.finishJob(jobID, "failed", nil, start, poolErr)
+		e.finishJob(jobID, "failed", nil, start, poolErr, accountID)
 		_ = e.store.RecordAccountOutcome(accountID, true, poolErr.Error())
 		return nil, poolErr
 	}
@@ -1729,7 +1752,7 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 	result.ElapsedS = result.Elapsed.Seconds()
 
 	credits := outcome.RemainingCredits
-	e.finishJob(jobID, result.Status, &credits, start, nil)
+	e.finishJob(jobID, result.Status, &credits, start, nil, accountID)
 	_ = e.store.RecordAccountOutcome(accountID, false, "")
 	e.clearError()
 
@@ -1739,6 +1762,17 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 // SubmitVideo starts a video generation in the background and returns its job ID
 // immediately, so an HTTP caller is not held open for the minutes a generation
 // takes. Poll the job for progress.
+//
+// Unreachable, and it is the head of the dead chain: nothing in the server, the
+// CLI or the tests calls this. It is what makes GenerateVideo reachable, which
+// is in turn the only caller of upsample, and through that of
+// flowapi.Client.UpsampleVideo. The whole legacy aisandbox generation surface
+// hangs off this function, which is why the comment on GenerateImageViaBatch
+// calls that surface "a record of what was tried".
+//
+// Left in place rather than deleted for that reason. Do not mistake it for a
+// working entry point: the generation paths the API and the CLI use are
+// GenerateVideoViaBatch and GenerateImageViaBatch.
 func (e *Engine) SubmitVideo(ctx context.Context, req VideoRequest) (string, error) {
 	if !e.Ready() {
 		return "", fmt.Errorf("engine: not ready — call Bootstrap first")
@@ -1757,16 +1791,19 @@ func (e *Engine) SubmitVideo(ctx context.Context, req VideoRequest) (string, err
 	}
 
 	// Create the tracking row now, so a poll issued immediately after submit
-	// finds the job rather than a 404.
+	// finds the job rather than a 404. Attributed here too: this path submits
+	// asynchronously and never runs through finishJob, so without it the row
+	// would stay unattributed forever.
 	if _, err := e.store.RecordGeneration(store.Generation{
-		JobID:    req.JobID,
-		Kind:     "video",
-		Prompt:   req.Prompt,
-		Model:    recordedModel,
-		Duration: req.Duration,
-		Aspect:   req.Aspect,
-		Count:    req.Count,
-		Status:   "submitted",
+		JobID:     req.JobID,
+		AccountID: e.AccountID(),
+		Kind:      "video",
+		Prompt:    req.Prompt,
+		Model:     recordedModel,
+		Duration:  req.Duration,
+		Aspect:    req.Aspect,
+		Count:     req.Count,
+		Status:    "submitted",
 	}); err != nil {
 		return "", err
 	}
@@ -1993,7 +2030,7 @@ func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOut
 	})
 
 	if poolErr != nil {
-		e.finishJob(jobID, "failed", nil, start, poolErr)
+		e.finishJob(jobID, "failed", nil, start, poolErr, accountID)
 		_ = e.store.RecordAccountOutcome(accountID, true, poolErr.Error())
 		return nil, poolErr
 	}
@@ -2020,7 +2057,7 @@ func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOut
 	}
 
 	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
+	e.finishJob(jobID, outcome.Status, nil, start, nil, accountID)
 	_ = e.store.RecordAccountOutcome(accountID, false, "")
 	e.clearError()
 
@@ -2353,8 +2390,10 @@ func canMoveAccounts(req BatchVideoRequest) bool {
 
 // GenerateVideoViaBatch submits a video generation over batchexecute.
 func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoRequest) (*BatchVideoOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+	// Fail here rather than 25 seconds from now. See session.go for why the
+	// readiness latch alone could not do this.
+	if err := e.preflight(); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("engine: a prompt is required")
@@ -2401,14 +2440,20 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	jobID := uuid.NewString()
 	start := time.Now()
 
+	// The batch path has no pool to pick a worker from, so the account is known
+	// up front. Recorded on the row at submit and again when the job finishes,
+	// which is what stops generations.account_id being left empty.
+	accountID := e.AccountID()
+
 	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:    jobID,
-		Kind:     "video",
-		Prompt:   req.Prompt,
-		Model:    model,
-		Duration: req.Duration,
-		Count:    req.Count,
-		Status:   "submitted",
+		JobID:     jobID,
+		AccountID: accountID,
+		Kind:      "video",
+		Prompt:    req.Prompt,
+		Model:     model,
+		Duration:  req.Duration,
+		Count:     req.Count,
+		Status:    "submitted",
 	})
 	if err != nil {
 		log.Printf("engine: could not record the job: %v", err)
@@ -2418,7 +2463,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	jar := e.bridge.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 
@@ -2456,7 +2501,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 	if !plan.Affordable() {
 		err := fmt.Errorf("engine: %s", plan.Reason)
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 	model, quality = plan.Model, plan.Quality
@@ -2465,18 +2510,18 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	// caller supplied so a freshly uploaded file's media id also works.
 	startImage, err := e.conditionImageID(ctx, req.StartImage)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 	endImage, err := e.conditionImageID(ctx, req.EndImage)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 
 	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
@@ -2495,7 +2540,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		BuildLabel: config.BuildLabel(),
 	}))
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
 		return nil, err
 	}
@@ -2512,10 +2557,24 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	for _, frame := range frames {
 		outcome.MediaIDs = append(outcome.MediaIDs, batchexecute.ParseGeneratedMediaIDs(frame.Payload)...)
 	}
+
+	// Non-nil exactly when nothing came back, and returned alongside the outcome
+	// at the end of this function. Declared here so the two cannot drift apart:
+	// the outcome is still worth handing back — it carries the raw frames — but
+	// the request did not succeed and the caller has to be told.
+	var emptyErr error
 	if len(outcome.MediaIDs) == 0 {
 		outcome.Status = "empty"
 		for _, frame := range frames {
 			outcome.RawFrames = append(outcome.RawFrames, frame.Payload)
+		}
+		emptyErr = &EmptyResultError{
+			Kind:    "video",
+			Model:   model,
+			JobID:   jobID,
+			Account: e.AccountID(),
+			Frames:  len(frames),
+			Hint:    e.emptySubmissionHint(),
 		}
 	}
 
@@ -2564,7 +2623,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 
 	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, spent, start, nil)
+	e.finishJob(jobID, outcome.Status, spent, start, nil, accountID)
 	_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
 
 	if len(outcome.MediaIDs) == 0 {
@@ -2593,7 +2652,11 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 				"recorded, so the balance cannot be ruled in or out. %s",
 				model, quality, e.emptySubmissionHint())
 		}
-		return outcome, nil
+		// The outcome goes back with the error rather than instead of it: the
+		// raw frames are the only record of what the transport actually said,
+		// and discarding them to return a bare error would throw away the one
+		// thing that makes this diagnosable.
+		return outcome, emptyErr
 	}
 
 	log.Printf("engine: submitted %d video(s) as %s in %.1fs",
@@ -2625,8 +2688,8 @@ type BatchEditRequest struct {
 // generation layout here is accepted and returns an empty result, which is what
 // made this look unimplemented rather than mis-shaped.
 func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*BatchVideoOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+	if err := e.preflight(); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(req.Source) == "" {
 		return nil, fmt.Errorf("engine: a source asset is required")
@@ -2650,12 +2713,16 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	jobID := uuid.NewString()
 	start := time.Now()
 
+	// Known up front on this path — see the note in GenerateVideoViaBatch.
+	accountID := e.AccountID()
+
 	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:  jobID,
-		Kind:   "video",
-		Prompt: req.Prompt,
-		Model:  model,
-		Status: "submitted",
+		JobID:     jobID,
+		AccountID: accountID,
+		Kind:      "video",
+		Prompt:    req.Prompt,
+		Model:     model,
+		Status:    "submitted",
 	})
 	if err != nil {
 		log.Printf("engine: could not record the job: %v", err)
@@ -2664,21 +2731,21 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 
 	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
 	jar := e.bridge.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
 
 	source, err := e.conditionImageID(ctx, req.Source)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 
@@ -2693,7 +2760,7 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 		BuildLabel: config.BuildLabel(),
 	}))
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
 		return nil, err
 	}
@@ -2708,8 +2775,18 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	for _, frame := range frames {
 		outcome.MediaIDs = append(outcome.MediaIDs, batchexecute.ParseGeneratedMediaIDs(frame.Payload)...)
 	}
+
+	var emptyErr error
 	if len(outcome.MediaIDs) == 0 {
 		outcome.Status = "empty"
+		emptyErr = &EmptyResultError{
+			Kind:    "video edit",
+			Model:   model,
+			JobID:   jobID,
+			Account: e.AccountID(),
+			Frames:  len(frames),
+			Hint:    e.emptySubmissionHint(),
+		}
 	}
 
 	if credits, credErr := client.Credits(ctx, batchexecute.CallOptions{
@@ -2728,12 +2805,12 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	}
 
 	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
+	e.finishJob(jobID, outcome.Status, nil, start, nil, accountID)
 	_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
 
 	log.Printf("engine: submitted an edit of %s as %s in %.1fs",
 		shortID(source), model, outcome.ElapsedS)
-	return outcome, nil
+	return outcome, emptyErr
 }
 
 // BatchReferenceRequest asks for a generation conditioned on reference images.
@@ -2759,8 +2836,8 @@ type BatchReferenceRequest struct {
 // success. The real submission goes to MZZa6b with a payload that puts the prompt
 // at index 0 and the reference list at index 1 — not the i2v arrangement.
 func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req BatchReferenceRequest) (*BatchVideoOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+	if err := e.preflight(); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("engine: a prompt is required")
@@ -2792,6 +2869,11 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	jobID := uuid.NewString()
 	start := time.Now()
 
+	// The batch path has no pool to pick a worker from, so the account is known
+	// up front. Recorded on the row at submit and again when the job finishes,
+	// which is what stops generations.account_id being left empty.
+	accountID := e.AccountID()
+
 	rowID, err := e.store.RecordGeneration(store.Generation{
 		JobID:    jobID,
 		Kind:     "video",
@@ -2807,14 +2889,14 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 
 	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
 	jar := e.bridge.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
@@ -2824,7 +2906,7 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	for _, ref := range req.References {
 		resolved, err := e.conditionImageID(ctx, ref)
 		if err != nil {
-			e.finishJob(jobID, "failed", nil, start, err)
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
 			return nil, err
 		}
 		refs = append(refs, resolved)
@@ -2841,7 +2923,7 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 		BuildLabel: config.BuildLabel(),
 	}))
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
 		return nil, err
 	}
@@ -2856,8 +2938,18 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	for _, frame := range frames {
 		outcome.MediaIDs = append(outcome.MediaIDs, batchexecute.ParseGeneratedMediaIDs(frame.Payload)...)
 	}
+
+	var emptyErr error
 	if len(outcome.MediaIDs) == 0 {
 		outcome.Status = "empty"
+		emptyErr = &EmptyResultError{
+			Kind:    "video reference",
+			Model:   model,
+			JobID:   jobID,
+			Account: e.AccountID(),
+			Frames:  len(frames),
+			Hint:    e.emptySubmissionHint(),
+		}
 	}
 
 	if credits, credErr := client.Credits(ctx, batchexecute.CallOptions{
@@ -2876,12 +2968,12 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	}
 
 	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
+	e.finishJob(jobID, outcome.Status, nil, start, nil, accountID)
 	_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
 
 	log.Printf("engine: submitted %d reference(s) as %s in %.1fs",
 		len(refs), model, outcome.ElapsedS)
-	return outcome, nil
+	return outcome, emptyErr
 }
 
 // LabsAccessToken mints (or returns a cached) Labs access token.
@@ -3281,8 +3373,8 @@ type BatchOutcome struct {
 // blocks the app's own origin; it is kept only for the endpoints that still work
 // there (credits) and as a record of what was tried.
 func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageRequest) (*BatchOutcome, error) {
-	if !e.Ready() {
-		return nil, fmt.Errorf("engine: not ready — call Bootstrap first")
+	if err := e.preflight(); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("engine: a prompt is required")
@@ -3300,12 +3392,16 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	jobID := uuid.NewString()
 	start := time.Now()
 
+	// Known up front on this path — see the note in GenerateVideoViaBatch.
+	accountID := e.AccountID()
+
 	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:  jobID,
-		Kind:   "image",
-		Prompt: req.Prompt,
-		Model:  model,
-		Status: "submitted",
+		JobID:     jobID,
+		AccountID: accountID,
+		Kind:      "image",
+		Prompt:    req.Prompt,
+		Model:     model,
+		Status:    "submitted",
 	})
 	if err != nil {
 		log.Printf("engine: could not record the job: %v", err)
@@ -3316,14 +3412,14 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	// something the app ever does.
 	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
 	jar := e.bridge.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 
@@ -3338,7 +3434,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		BuildLabel: config.BuildLabel(),
 	}))
 	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err)
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
 		return nil, err
 	}
@@ -3351,11 +3447,19 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Media:     media,
 		Status:    "succeeded",
 	}
+	var emptyErr error
 	if len(media) == 0 {
 		// Accepted but nothing came back. The app's own call returns the asset
 		// inline, so this means the request was a no-op — worth surfacing rather
 		// than reporting success on an empty result.
 		outcome.Status = "empty"
+		emptyErr = &EmptyResultError{
+			Kind:    "image",
+			Model:   model,
+			JobID:   jobID,
+			Account: e.AccountID(),
+			Hint:    e.emptyImageHint(),
+		}
 	}
 
 	if req.Download {
@@ -3373,11 +3477,11 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	}
 
 	outcome.ElapsedS = time.Since(start).Seconds()
-	e.finishJob(jobID, outcome.Status, nil, start, nil)
+	e.finishJob(jobID, outcome.Status, nil, start, nil, accountID)
 	_ = e.store.RecordAccountOutcome(e.AccountID(), false, "")
 
 	log.Printf("engine: generated %d image(s) in %.1fs", len(media), outcome.ElapsedS)
-	return outcome, nil
+	return outcome, emptyErr
 }
 
 // batchImageModel resolves a friendly model name to the enum the RPC expects.
@@ -3559,12 +3663,21 @@ func (e *Engine) recordMedia(generationRow int64, file MediaFile, kind, prompt, 
 	}
 }
 
-func (e *Engine) finishJob(jobID, status string, credits *int, start time.Time, err error) {
+// finishJob marks a generation row terminal and stamps it with the account that
+// ran it.
+//
+// accountID is what makes generations.account_id useful. The row is written at
+// submit, before the pool has chosen a worker, so the account is genuinely
+// unknown at that point and the column was left empty on every row. Passing it
+// here fills it in on the way out. An empty value is not an error — the store
+// guards the column, so a caller with nothing to add leaves the recorded value
+// alone rather than erasing it.
+func (e *Engine) finishJob(jobID, status string, credits *int, start time.Time, err error, accountID string) {
 	message := ""
 	if err != nil {
 		message = err.Error()
 	}
-	if err := e.store.FinishGeneration(jobID, status, credits, time.Since(start).Milliseconds(), message); err != nil {
+	if err := e.store.FinishGeneration(jobID, status, credits, time.Since(start).Milliseconds(), message, accountID); err != nil {
 		log.Printf("engine: could not finalise job %s: %v", shortID(jobID), err)
 	}
 }

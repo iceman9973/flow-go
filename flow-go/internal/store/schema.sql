@@ -3,10 +3,11 @@
 --
 -- Every table here is written by the running engine. Nothing in this database is
 -- seeded with test fixtures: the Python version's /stats endpoint reported
--- 1600 credits and 8 accounts that were entirely rows left behind by
--- tests/test_worker_pool.py, which wrote to the production database because it
--- had no isolation. Tests here use a temporary file per test and never touch
--- this database.
+-- 1600 credits and 8 accounts that were entirely rows left behind by its own
+-- worker-pool test, which wrote to the production database because it had no
+-- isolation. That test and the rest of the Python tree are gone; the reason to
+-- remember them is that this file must never grow a seed block. Tests here use a
+-- temporary file per test and never touch this database.
 -- ============================================================================
 
 PRAGMA journal_mode = WAL;
@@ -29,10 +30,51 @@ CREATE TABLE IF NOT EXISTS accounts (
     total_requests      INTEGER NOT NULL DEFAULT 0,
     total_failures      INTEGER NOT NULL DEFAULT 0,
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_used_at        DATETIME
+    last_used_at        DATETIME,
+
+    -- Identity.
+    --
+    -- identity_key is the anchor the account is matched on: a hash of the
+    -- long-lived credential cookies, a GAIA id, or an explicit override. It is
+    -- deliberately separate from account_id so a rotation can move the anchor
+    -- without changing the label — which is what stops one account becoming
+    -- several rows. cookie_hash above is now only a change detector.
+    identity_key        TEXT,
+    identity_source     TEXT,                      -- override|session|cookie-core|re-anchored|adopted-legacy
+    superseded_by       TEXT,                      -- set when this anchor rotated into another
+    last_authuser       INTEGER,                   -- the authuser index this row was last seen at
+    sapisid_fingerprint TEXT                       -- hash of SAPISID; the continuity proof
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+
+-- NOTE: there is deliberately no index on accounts(identity_key) here.
+--
+-- This script runs before migrate() adds the identity columns to a database
+-- that predates them, and CREATE INDEX on a column that does not exist yet is
+-- not a no-op — SQLite rejects it with "no such column". A database created
+-- before this change would then refuse to open at all. The index is created
+-- after the ALTERs instead; see postColumnIndexes in db.go.
+
+-- ----------------------------------------------------------------------------
+-- account_anchors: every anchor and jar hash an account has ever presented.
+--
+-- This is the audit trail that makes re-anchoring safe. When an anchor rotates,
+-- the old one is kept here rather than overwritten, so "these two rows are the
+-- same account" is a recorded fact the operator can check instead of an
+-- inference they have to trust.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS account_anchors (
+    account_id   TEXT NOT NULL,
+    identity_key TEXT NOT NULL,
+    cookie_hash  TEXT,                             -- NULL for an anchor recorded before its jar hash was known
+    source       TEXT,
+    first_seen   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (account_id, identity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_anchors_key ON account_anchors(identity_key);
 
 -- ----------------------------------------------------------------------------
 -- generations: one row per submitted generation job.
@@ -48,7 +90,12 @@ CREATE TABLE IF NOT EXISTS generations (
     aspect              TEXT,
     count               INTEGER NOT NULL DEFAULT 1,
     media_ids           TEXT,                      -- JSON array
-    status              TEXT NOT NULL DEFAULT 'submitted',  -- submitted|succeeded|failed
+    -- Five values, not three. 'empty' is a job the transport accepted and
+    -- produced nothing for, and 'ready' is a video whose render resolved and was
+    -- downloaded. Both were missing from this comment and from the Stats query,
+    -- which is how ten of the fifteen jobs in one database came to be counted in
+    -- no bucket at all.
+    status              TEXT NOT NULL DEFAULT 'submitted',  -- submitted|succeeded|failed|empty|ready
     credits_spent       INTEGER,
     elapsed_ms          INTEGER,
     error               TEXT,

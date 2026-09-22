@@ -1,8 +1,14 @@
 // Package config holds every constant the Flow client needs.
 //
-// Ported from flow-agent/flow_engine/config.py so the Go port stays behaviourally
-// identical to the Python engine it replaces. Values that were environment
-// overrides in Python remain environment overrides here.
+// Ported from a Python engine that is no longer in this tree: the directory that
+// held it, flow-agent/flow_engine, has been deleted, so the comments below that
+// name it record where a value came from rather than pointing at something you
+// can still go and read. That makes this file the only surviving copy of those
+// values, which is the reason to keep the ones nothing calls — see the legacy
+// Labs block near the bottom.
+//
+// Values that were environment overrides in Python remain environment overrides
+// here.
 package config
 
 import (
@@ -103,7 +109,8 @@ type ClientContextValues struct {
 	RecaptchaAppType string
 }
 
-// ClientCtx mirrors CLIENT_CTX in config.py.
+// ClientCtx is the value the Python engine carried as CLIENT_CTX. That file is
+// gone, so this is now the only copy.
 var ClientCtx = ClientContextValues{
 	Tool:             "PINHOLE",
 	Tier:             "PAYGATE_TIER_ONE",
@@ -130,7 +137,8 @@ var ImageAspects = map[string]string{
  * Endpoints
  * ------------------------------------------------------------------ */
 
-// Endpoints mirrors ENDPOINTS in config.py. Paths containing "{}" are templates.
+// Endpoints is the map the Python engine carried as ENDPOINTS. That file is
+// gone, so this is now the only copy. Paths containing "{}" are templates.
 var Endpoints = map[string]string{
 	"generate_t2v":    "/v1/video:batchAsyncGenerateVideoText",
 	"generate_i2v":    "/v1/video:batchAsyncGenerateVideoStartImage",
@@ -438,11 +446,15 @@ var UserAgents = []string{
 
 // The legacy Labs REST surface.
 //
-// These are the values the previous Python engine hardcoded
-// (flow_engine/config.py). They are kept so the surface can be probed: if it still
-// answers, the image-to-video, reference and edit generators can be ported from
-// that reference instead of re-derived for batchexecute. Nothing depends on them
-// at runtime yet.
+// These are the values the previous Python engine hardcoded. That engine is gone
+// from this tree, so these constants are the only surviving record of the
+// surface — which is a better reason to keep them than the one they were kept
+// for.
+//
+// They are kept so the surface can be probed: if it still answers, the
+// image-to-video, reference and edit generators can be ported from the recorded
+// shape instead of re-derived for batchexecute. Nothing depends on them at
+// runtime, and nothing here is reachable from the HTTP API or the CLI.
 const (
 	labsAPIBase = "https://aisandbox-pa.googleapis.com"
 	// labsAPIKey is the public client key the previous engine shipped. It is not

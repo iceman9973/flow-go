@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
+	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )

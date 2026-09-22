@@ -26,11 +26,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/auth"
 	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
+	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
@@ -935,42 +935,6 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// so the session, the project and every later call agree on it.
 	index := e.AccountIndex()
 
-	provider := auth.NewProvider(jar, e.hc)
-	// The provider has to know which signed-in account to mint for, or it
-	// silently mints the first one while the project came from another.
-	provider.SetAccountIndex(index)
-
-	// The Labs session is the bearer path's credential, and the bearer path is
-	// the legacy one. The app moved from labs.google to flow.google.com — which
-	// now answers 308 for the old route — and a browser signed in there carries
-	// Google's account cookies and no Labs NextAuth session at all. The path that
-	// works, batchexecute authenticated by SAPISIDHASH over those cookies, never
-	// asks for the session.
-	//
-	// Refusing to boot over it made the whole engine unusable, including the
-	// cookie-authenticated path that was fine, so the failure is recorded and the
-	// boot continues. Calls that genuinely need a bearer token still fail, with
-	// their own error, at the point they need it.
-	session, sessionErr := provider.Session(ctx)
-	hasSession := sessionErr == nil
-	if sessionErr != nil {
-		log.Printf("engine: no Labs session (%v); the bearer path is unavailable, "+
-			"continuing on the cookie-authenticated path", sessionErr)
-		session = &auth.Session{}
-	}
-
-	// One browser can hold several signed-in accounts and they share a cookie
-	// jar, so the jar alone cannot tell them apart — the index is part of the
-	// identity, and without it two accounts collapse into one row.
-	//
-	// The anchor is taken from the long-lived credential cookies rather than the
-	// whole jar, and a new anchor has to fail a continuity check before it is
-	// treated as a new account. See identity.go: keying on the whole jar made
-	// the identity a function of state that rotates, so one account became a new
-	// row every time a cookie moved.
-	identity := e.resolveIdentity(jar, session, index)
-	accountID := identity.AccountID
-
 	// Read the browser identity first, because two things below depend on it:
 	// the captcha provider presents it when it mints a token, and every call
 	// this engine makes has to present the same identity as the token's.
@@ -988,46 +952,41 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(),
 		e.captchaPageURL, e.bridge.Current, userAgentOf(browserFP))
 
-	// Prefer the account's own project list over navigating a browser to read an
-	// editor URL: both are live, and only one of them drives a tab. The browser
-	// remains the fallback for when the listing is rejected.
-	projectID, projectSource := chooseProjectID(e.opts.ProjectID, e.opts.DefaultProjectID,
-		func() string { return e.projectFromRPC(ctx, jar, index) },
-		func() string { return e.projectFromBrowser(ctx, index) })
-	if projectSource == projectSourceConfigured {
-		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); no source was consulted", projectID)
-	}
+	// The account the engine acts as, and the only one whose cookies came from
+	// the bridge or from cookies.json. Everything below reads the account and the
+	// project off this value rather than off the engine's own fields, because a
+	// second account registered further down overwrites those.
+	primary := e.resolveAccount(ctx, jar, index, browserFP, captchaProvider)
+	e.pool.Register(primary.Worker)
+
+	accountID := primary.AccountID
+	projectID := primary.ProjectID
+	hasSession := primary.HasSession
+	client := primary.Client
 
 	// The page's anti-CSRF token, read once for the same reason: every
 	// batchexecute client has to open with the same first request the browser
 	// makes. Optional — without it the client falls back to the priming round
 	// trip, which is what it did before the extension could supply it.
+	//
+	// After the project resolution inside resolveAccount on purpose: that step may
+	// navigate the attached tab, and the tokens belong to whatever page is loaded
+	// when they are read.
 	atToken, fsid := e.pageTokens(ctx)
-
-	client := flowapi.New(provider, e.hc, flowapi.Options{
-		ProjectID:   projectID,
-		AccountID:   accountID,
-		Captcha:     captchaProvider,
-		ProxyURL:    e.opts.ProxyURL,
-		Fingerprint: browserFP,
-	})
-
-	worker := pool.NewWorker(accountID, client)
-	// Install the authoritative balance reader before the worker is registered,
-	// so the pool never has a window in which it could read a balance from the
-	// worker's own client — which is the legacy aisandbox surface and reports
-	// whichever account that credential belongs to.
-	worker.SetCreditsReader(e.creditsReader(index, jar, session.Sku))
-	// Drop the previous account's worker first. Bootstrap runs again on every
-	// switch, and keeping the old one would leave the pool holding an account the
-	// engine can no longer route to — and reporting its balance as available.
-	e.pool.Retain(accountID)
-	e.pool.Register(worker)
 
 	// Record the account. Credits are left unknown until a real check runs —
 	// writing a plausible-looking number here is exactly how the Python version
 	// ended up reporting test fixtures as live balances.
-	e.recordIdentity(identity, jar, session.Sku, index)
+	//
+	// Before the dumps below, and that order matters: resolveIdentity runs a
+	// continuity check against what the store already holds, so an account has to
+	// be on record before anything else is resolved against it.
+	e.recordIdentity(primary.Identity, jar, primary.Session.Sku, index)
+
+	// Then any account dumped alongside it, each with its own jar. Additive: with
+	// no such files — which is every setup driven by the extension — this does
+	// nothing at all, and the boot is the single-account one it has always been.
+	e.registerAccountDumps(ctx, browserFP, captchaProvider)
 
 	e.mu.Lock()
 	e.accountID = accountID
@@ -1078,6 +1037,240 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
+// accountBoot is one account's contribution to a boot: its credential, its
+// session, the project it generates into, and the worker that will serve it.
+type accountBoot struct {
+	// Index is the `authuser` index the account was resolved for.
+	Index int
+	// Identity is what resolveIdentity made of the jar.
+	Identity Identity
+	// AccountID is the label every record for this account is written under.
+	AccountID string
+	// ProjectID is the Flow project this account generates into.
+	ProjectID string
+	// Session is the Labs session, or an empty one when there was none.
+	Session *auth.Session
+	// HasSession records whether Session came back from the provider, because an
+	// empty session and a missing one are not the same thing to a caller.
+	HasSession bool
+	// Client is the upstream client, built with this account's project.
+	Client *flowapi.Client
+	// Worker is the pool entry, ready to register.
+	Worker *pool.Worker
+}
+
+// resolveAccount prepares one signed-in account for the pool.
+//
+// Extracted so that the account the engine acts as and any account discovered
+// from a cookies/account_*.json dump are resolved by the same sequence. Two
+// copies would drift, and this is a sequence where drift is silent: a client
+// built with another account's index or project still makes requests, it just
+// makes them as somebody else — and upstream refuses that as unusual activity
+// rather than as a mismatched identity, so it presents as an intermittent
+// generation failure with nothing in the log to explain it.
+//
+// jar must be that account's own cookie jar. index selects between the accounts
+// signed into it, and is 0 for a per-account dump, which holds one account's
+// cookies and nothing to select between.
+//
+// It cannot fail. The two steps that talk to the network — the session and the
+// project listing — are best-effort by design and record their own failures, so
+// there is no error here to return rather than an error that is always nil.
+func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index int,
+	fp *flowapi.BrowserFingerprint, captcha recaptcha.Provider) *accountBoot {
+
+	provider := auth.NewProvider(jar, e.hc)
+	// The provider has to know which signed-in account to mint for, or it
+	// silently mints the first one while the project came from another.
+	provider.SetAccountIndex(index)
+
+	// The Labs session is the bearer path's credential, and the bearer path is
+	// the legacy one. The app moved from labs.google to flow.google.com — which
+	// now answers 308 for the old route — and a browser signed in there carries
+	// Google's account cookies and no Labs NextAuth session at all. The path that
+	// works, batchexecute authenticated by SAPISIDHASH over those cookies, never
+	// asks for the session.
+	//
+	// Refusing to boot over it made the whole engine unusable, including the
+	// cookie-authenticated path that was fine, so the failure is recorded and the
+	// boot continues. Calls that genuinely need a bearer token still fail, with
+	// their own error, at the point they need it.
+	session, sessionErr := provider.Session(ctx)
+	hasSession := sessionErr == nil
+	if sessionErr != nil {
+		log.Printf("engine: no Labs session (%v); the bearer path is unavailable, "+
+			"continuing on the cookie-authenticated path", sessionErr)
+		session = &auth.Session{}
+	}
+
+	// One browser can hold several signed-in accounts and they share a cookie
+	// jar, so the jar alone cannot tell them apart — the index is part of the
+	// identity, and without it two accounts collapse into one row.
+	//
+	// The anchor is taken from the long-lived credential cookies rather than the
+	// whole jar, and a new anchor has to fail a continuity check before it is
+	// treated as a new account. See identity.go: keying on the whole jar made
+	// the identity a function of state that rotates, so one account became a new
+	// row every time a cookie moved.
+	identity := e.resolveIdentity(jar, session, index)
+
+	// Prefer the account's own project list over navigating a browser to read an
+	// editor URL: both are live, and only one of them drives a tab. The browser
+	// remains the fallback for when the listing is rejected.
+	projectID, projectSource := chooseProjectID(e.opts.ProjectID, e.opts.DefaultProjectID,
+		func() string { return e.projectFromRPC(ctx, jar, index) },
+		func() string { return e.projectFromBrowser(ctx, index) })
+	if projectSource == projectSourceConfigured {
+		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); no source was consulted", projectID)
+	}
+
+	client := flowapi.New(provider, e.hc, flowapi.Options{
+		ProjectID:   projectID,
+		AccountID:   identity.AccountID,
+		Captcha:     captcha,
+		ProxyURL:    e.opts.ProxyURL,
+		Fingerprint: fp,
+	})
+
+	worker := pool.NewWorker(identity.AccountID, client)
+	// Install the authoritative balance reader before the worker is registered,
+	// so the pool never has a window in which it could read a balance from the
+	// worker's own client — which is the legacy aisandbox surface and reports
+	// whichever account that credential belongs to.
+	worker.SetCreditsReader(e.creditsReader(index, jar, session.Sku))
+	// Record the project on the worker, not just on the engine.
+	//
+	// Registration is additive: each account bootstrapped here keeps its worker,
+	// so the pool can route between them, and e.projectID can only ever name the
+	// one that bootstrapped last. The worker's project is the one its jobs
+	// actually run in — the client above was built with it — so the result of a
+	// routed job has to be able to read it back off the worker that served it.
+	worker.SetProjectID(projectID)
+
+	return &accountBoot{
+		Index:      index,
+		Identity:   identity,
+		AccountID:  identity.AccountID,
+		ProjectID:  projectID,
+		Session:    session,
+		HasSession: hasSession,
+		Client:     client,
+		Worker:     worker,
+	}
+}
+
+// accountDump is one per-account cookie file found in the cookie directory.
+type accountDump struct {
+	// Label is the `<id>` from `account_<id>.json`.
+	Label string
+	// Path is where the dump lives.
+	Path string
+}
+
+// registerAccountDumps registers a worker for every cookies/account_*.json dump.
+//
+// This is the additive half of multi-account support, and it is deliberately
+// additive rather than a replacement: with no such files — which is the state of
+// every setup driven by the browser extension, and the state this machine is in —
+// it does nothing at all and the boot is exactly the single-account one it has
+// always been. The files exist for the case the extension cannot cover: several
+// signed-in accounts, each dumped to its own jar, where the pool is meant to
+// route between them.
+//
+// Failures are logged and skipped rather than returned. One unreadable or empty
+// dump must not cost the operator the account that works, which is the same
+// reasoning Bootstrap already applies to a missing Labs session.
+func (e *Engine) registerAccountDumps(ctx context.Context, fp *flowapi.BrowserFingerprint, captcha recaptcha.Provider) {
+	dumps, err := discoverAccountJars(config.CookieDir())
+	if err != nil {
+		log.Printf("engine: could not list per-account cookie dumps: %v", err)
+		return
+	}
+
+	for _, dump := range dumps {
+		jar, err := cookiejar.LoadFile(dump.Path)
+		if err != nil {
+			log.Printf("engine: skipping cookie dump %s: %v", dump.Path, err)
+			continue
+		}
+		// A dump that parses but holds nothing is the state a half-written file
+		// leaves behind, and registering it would put a worker in the pool that
+		// cannot make a single authenticated call.
+		if jar.Count() == 0 {
+			log.Printf("engine: skipping cookie dump %s: it holds no cookies", dump.Path)
+			continue
+		}
+
+		// Index 0: the file holds one account's cookies, so there is nothing to
+		// select between. If it describes the same account as the primary jar the
+		// account id matches and Register replaces that worker in place, which is
+		// the right outcome — one account, one worker.
+		boot := e.resolveAccount(ctx, jar, 0, fp, captcha)
+		e.pool.Register(boot.Worker)
+		e.recordIdentity(boot.Identity, jar, boot.Session.Sku, 0)
+
+		log.Printf("engine: registered account %s from %s (project %s)",
+			boot.AccountID, filepath.Base(dump.Path), boot.ProjectID)
+	}
+}
+
+// discoverAccountJars finds `account_<id>.json` dumps in dir, ordered by label.
+//
+// The order matters: the caller registers a worker per dump, and the pool's
+// round-robin tiebreak follows registration order. `os.ReadDir` already returns
+// entries sorted by filename, and while there is one accepted prefix that is the
+// same order — so this sort is a restatement rather than a correction. It is here
+// so the guarantee belongs to the function that makes it instead of to a property
+// of the directory reader two layers down.
+//
+// A missing directory is not an error. It is the state of every setup that has
+// never written a dump, and the caller is expected to carry on with the single
+// cookies.json.
+func discoverAccountJars(dir string) ([]accountDump, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var dumps []accountDump
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		label, ok := accountDumpLabel(entry.Name())
+		if !ok {
+			continue
+		}
+		dumps = append(dumps, accountDump{Label: label, Path: filepath.Join(dir, entry.Name())})
+	}
+
+	sort.Slice(dumps, func(i, j int) bool { return dumps[i].Label < dumps[j].Label })
+	return dumps, nil
+}
+
+// accountDumpLabel extracts `<id>` from `account_<id>.json`.
+//
+// The id has to be non-empty, and that is what keeps the pattern off the plain
+// `cookies.json` this directory also holds. It matters: treating the full jar as
+// one account's dump would register that account a second time, and because
+// Register replaces in place the second registration would quietly overwrite the
+// first worker with an identically-built one — so the mistake would leave no
+// trace at all.
+func accountDumpLabel(name string) (string, bool) {
+	const prefix, suffix = "account_", ".json"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return "", false
+	}
+	label := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	if label == "" {
+		return "", false
+	}
+	return label, true
+}
+
 func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
 	// Prefer a live browser, since its cookies are the freshest.
 	if client := e.bridge.Current(); client != nil && client.Connected() {
@@ -1119,7 +1312,7 @@ func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
 		tried = append(tried, path)
 	}
 	return nil, "", fmt.Errorf(
-		"engine: no cookies available. Open the browser with the Flow Go Bridge "+
+		"engine: no cookies available. Open the browser with the Flow Bridge "+
 			"extension (extension/) loaded, or place a cookie dump at %s",
 		strings.Join(tried, " or "))
 }
@@ -1264,13 +1457,9 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 	return id
 }
 
-// browserFingerprint reads the browser's request identity so generation calls
-// can present it. Returns nil when the browser cannot be reached, in which case
-// the client falls back to a generic Chrome profile — fine for read-only calls,
-// but generation requests will be rejected as unusual activity.
-// pageTokensFile is where the page's anti-CSRF token and session id are kept
-// between runs, beside the cookie cache and for the same reason: a process with
-// no browser has to present the same opening request the page would have made.
+// pageTokensFile is where the page tokens used to be kept: a file beside the
+// cookie cache. They live in the settings table now, so this is read only to
+// migrate a file written by an older build.
 func pageTokensFile() string {
 	return filepath.Join(config.CookieDir(), "page-tokens.json")
 }
@@ -1282,20 +1471,40 @@ type pageTokenSet struct {
 	Fsid string `json:"fsid,omitempty"`
 }
 
-func savePageTokens(tokens pageTokenSet) {
+// savePageTokens persists the pair in the settings table, best-effort.
+func (e *Engine) savePageTokens(tokens pageTokenSet) {
 	if tokens.At == "" && tokens.Fsid == "" {
 		return
 	}
-	data, err := json.MarshalIndent(tokens, "", "  ")
+	data, err := json.Marshal(tokens)
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(pageTokensFile(), data, 0o600); err != nil {
+	if e.store == nil {
+		return
+	}
+	if err := e.store.SetSetting(store.SettingKeyPageTokens, string(data)); err != nil {
 		log.Printf("engine: could not persist the page tokens: %v", err)
 	}
 }
 
-func loadPageTokens() pageTokenSet {
+// loadPageTokens reads the pair back, migrating a legacy file on the way.
+//
+// The file is removed only once the value is safely in the database. Deleting it
+// first would lose the pair outright on a store that cannot be written, and
+// these are the difference between a browserless run that works and one that
+// comes back empty with nothing in the log to say why.
+func (e *Engine) loadPageTokens() pageTokenSet {
+	if e.store != nil {
+		if raw, found, err := e.store.Setting(store.SettingKeyPageTokens); err == nil && found && raw != "" {
+			var tokens pageTokenSet
+			if err := json.Unmarshal([]byte(raw), &tokens); err == nil {
+				return tokens
+			}
+		}
+	}
+
+	// One-time migration from the file this used to be kept in.
 	data, err := os.ReadFile(pageTokensFile())
 	if err != nil {
 		return pageTokenSet{}
@@ -1303,6 +1512,16 @@ func loadPageTokens() pageTokenSet {
 	var tokens pageTokenSet
 	if err := json.Unmarshal(data, &tokens); err != nil {
 		return pageTokenSet{}
+	}
+	if e.store != nil {
+		if err := e.store.SetSetting(store.SettingKeyPageTokens, string(data)); err != nil {
+			log.Printf("engine: could not migrate %s into the database, leaving it in place: %v",
+				pageTokensFile(), err)
+			return tokens
+		}
+	}
+	if err := os.Remove(pageTokensFile()); err != nil {
+		log.Printf("engine: could not remove the migrated %s: %v", pageTokensFile(), err)
 	}
 	return tokens
 }
@@ -1327,7 +1546,7 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 		}
 		// Then the persisted copy, which is what lets a run with no browser at
 		// all present the same opening request the page would have.
-		if persisted := loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
+		if persisted := e.loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
 			log.Printf("engine: adopting the persisted page tokens (at %d chars, f.sid %d chars)",
 				len(persisted.At), len(persisted.Fsid))
 			return persisted.At, persisted.Fsid
@@ -1350,7 +1569,7 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 		// persisted pair because a page happens to be missing defeats the reason
 		// they are persisted at all. A connected bridge with no Flow tab is the
 		// ordinary case, not a failure worth losing them over.
-		if persisted := loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
+		if persisted := e.loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
 			log.Printf("engine: the page could not supply its batchexecute tokens (%v); "+
 				"adopting the persisted pair instead (at %d chars, f.sid %d chars)",
 				err, len(persisted.At), len(persisted.Fsid))
@@ -1372,7 +1591,7 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	}
 
 	// Persist so the next run does not need this page.
-	savePageTokens(pageTokenSet{At: out.At, Fsid: out.Fsid})
+	e.savePageTokens(pageTokenSet{At: out.At, Fsid: out.Fsid})
 
 	if out.At == "" {
 		log.Printf("engine: the page did not carry an anti-CSRF token; " +
@@ -1388,30 +1607,43 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 	return out.At, out.Fsid
 }
 
-// fingerprintFile is where the browser identity is kept between runs, beside the
-// cookie cache for the same reason: a process with no browser has to be able to
-// present the client its token was minted for, and a session snapshot is only
-// available while another process is running to hand one over.
+// fingerprintFile is where the browser identity used to be kept: a file beside
+// the cookie cache. It lives in the settings table now, so this is read only to
+// migrate a file written by an older build.
 func fingerprintFile() string {
 	return filepath.Join(config.CookieDir(), "fingerprint.json")
 }
 
 // saveFingerprint persists the browser identity, best-effort.
-func saveFingerprint(fp *flowapi.BrowserFingerprint) {
+func (e *Engine) saveFingerprint(fp *flowapi.BrowserFingerprint) {
 	if fp == nil || fp.UserAgent == "" {
 		return
 	}
-	data, err := json.MarshalIndent(fp, "", "  ")
+	data, err := json.Marshal(fp)
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(fingerprintFile(), data, 0o600); err != nil {
+	if e.store == nil {
+		return
+	}
+	if err := e.store.SetSetting(store.SettingKeyBrowserFingerprint, string(data)); err != nil {
 		log.Printf("engine: could not persist the fingerprint: %v", err)
 	}
 }
 
-// loadFingerprint reads a previously persisted browser identity.
-func loadFingerprint() *flowapi.BrowserFingerprint {
+// loadFingerprint reads a previously persisted browser identity, migrating a
+// legacy file on the way. See loadPageTokens for why the file goes last.
+func (e *Engine) loadFingerprint() *flowapi.BrowserFingerprint {
+	if e.store != nil {
+		if raw, found, err := e.store.Setting(store.SettingKeyBrowserFingerprint); err == nil && found && raw != "" {
+			var fp flowapi.BrowserFingerprint
+			if err := json.Unmarshal([]byte(raw), &fp); err == nil && fp.UserAgent != "" {
+				return &fp
+			}
+		}
+	}
+
+	// One-time migration from the file this used to be kept in.
 	data, err := os.ReadFile(fingerprintFile())
 	if err != nil {
 		return nil
@@ -1420,9 +1652,23 @@ func loadFingerprint() *flowapi.BrowserFingerprint {
 	if err := json.Unmarshal(data, &fp); err != nil || fp.UserAgent == "" {
 		return nil
 	}
+	if e.store != nil {
+		if err := e.store.SetSetting(store.SettingKeyBrowserFingerprint, string(data)); err != nil {
+			log.Printf("engine: could not migrate %s into the database, leaving it in place: %v",
+				fingerprintFile(), err)
+			return &fp
+		}
+	}
+	if err := os.Remove(fingerprintFile()); err != nil {
+		log.Printf("engine: could not remove the migrated %s: %v", fingerprintFile(), err)
+	}
 	return &fp
 }
 
+// browserFingerprint reads the browser's request identity so generation calls
+// can present it. Returns nil when the browser cannot be reached, in which case
+// the client falls back to a generic Chrome profile — fine for read-only calls,
+// but generation requests will be rejected as unusual activity.
 func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerprint {
 	if e.bridge == nil || !e.bridge.Connected() {
 		// No browser to read from. A SessionSnapshot is the best source, because
@@ -1438,7 +1684,7 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 		// which is a *different machine* from this one — and a captcha token
 		// minted under one client and spent under another is rejected with no
 		// error at all, just an empty result.
-		if fp := loadFingerprint(); fp != nil {
+		if fp := e.loadFingerprint(); fp != nil {
 			log.Printf("engine: adopting the persisted fingerprint — %s",
 				truncate(fp.UserAgent, 70))
 			return fp
@@ -1466,7 +1712,7 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 		// *worse* than not attaching it: the disconnected path found the
 		// persisted copy and the connected path threw it away, so every
 		// generation came back empty with nothing in the log to say why.
-		if persisted := loadFingerprint(); persisted != nil {
+		if persisted := e.loadFingerprint(); persisted != nil {
 			log.Printf("engine: the browser could not supply a fingerprint (%v); "+
 				"adopting the persisted one — %s", err, truncate(persisted.UserAgent, 70))
 			return persisted
@@ -1485,7 +1731,7 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 		Mobile:    fp.Mobile,
 	}
 	// Persist it so the next run does not need this browser at all.
-	saveFingerprint(adopted)
+	e.saveFingerprint(adopted)
 
 	log.Printf("engine: adopting the browser fingerprint — %s", truncate(fp.UserAgent, 70))
 	return adopted
@@ -1568,16 +1814,41 @@ type VideoRequest struct {
 	AudioPreference string
 }
 
+// servingWorker names the account and the project a routed job actually ran in.
+//
+// Read off the worker the pool chose, never from the engine. Bootstrap overwrites
+// the engine's own account and project every time it runs, so once more than one
+// account is registered they describe whichever account was discovered last —
+// which is not necessarily the one that served this job.
+//
+// The pair is returned together on purpose. An account taken from one worker and
+// a project from another would name a project that account cannot generate into,
+// and that is a combination nothing downstream could detect: the request would
+// simply be refused upstream as unusual activity.
+//
+// w must not be nil. Every caller holds a worker the pool just handed out, and a
+// worker is only returned alongside a nil error.
+func servingWorker(w *pool.Worker) (accountID, projectID string) {
+	return w.ID, w.ProjectID()
+}
+
 // VideoOutcome is the result of a video generation.
 type VideoOutcome struct {
-	JobID    string        `json:"job_id"`
-	Account  string        `json:"account_id"`
-	MediaIDs []string      `json:"media_ids"`
-	Files    []MediaFile   `json:"files,omitempty"`
-	Credits  int           `json:"credits_remaining"`
-	Elapsed  time.Duration `json:"-"`
-	ElapsedS float64       `json:"elapsed_seconds"`
-	Status   string        `json:"status"`
+	JobID   string `json:"job_id"`
+	Account string `json:"account_id"`
+	// ProjectID is the project the job ran in, read off the worker that served it.
+	//
+	// Per worker rather than from the engine, because the pool chooses the worker
+	// at submit time: with more than one account registered, e.projectID names
+	// whichever bootstrapped last, which is not necessarily the account this job
+	// was routed to. BatchVideoOutcome carries the same field for the same reason.
+	ProjectID string        `json:"project_id"`
+	MediaIDs  []string      `json:"media_ids"`
+	Files     []MediaFile   `json:"files,omitempty"`
+	Credits   int           `json:"credits_remaining"`
+	Elapsed   time.Duration `json:"-"`
+	ElapsedS  float64       `json:"elapsed_seconds"`
+	Status    string        `json:"status"`
 }
 
 // MediaFile is a downloaded asset.
@@ -1656,7 +1927,8 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 	}
 
 	var outcome *flowapi.VideoResult
-	var accountID string
+	// Filled in from the worker the pool routes to; see servingWorker.
+	var accountID, projectID string
 
 	poolErr := e.pool.Execute(ctx, cost, func(ctx context.Context, worker *pool.Worker) error {
 		var callErr error
@@ -1671,7 +1943,7 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 			outcome, callErr = worker.Client.GenerateVideo(ctx, toAPIRequest(req))
 		}
 		if callErr == nil {
-			accountID = worker.ID
+			accountID, projectID = servingWorker(worker)
 
 			// Hand the pool the balance this call just read. The submission
 			// already fetches it after posting (the RemainingCredits reads
@@ -1698,10 +1970,11 @@ func (e *Engine) GenerateVideo(ctx context.Context, req VideoRequest) (*VideoOut
 	}
 
 	result := &VideoOutcome{
-		JobID:    jobID,
-		Account:  accountID,
-		MediaIDs: outcome.MediaIDs,
-		Credits:  outcome.RemainingCredits,
+		JobID:     jobID,
+		Account:   accountID,
+		ProjectID: projectID,
+		MediaIDs:  outcome.MediaIDs,
+		Credits:   outcome.RemainingCredits,
 	}
 
 	// Poll outside the pool: polling is read-only and cheap, and holding a
@@ -1976,12 +2249,17 @@ type ImageRequest struct {
 
 // ImageOutcome is the result of an image generation.
 type ImageOutcome struct {
-	JobID    string                `json:"job_id"`
-	Account  string                `json:"account_id"`
-	Images   []flowapi.ImageResult `json:"images"`
-	Files    []MediaFile           `json:"files,omitempty"`
-	ElapsedS float64               `json:"elapsed_seconds"`
-	Status   string                `json:"status"`
+	JobID string `json:"job_id"`
+	// Account and ProjectID name the worker the pool routed this job to. Read off
+	// that worker rather than from the engine, for the reason VideoOutcome gives:
+	// with more than one account registered the engine-level pair describes only
+	// the account that bootstrapped last.
+	Account   string                `json:"account_id"`
+	ProjectID string                `json:"project_id"`
+	Images    []flowapi.ImageResult `json:"images"`
+	Files     []MediaFile           `json:"files,omitempty"`
+	ElapsedS  float64               `json:"elapsed_seconds"`
+	Status    string                `json:"status"`
 }
 
 // GenerateImage submits an image job and downloads the results.
@@ -2010,7 +2288,7 @@ func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOut
 	}
 
 	var images []flowapi.ImageResult
-	var accountID string
+	var accountID, projectID string
 
 	// Image generation is free on the tiers this targets, so the cost gate is 0.
 	poolErr := e.pool.Execute(ctx, 0, func(ctx context.Context, worker *pool.Worker) error {
@@ -2024,7 +2302,7 @@ func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOut
 			ReferenceIDs: req.ReferenceIDs,
 		})
 		if callErr == nil {
-			accountID = worker.ID
+			accountID, projectID = servingWorker(worker)
 		}
 		return callErr
 	})
@@ -2036,10 +2314,11 @@ func (e *Engine) GenerateImage(ctx context.Context, req ImageRequest) (*ImageOut
 	}
 
 	outcome := &ImageOutcome{
-		JobID:   jobID,
-		Account: accountID,
-		Images:  images,
-		Status:  "succeeded",
+		JobID:     jobID,
+		Account:   accountID,
+		ProjectID: projectID,
+		Images:    images,
+		Status:    "succeeded",
 	}
 
 	if req.Download {

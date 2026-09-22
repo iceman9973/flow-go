@@ -2,9 +2,12 @@ package pool
 
 import "testing"
 
-// Bootstrap runs again on every account switch, so without this the pool keeps
-// the account the engine has moved off — and /status reports that account's
-// balance as though it were still available.
+// Retain collapses the pool to one account.
+//
+// Bootstrap no longer calls it — registration is additive now, so that each
+// discovered account keeps its worker and routing can pick between them — but the
+// operation is still the supported way for a caller that genuinely acts as a
+// single account, and these cover it.
 func TestRetainDropsThePreviousAccount(t *testing.T) {
 	p := New()
 	p.Register(newTestWorker("acct-index0"))

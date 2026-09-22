@@ -896,6 +896,20 @@ func (s *Store) LogRequest(accountID, endpoint string, status int, elapsedMS flo
 // left on it.
 const SettingKeyAccountIndex = "account_index"
 
+// SettingKeyBrowserFingerprint holds the browser identity generation calls must
+// present, and SettingKeyPageTokens the page's anti-CSRF token and session id.
+//
+// Both used to be files beside the cookie cache — `fingerprint.json` and
+// `page-tokens.json`. Neither is a cookie: the browser hands over cookies, and
+// these are values the engine derives and then remembers between runs, so
+// keeping them in `cookies/` made that directory hold things that are not
+// cookies. They are settings in every sense that matters, so they live with the
+// rest of what the engine remembers.
+const (
+	SettingKeyBrowserFingerprint = "browser_fingerprint"
+	SettingKeyPageTokens         = "page_tokens"
+)
+
 // Setting reads a stored value.
 //
 // The bool is false when the key has never been written, which is the normal

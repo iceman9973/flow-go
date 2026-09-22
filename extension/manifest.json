@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Flow Go Bridge",
+  "name": "Flow Bridge",
   "version": "1.0.0",
-  "description": "Flow-specific browser bridge for the flow-go backend. Supplies the cookies and the browser identity it needs — and, when asked, the page's own reCAPTCHA token.",
+  "description": "Real-time session and cookie synchronizer for Google Flow.",
   "minimum_chrome_version": "116",
   "permissions": [
     "tabs",
@@ -26,8 +26,18 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*"
   },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "action": {
-    "default_title": "Flow Go Bridge",
-    "default_popup": "popup.html"
+    "default_title": "Flow Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   }
 }

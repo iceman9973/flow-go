@@ -1,5 +1,5 @@
 /**
- * Flow Go Bridge — configuration.
+ * Flow Bridge — configuration.
  *
  * Deliberately the same shape as the generic bridge's, so the backend can push
  * scope with the same `config.set` call and nothing on that side has to know
@@ -14,9 +14,14 @@ export const DEFAULTS = {
   // WebSocket endpoint of the flow-go backend.
   bridgeUrl: 'ws://127.0.0.1:9222',
 
-  // Shared secret required on the upgrade. The backend generates one on first
-  // run and hands it over via config.set.
-  bridgeToken: '',
+  // There is deliberately no `bridgeToken` here.
+  //
+  // The token is not a setting and has no default: the backend generates it,
+  // hands it over on the first connection via `config.set`, and the extension
+  // persists it from there. Declaring an empty default made it look like
+  // something a person was meant to fill in, which is what put a paste box in
+  // the popup. Absent, `socketUrl` simply dials without one — which is exactly
+  // how the first pairing is supposed to start.
 
   // Only tabs whose URL starts with one of these can be attached or listed. The
   // first entry is also what gets opened when a command needs a tab and none
@@ -41,7 +46,18 @@ export const DEFAULTS = {
 
   // Maximum events buffered before the oldest are dropped. Only the Flow hosts
   // are observed, so this is small on purpose.
+  //
+  // Nothing reads this any more. The buffer it sized was removed — nothing ever
+  // pushed into it — and `events.read` now answers an empty list. The key is kept
+  // because the backend pushes the generic bridge's config shape, and a key it
+  // writes should not vanish on the next read.
   eventBufferSize: 500,
+
+  // How long a cookie-rotation burst is allowed to settle before it is announced
+  // over the socket. Chrome fires one change per cookie and a sign-in rotates
+  // several at once, so without this the backend would re-read its jar once per
+  // cookie for what is a single event.
+  cookieRotationDebounceMs: 1500,
 
   // Reconnect backoff for the backend socket.
   reconnectDelayMs: 1500,

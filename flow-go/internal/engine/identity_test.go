@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/auth"
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )

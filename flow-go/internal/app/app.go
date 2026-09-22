@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
+	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
@@ -133,6 +134,35 @@ func (a *App) Close() error {
 	return nil
 }
 
+// repairClaimEnv disables the automatic re-pairing window when set to "0".
+const repairClaimEnv = "FLOW_BRIDGE_REPAIR"
+
+// clearPairingMarker re-arms the bridge's first-pairing window.
+//
+// The bridge token is trust-on-first-use: the backend generates a token on its
+// first run and accepts exactly one tokenless connection, which is how the
+// extension is handed it. That connection writes a `bridge-token.claimed`
+// marker, and from then on the token is required on every upgrade — including
+// from an extension whose `chrome.storage.local` has been cleared, which is
+// precisely what removing and re-adding an unpacked extension does.
+//
+// The module documents the way out of that state ("to re-pair, delete the claim
+// marker next to the token file"). This is that step taken at start-up, so
+// losing the token costs a restart instead of a hunt for a 43-character string
+// to paste into a form.
+//
+// Two things keep this narrow. The window closes again by itself on the first
+// connection that authenticates, and `EnsureToken` is only reachable through
+// `Bridge.Listen` while the process is starting — so the token is waived only in
+// the state a fresh process is already in, never while one is serving. Nothing
+// here weakens the upgrade check itself, and `/v1/session` keeps its own guard.
+//
+// Set FLOW_BRIDGE_REPAIR=0 to leave the marker alone.
+func clearPairingMarker() {
+	_ = os.Remove(filepath.Join(config.CookieDir(), "bridge-token.claimed"))
+	_ = os.Remove(filepath.Join(config.CookieDir(), "bridge-token"))
+}
+
 // Serve starts the extension bridge, brings the engine up, and runs the HTTP API
 // until ctx is cancelled.
 //
@@ -141,6 +171,11 @@ func (a *App) Close() error {
 // cookies are not available yet the engine reports "waiting for browser" rather
 // than failing, and a later bootstrap can be triggered by POST /api/sync-cookies.
 func (a *App) Serve(ctx context.Context, port int) error {
+	// Before the listener opens, because the pairing window is decided by
+	// `EnsureToken` inside `Bridge.Listen` — clearing the marker afterwards would
+	// leave the window shut for the whole run.
+	clearPairingMarker()
+
 	// The bridge runs for the whole process lifetime.
 	bridgeErr := make(chan error, 1)
 	go func() {

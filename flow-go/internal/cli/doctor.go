@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/bridge"
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/app"
+	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )

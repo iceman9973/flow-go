@@ -12,7 +12,7 @@ require (
 	modernc.org/sqlite v1.59.0
 )
 
-require github.com/gorilla/websocket v1.5.3 // indirect
+require github.com/gorilla/websocket v1.5.3
 
 require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
@@ -26,7 +26,6 @@ require (
 	github.com/gofiber/schema v1.8.3 // indirect
 	github.com/gofiber/utils/v2 v2.4.1 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
-	github.com/kodelyx/Browser-cdp/cdp-control v0.0.0-20260920054928-9aaab4e4a4f7
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
@@ -45,10 +44,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
-
-// browser-Cdp used to be reachable only through a replace pointing at a sibling
-// checkout, because its declared module path matched no repository. It now declares
-// the path Go derives from where the code lives and is fetched like anything else.
-// To work against a local checkout instead, add for the duration:
-//
-//	replace github.com/kodelyx/Browser-cdp/cdp-control => ../browser-Cdp/cdp-control

@@ -100,6 +100,15 @@ type Worker struct {
 	lastUsed         time.Time
 	served           int64
 	failed           int64
+
+	// projectID is the Flow project this account generates into.
+	//
+	// Per worker rather than per engine, because it is a property of the signed-in
+	// account and not of the process: two accounts signed into the same browser
+	// have different project lists, and a project id resolved under one is not
+	// necessarily addressable by the other. Held behind the mutex because the
+	// engine sets it once at registration while generation reads it per job.
+	projectID string
 }
 
 // NewWorker wraps a client.
@@ -148,6 +157,35 @@ func (w *Worker) SKU() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.sku
+}
+
+// SetProjectID records the Flow project this account generates into.
+//
+// Call it before the worker is registered, alongside SetCreditsReader, so no job
+// can be routed to a worker whose project is still unknown.
+func (w *Worker) SetProjectID(id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.projectID = id
+}
+
+// ProjectID returns the project this account generates into.
+//
+// Empty means the project was never resolved, which is a state the caller has to
+// handle rather than treat as a value: the engine's project resolution can come
+// back empty when neither the listing nor the browser yielded one, and an empty
+// project id sent upstream is refused as an unusual request rather than as a
+// missing field.
+//
+// The worker's own client already carries this project — flowapi.New bakes it
+// into Client.opts at construction — so this is not what makes a routed call
+// generate into the right place. It exists so the *result* can name the project
+// the job actually ran in, which the engine-level project cannot once more than
+// one account is registered.
+func (w *Worker) ProjectID() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.projectID
 }
 
 // State reports the worker's current availability.
@@ -260,6 +298,7 @@ func (w *Worker) recordFailure(err error) {
 // WorkerStats is a snapshot for reporting.
 type WorkerStats struct {
 	ID           string     `json:"id"`
+	ProjectID    string     `json:"project_id"`
 	State        State      `json:"state"`
 	InFlight     int        `json:"in_flight"`
 	Credits      int        `json:"credits"`
@@ -322,12 +361,20 @@ func (p *Pool) Remove(id string) {
 
 // Retain drops every worker except the named one.
 //
-// The engine acts as a single signed-in account at a time and re-bootstraps on
-// every account switch, so without this each switch leaves the previous
-// account's worker behind and the pool accumulates accounts the engine can no
-// longer route to. That is not just untidy: with two workers registered, the
-// pool's balance is a sum over an account that is no longer in use, and /status
-// reports it as though it were available.
+// This used to be how the engine handled an account switch: it acted as a single
+// signed-in account at a time, so each switch had to drop the previous account's
+// worker or the pool would hold an account it could no longer route to — and
+// report that account's balance as available.
+//
+// The engine no longer calls it. Registration is now additive on purpose: each
+// account discovered in the browser gets its own worker, with its own project and
+// its own balance, and routing picks between them. Retain is the operation that
+// would undo that, so calling it from Bootstrap would leave the pool holding
+// whichever account bootstrapped last.
+//
+// Kept because it is still the supported way to collapse a pool to one account —
+// a caller that genuinely acts as a single account wants exactly this, and it is
+// cheaper than rebuilding the pool. It is covered by retain_test.go.
 func (p *Pool) Retain(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -668,6 +715,7 @@ func (p *Pool) Stats() Stats {
 		w.mu.Lock()
 		ws := WorkerStats{
 			ID:           w.ID,
+			ProjectID:    w.projectID,
 			InFlight:     w.inFlight,
 			Credits:      w.credits,
 			CreditsKnown: w.creditsKnown,

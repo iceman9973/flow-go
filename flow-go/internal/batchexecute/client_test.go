@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 )
 
 func jarWith(cookies ...cookiejar.Cookie) *cookiejar.Jar {

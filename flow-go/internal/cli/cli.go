@@ -14,11 +14,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kodelyx/Browser-cdp/cdp-control/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/app"
 	"github.com/kodelyx/flow-go/flow-go/internal/auth"
 	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
@@ -80,7 +80,7 @@ USAGE
   flow-go <command> [flags]
 
 COMMANDS
-  serve                 Start the HTTP API and the Flow Go Bridge extension bridge
+  serve                 Start the HTTP API and the Flow Bridge extension bridge
   doctor                Diagnose whether this machine can generate right now
   generate              Generate a video
   image                 Generate an image
@@ -368,7 +368,7 @@ func runServe(args []string) int {
 	fmt.Printf("  database       %s\n", a.Store.Path())
 	fmt.Printf("  output         %s\n", config.OutputDir())
 	fmt.Println()
-	fmt.Println("Waiting for the Flow Go Bridge extension to connect...")
+	fmt.Println("Waiting for the Flow Bridge extension to connect...")
 
 	if err := a.Serve(ctx, *port); err != nil {
 		return fail(err)

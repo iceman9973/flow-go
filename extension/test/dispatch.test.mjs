@@ -1,5 +1,5 @@
 /**
- * Dispatch harness for the Flow Go Bridge extension.
+ * Dispatch harness for the Flow Bridge extension.
  *
  * The extension cannot be exercised without Chrome, and the parts that can break
  * silently are not the Chrome calls — they are the shapes. Every operation here
@@ -150,6 +150,12 @@ let badgeText = '';
 // the one piece of UI that has to work when everything else already does not.
 let workerOnMessage = null;
 
+// The cookie-change listener the worker registers. Captured for the same reason
+// the message listener is: the rotation announcement is the one thing the
+// extension says unprompted, so there is no request to drive it with — the only
+// way to exercise it is to fire the event Chrome would have fired.
+let cookiesOnChanged = null;
+
 const chromeStub = {
   runtime: {
     getManifest: () => ({ version: '1.0.0' }),
@@ -199,6 +205,9 @@ const chromeStub = {
     },
   },
   cookies: {
+    onChanged: {
+      addListener: (fn) => { cookiesOnChanged = fn; },
+    },
     getAll: async (query = {}) => {
       // Hosts Chrome refuses to see through the domain query, which it does
       // silently — no error, and the host permission is granted.
@@ -246,32 +255,10 @@ const page = {
   WIZ_global_data: { SNlM0e: 'at-value', FdrFJe: '-56329636' },
 };
 
-// A realistic wrb.fr frame: the payload is a JSON *string* inside the frame, so
-// the image arrives with its quotes escaped. That escaping is the whole reason
-// the extraction has to parse rather than scrape.
-//
-//   frame line   [["wrb.fr","SPrCad","<payload>"]]
-//   <payload>    [[null,[null,null,"<image>"]]]      (quotes escaped in the line)
-const upscaleFrame = (payload) =>
-  `)]}'\n\n[["wrb.fr","SPrCad","[[null,[null,null,\\"${payload}\\"]]]"]]\n`;
-
-const PUBLIC_ERROR_FRAME = `)]}'\n\n[["wrb.fr","SPrCad","[[null,[null,null,null,null,[[null,null,[\\"PUBLIC_ERROR_UNUSUAL_ACTIVITY\\"]]]]]]"]]\n`;
-
-let fetchReply = () => upscaleFrame('A'.repeat(600));
-let lastFetch = null;
-
-// Guard the fixture itself. A malformed frame here reads as an extension bug —
-// which is exactly how this harness first failed, and it cost more time than the
-// real defect did.
-{
-  const line = upscaleFrame('X'.repeat(600))
-    .split('\n')
-    .find((l) => l.trim().indexOf('[["wrb.fr"') === 0);
-  assert.ok(line, 'the fixture should contain a wrb.fr frame');
-  const outer = JSON.parse(line);
-  const inner = JSON.parse(outer[0][2]);
-  assert.equal(inner[0][1][2], 'X'.repeat(600), 'the fixture should round-trip the image');
-}
+// An `upscaleFrame` fixture used to live here, with a guard that proved it
+// round-tripped the image. Both went with `flow.upscale`: the op was implemented
+// and tested at both ends and called by nothing, so it was deleted from the
+// extension and from the backend's pinned bridge surface.
 
 let sockets = [];
 
@@ -341,14 +328,6 @@ const descriptors = {
     configurable: true,
     writable: true,
   },
-  fetch: {
-    value: async (url, init) => {
-      lastFetch = { url, init };
-      return { text: async () => fetchReply() };
-    },
-    configurable: true,
-    writable: true,
-  },
 };
 
 for (const [key, descriptor] of Object.entries(descriptors)) {
@@ -410,7 +389,7 @@ await check('ping advertises every op the backend calls', async () => {
   const needed = [
     'ping', 'config.get', 'config.set', 'tabs.list', 'tabs.open', 'tab.attach',
     'tab.detach', 'tab.current', 'events.read', 'cookies.list',
-    'flow.fingerprint', 'flow.navigate', 'flow.projects', 'flow.captcha', 'flow.upscale',
+    'flow.fingerprint', 'flow.navigate', 'flow.projects', 'flow.captcha',
   ];
   const missing = needed.filter((op) => !pong.ops.includes(op));
   assert.deepEqual(missing, [], `not advertised: ${missing.join(', ')}`);
@@ -495,91 +474,13 @@ await check('flow.captcha mint matches FlowCaptchaResult', async () => {
   assert.ok(mint.token.length > 0);
 });
 
-await check('flow.upscale parses the frame and matches FlowUpscaleResult', async () => {
-  fetchReply = () => upscaleFrame('A'.repeat(600));
-  const up = await call('flow.upscale', {
-    projectId: 'abc123', mediaId: 'media-1', contentId: 'content-1',
-    resolution: 2, buildLabel: 'bl-1',
-  });
-  assert.equal(typeof up.data, 'string');
-  assert.equal(up.data.length, 600);
-
-  // The request shape, which the app is strict about.
-  assert.ok(lastFetch, 'the page should have made the request');
-
-  // Same-origin, and it has to be. The whole reason the page makes this call is
-  // that the identical request from Go is refused on its TLS fingerprint, so
-  // pointing it anywhere but the page's own origin would defeat the point.
-  assert.ok(
-    lastFetch.url.startsWith('/_/AiSandboxAngularFrontend/data/batchexecute'),
-    `the upscale must go to the page's own origin, got ${lastFetch.url}`,
-  );
-
-  const url = decodeURIComponent(lastFetch.url);
-  // The project, and only the project. An earlier version appended the editor
-  // route with the media id in it; the app's own request does not.
-  assert.match(url, /source-path=\/project\/abc123(&|$)/);
-  assert.doesNotMatch(url, /\/edit\//, 'the source path must not name the editor route');
-  assert.match(lastFetch.url, /rpcids=SPrCad/);
-  assert.match(lastFetch.url, /[?&]hl=en-US/);
-  assert.match(lastFetch.url, /[?&]rt=c/);
-  assert.match(lastFetch.url, /[?&]bl=bl-1/);
-
-  assert.equal(lastFetch.init.method, 'POST');
-  assert.equal(lastFetch.init.credentials, 'include');
-  assert.equal(lastFetch.init.headers['X-Same-Domain'], '1');
-  assert.equal(lastFetch.init.headers['content-type'], 'application/x-www-form-urlencoded;charset=UTF-8');
-
-  // The body is the half of the request a URL cannot show, and a wrong argument
-  // shape comes back as an opaque upstream error rather than a clear one. The
-  // layout is the app's own: [media id, resolution selector, context block],
-  // and the context block carries tool id 22, the project, then the captcha
-  // pair — none of which is guessable from the outside.
-  const body = new URLSearchParams(lastFetch.init.body);
-  assert.equal(body.get('at'), 'at-value', 'the page anti-CSRF token must be carried');
-
-  const frame = JSON.parse(body.get('f.req'));
-  assert.equal(frame.length, 1);
-  assert.equal(frame[0].length, 1);
-  const [rpcid, argJSON, absent, kind] = frame[0][0];
-  assert.equal(rpcid, 'SPrCad');
-  assert.equal(absent, null);
-  assert.equal(kind, 'generic');
-
-  const arg = JSON.parse(argJSON);
-  // The media id, not the content id. This is the opposite of the generation
-  // calls, which take content ids — and getting it backwards returns a null
-  // payload rather than an error, which is how it presented for a long time.
-  assert.equal(arg[0], 'media-1', 'argument 0 is the media id');
-  assert.notEqual(arg[0], 'content-1', 'the content id must not be sent here');
-  assert.equal(arg[1], 2, 'argument 1 is the resolution selector');
-  assert.equal(arg[2].length, 11, 'argument 2 is the context block');
-  assert.equal(arg[2][1], 22, 'the context block carries the tool id the app always sends');
-  assert.equal(arg[2][5], 'abc123', 'the context block carries the project id');
-  assert.match(arg[2][10][0], /^token-for-IMAGE_GENERATION-\d+$/, 'the context block carries a fresh captcha token');
-  assert.equal(arg[2][10][1], 1);
-});
-
-await check('flow.upscale reports an upstream PUBLIC_ERROR', async () => {
-  fetchReply = () => PUBLIC_ERROR_FRAME;
-  const up = await call('flow.upscale', { projectId: 'abc123', mediaId: 'm1', contentId: 'c1' });
-  assert.equal(up.data, undefined);
-  assert.equal(up.error, 'PUBLIC_ERROR_UNUSUAL_ACTIVITY');
-  fetchReply = () => upscaleFrame('A'.repeat(600));
-});
-
-await check('flow.upscale refuses a response with no SPrCad frame', async () => {
-  fetchReply = () => '<html>nope</html>';
-  const up = await call('flow.upscale', { projectId: 'abc123', mediaId: 'm1', contentId: 'c1' });
-  assert.equal(up.data, undefined);
-  assert.match(String(up.error), /no SPrCad frame/);
-  fetchReply = () => upscaleFrame('A'.repeat(600));
-});
-
-await check('flow.upscale needs a project id', async () => {
-  const message = await callExpectingError('flow.upscale', { contentId: 'c1' });
-  assert.match(String(message), /needs a projectId/);
-});
+// Four `flow.upscale` cases used to sit here, covering the frame parse, an
+// upstream PUBLIC_ERROR, a response with no SPrCad frame, and the missing-project
+// guard. The op was implemented and tested at both ends and called by nothing, so
+// it was deleted — and a case asserting "Unknown operation: flow.upscale" would
+// be testing the deletion rather than the behaviour. What is worth keeping is
+// that the deletion is visible: `ping` no longer advertises it, and the case
+// above checks the advertised list against the ops the backend actually calls.
 
 await check('flow.navigate refuses a URL outside the tab scope', async () => {
   const message = await callExpectingError('flow.navigate', { url: 'https://example.com/' });
@@ -660,6 +561,138 @@ await check('cookies falls back to per-name reads when the domain query is blind
   }
 });
 
+/* ------------------------------------------------------------------ *
+ * Cookie rotation
+ *
+ * The one thing the extension says without being asked, so there is no request to
+ * drive it with — the only way to exercise it is to fire the event Chrome would
+ * have fired and then read what reached the socket.
+ *
+ * The debounce is shortened through config rather than slept through. The window
+ * is a deployment property, which is why it is a config key at all, and a suite
+ * that waits 1.5 seconds per case is a suite that gets skipped.
+ * ------------------------------------------------------------------ */
+
+// 300 ms rather than the 1500 ms default. The window is a deployment property,
+// which is why it is a config key at all — and the burst case below has to time a
+// change *inside* the window, which a 1.5 s default would make a two-second test.
+await call('config.set', { patch: { cookieRotationDebounceMs: 300 } });
+
+/** The rotation frames the worker has put on the wire so far. */
+const rotationFrames = () =>
+  ws.sent.filter((f) => f.event === 'bridge.cookies_rotated').map((f) => f.params);
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Wait for the debounce to expire and the re-read behind it to finish. */
+async function waitForRotation(before) {
+  for (let i = 0; i < 60; i++) {
+    if (rotationFrames().length > before) return;
+    await pause(25);
+  }
+}
+
+await check('the worker subscribes to cookie changes', async () => {
+  assert.equal(
+    typeof cookiesOnChanged, 'function',
+    'chrome.cookies.onChanged should have a listener, or a rotation is never seen',
+  );
+});
+
+await check('a rotation burst is announced once, after the window restarts', async () => {
+  const before = rotationFrames().length;
+
+  // The event is deliberately stale: it carries the value Chrome saw when it
+  // fired, and the debounce window exists precisely because the cookie can rotate
+  // again inside it. Announcing the event's own value would hand the backend the
+  // value that has just gone out of date, which is the failure this path exists
+  // to prevent.
+  const stored = allCookies.find((c) => c.name === '__Secure-1PSIDTS');
+  stored.value = 'psidts-2';
+
+  const second = cookie('.google.com', '__Secure-3PSIDTS', 'psidts-3');
+  allCookies.push(second);
+
+  cookiesOnChanged({ removed: false, cause: 'explicit', cookie: { ...stored, value: 'psidts-1' } });
+
+  // A change inside the window has to push the window out rather than leave the
+  // first timer running. Without that the frame goes out mid-burst carrying half
+  // the changes, and a caller has no way to tell a partial announcement from a
+  // complete one — so this is asserted at the moment the first timer would have
+  // fired had it not been reset.
+  await pause(150);
+  cookiesOnChanged({ removed: false, cause: 'explicit', cookie: { ...stored, value: 'psidts-2' } });
+  await pause(200);
+  assert.equal(
+    rotationFrames().length, before,
+    'the window must restart on each change, not expire on the first',
+  );
+
+  cookiesOnChanged({ removed: false, cause: 'explicit', cookie: second });
+  await waitForRotation(before);
+
+  assert.equal(rotationFrames().length, before + 1, 'a burst must produce exactly one frame');
+
+  const params = rotationFrames()[before];
+  assert.deepEqual(
+    params.cookies.map((c) => c.name).sort(),
+    ['__Secure-1PSIDTS', '__Secure-3PSIDTS'],
+    'each changed name is announced once, not once per change',
+  );
+  assert.equal(
+    params.cookies.find((c) => c.name === '__Secure-1PSIDTS').value,
+    'psidts-2',
+    'the announced value must be the one still on disk, not the one in the event',
+  );
+  assert.deepEqual(params.removed, []);
+
+  // The shape has to be cookiejar.Cookie's, or the backend's merge is guessing at
+  // which key holds the value.
+  assert.deepEqual(Object.keys(params.cookies[0]).sort(), [
+    'domain', 'expirationDate', 'hostOnly', 'httpOnly', 'name', 'path',
+    'sameSite', 'secure', 'session', 'storeId', 'value',
+  ]);
+});
+
+await check('only rotating cookies on the Flow domains are announced', async () => {
+  const before = rotationFrames().length;
+
+  // SID is essential to the backend but is not rotated — it is reissued when
+  // someone signs in, and the next cookies.list carries it. `_ga` is analytics
+  // and not on this surface at all. Neither belongs on this path.
+  for (const name of ['SID', '_ga']) {
+    cookiesOnChanged({
+      removed: false, cause: 'explicit', cookie: allCookies.find((c) => c.name === name),
+    });
+  }
+
+  // Right name, wrong domain: a rotating cookie set somewhere the backend never
+  // reads from.
+  cookiesOnChanged({
+    removed: false, cause: 'explicit', cookie: cookie('example.com', '__Secure-1PSIDTS', 'elsewhere'),
+  });
+
+  // Longer than the debounce, so a frame would have had time to appear.
+  await pause(600);
+  assert.equal(rotationFrames().length, before, 'nothing outside the whitelist should be announced');
+});
+
+await check('a removed rotating cookie is announced by name', async () => {
+  const before = rotationFrames().length;
+
+  // Chrome reports a removal with the cookie as it last stood.
+  const gone = allCookies.find((c) => c.name === '__Secure-1PSIDTS');
+  cookiesOnChanged({ removed: true, cause: 'evicted', cookie: gone });
+
+  await waitForRotation(before);
+  const params = rotationFrames()[before];
+  assert.deepEqual(params.cookies, [], 'a removed cookie has no value left to send');
+  assert.deepEqual(
+    params.removed, ['__Secure-1PSIDTS'],
+    'a merge cannot tell "unchanged" from "removed" from values alone',
+  );
+});
+
 await check('config.set round-trips and stays in the backend shape', async () => {
   const saved = await call('config.set', { patch: { eventBufferSize: 123 } });
   assert.equal(saved.eventBufferSize, 123);
@@ -698,17 +731,25 @@ await check('config.set with a new token replies, then reconnects', async () => 
 /* ------------------------------------------------------------------ *
  * The popup
  *
- * It is the recovery route. An extension that has lost its token cannot connect,
- * so the backend can never tell it anything — the connection is refused before a
- * message could be sent — and the only way back is a human pasting the token in
- * here. That is exactly the moment it has to work, so it is driven rather than
- * eyeballed.
+ * It carries one action — a cookie export — and deliberately no bridge-token
+ * field. Pairing is not a human step: the extension dials tokenless on first
+ * run, the backend hands it a token over that connection via `config.set`, and
+ * the extension persists it and reconnects with it. The form for pasting one by
+ * hand was the fallback for that handover failing, and it is gone.
+ *
+ * So the test here is about absence, and it is the only thing that would notice
+ * the form creeping back: nothing else in this suite touches the popup's DOM.
  *
  * These run after the socket tests because they read config through the popup's
  * own channel, which needs no socket.
  * ------------------------------------------------------------------ */
 
-/** A DOM just large enough to run the popup's own logic. */
+/**
+ * A DOM just large enough to run the popup's own logic.
+ *
+ * It records which ids were asked for, because what the popup test asserts now
+ * is what the script does *not* reach for.
+ */
 function makeDom() {
   const nodes = new Map();
   const listeners = new Map();
@@ -730,6 +771,7 @@ function makeDom() {
 
   return {
     node,
+    ids: () => new Set(nodes.keys()),
     document: { getElementById: node },
     submit(id) {
       const handler = listeners.get(`${id}:submit`);
@@ -744,36 +786,22 @@ Object.defineProperty(globalThis, 'document', {
   value: dom.document, configurable: true, writable: true,
 });
 
-/** Read the worker's config the way the popup does. */
-const workerConfig = () => chromeStub.runtime.sendMessage({ op: 'config.get' });
-
 await import(path.join(stage, 'popup.js'));
 await new Promise((resolve) => setTimeout(resolve, 20));
 
-await check('the popup reports the stored token without revealing it', async () => {
-  const shown = dom.node('tokenState').textContent;
-  assert.match(shown, /^\(set \(\d+ chars\)\)$/, `unexpected token state: ${shown}`);
-  // The secret itself must never reach the UI.
-  assert.ok(!shown.includes('secret-token'), 'the popup must not print the token');
-});
+await check('the popup exposes no bridge-token surface', async () => {
+  // Every id the script touched while rendering. A form that came back would
+  // show up here, and so would a read of the stored token.
+  const asked = dom.ids();
+  for (const id of ['tokenForm', 'token', 'save', 'tokenState', 'settings']) {
+    assert.ok(!asked.has(id), `the popup must not reach for #${id} any more`);
+  }
 
-await check('the popup refuses an empty token', async () => {
-  dom.node('token').value = '   ';
-  await dom.submit('tokenForm');
-
-  assert.match(dom.node('result').textContent, /Paste the token first/);
-  const read = await workerConfig();
-  assert.equal(read.bridgeToken, 'secret-token', 'an empty submit must not change the token');
-});
-
-await check('the popup hands a pasted token to the worker', async () => {
-  dom.node('token').value = 'a-freshly-pasted-token';
-  await dom.submit('tokenForm');
-
-  const read = await workerConfig();
-  assert.equal(read.bridgeToken, 'a-freshly-pasted-token');
-  // Cleared, so the secret is not left sitting on screen.
-  assert.equal(dom.node('token').value, '');
+  // And nothing can submit one, because no form registered a handler.
+  assert.throws(
+    () => dom.submit('tokenForm'),
+    /no submit handler was registered on tokenForm/,
+  );
 });
 
 /* ------------------------------------------------------------------ *

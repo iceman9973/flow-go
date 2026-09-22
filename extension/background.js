@@ -1,5 +1,5 @@
 /**
- * Flow Go Bridge — background service worker.
+ * Flow Bridge — background service worker.
  *
  * The browser surface of the flow-go backend, and nothing more. Where the
  * generic CDP bridge this replaces exposes `cdp.call` and `cdp.evaluate` — that
@@ -12,14 +12,18 @@
  *   flow.navigate     move the attached tab, inside the tab scope
  *   flow.projects     the project links on the current page
  *   flow.captcha      is the client loaded, and mint a token for an action
- *   flow.upscale      run the app's own SPrCad call and hand back the image
  *
- * Of those, flow.upscale is the one nothing calls. It is implemented and tested
- * here and on the Go side, and the backend has no path that reaches it — the
- * upscale chain there ends at Engine.SubmitVideo, which has no callers either.
- * It is kept rather than deleted because the Go implementation is the last
- * description of that wire shape, and it is flagged here so that finding it in
- * the advertised ops list is not mistaken for the backend using it.
+ * Every operation above is load-bearing and must not be trimmed. The engine's
+ * Bootstrap resolves its project through flow.navigate + flow.projects, reached
+ * via Bridge.EnsureProjectTab, and tabs.list / tab.attach / tab.current are on
+ * that same path — so removing any of them leaves every generation failing at
+ * "no project id resolved", and the per-worker project ids depend on it too.
+ *
+ * `flow.upscale` used to be listed here. It was implemented and tested at both
+ * ends and called by nothing, so it was deleted. The pinned bridge still declares
+ * an Upscale method, so a call would now come back as "Unknown operation:
+ * flow.upscale" rather than quietly doing nothing. That is the honest answer, and
+ * the reason this note is here.
  *
  * Everything page-level runs through chrome.scripting.executeScript rather than
  * chrome.debugger. That is the substantive difference from the generic bridge:
@@ -38,7 +42,17 @@ let socket = null;
 let reconnectTimer = null;
 let attachedTabId = null;
 let config = null;
-let eventQueue = [];
+
+// A 500-entry event buffer used to live here, and `events.read` drained it. It is
+// gone: nothing ever pushed into it, because observing page navigations would need
+// the webNavigation permission and that buys a diagnostic rather than a capability
+// the backend uses.
+//
+// The `events.read` op itself stays. The pinned bridge calls it (cdp/client.go),
+// and the server's /v1/bridge/events and /v1/debug/events-raw read through it, so
+// removing the op would turn two working routes into "Unknown operation". It now
+// answers with an empty list — which is what it effectively always did, since the
+// buffer was never filled.
 
 const state = {
   daemonConnected: false,
@@ -49,7 +63,16 @@ const state = {
   lastError: null,
   lastActivity: null,
   captchaMints: 0,
-  upscales: 0,
+  // What the popup reports as "Cookie Sync". `lastSyncTime` is when the backend
+  // last pulled cookies, or when a rotation was announced; `cookieCount` is how
+  // many essential cookies that read yielded.
+  //
+  // The count is the closest thing the extension has to evidence of a signed-in
+  // session. It cannot read the Labs session itself, and a Flow tab being open
+  // proves nothing on its own — zero essential cookies means there is nothing to
+  // authenticate with, whatever the tab looks like.
+  lastSyncTime: null,
+  cookieCount: 0,
 };
 
 /* ------------------------------------------------------------------ *
@@ -100,6 +123,38 @@ const ESSENTIAL_COOKIES = new Set([
 const isEssentialCookie = (name) => ESSENTIAL_COOKIES.has(String(name || ''));
 
 /**
+ * The cookies Google rotates on a timer, rather than on a sign-in.
+ *
+ * A subset of the essential names on purpose. The rest are stable for the life
+ * of a session — `SID` and `SAPISID` are reissued when someone signs in, and the
+ * next `cookies.list` picks that up — so watching them would put traffic on the
+ * wire for no change. These four are the ones reissued while a tab just sits
+ * there, and a jar holding the previous value is refused as expired rather than
+ * as wrong.
+ */
+const ROTATING_COOKIES = new Set([
+  '__Secure-1PSIDTS',
+  '__Secure-3PSIDTS',
+  '__Secure-next-auth.session-token',
+  'SIDCC',
+]);
+
+/**
+ * Is this a cookie domain the backend reads from?
+ *
+ * `.google.com` is a parent-domain scope, so it covers every Google subdomain —
+ * including hosts whose sessions have nothing to do with Flow. That is
+ * deliberate and matches the manifest's own host permission; the name whitelist
+ * above is what actually narrows this, because the rotating tokens are set on the
+ * parent domain rather than on whichever host happened to be open.
+ */
+function isRotationDomain(domain) {
+  const bare = String(domain || '').replace(/^\./, '').toLowerCase();
+  if (!bare) return false;
+  return bare === 'google.com' || bare.endsWith('.google.com') || bare === 'labs.google';
+}
+
+/**
  * The cookies visible for one scope.
  *
  * `getAll({domain})` can come back empty for a host that plainly has cookies —
@@ -120,6 +175,28 @@ async function cookiesForScope(domain, url) {
   }
   return byName;
 }
+
+/**
+ * One cookie in the backend's shape — `cookiejar.Cookie`'s JSON tags, not
+ * Chrome's camelCase.
+ *
+ * Shared by `cookies.list` and the rotation announcement below. A merge on the
+ * backend side is only safe if both surfaces describe a cookie identically, and
+ * two hand-written copies of this mapping is exactly how they would drift.
+ */
+const shapeCookie = (c) => ({
+  domain: c.domain,
+  expirationDate: c.expirationDate,
+  hostOnly: c.hostOnly,
+  httpOnly: c.httpOnly,
+  name: c.name,
+  path: c.path,
+  sameSite: c.sameSite,
+  secure: c.secure,
+  session: c.session,
+  storeId: c.storeId,
+  value: c.value,
+});
 
 /* ------------------------------------------------------------------ *
  * Tabs
@@ -264,128 +341,6 @@ async function mintCaptcha(siteKey, action) {
   }
 }
 
-/**
- * Run the app's own image-upscale call in the page and return the image.
- *
- * The backend cannot make this call itself: the identical request from Go is
- * rejected with PUBLIC_ERROR_UNUSUAL_ACTIVITY while the same token and payload
- * succeed from the page, and the difference is the TLS fingerprint. So the page
- * makes it.
- *
- * The request and the extraction mirror the in-page expression the backend used
- * before this extension existed. That expression lived in an upscale.go the Go
- * side no longer has — the file is gone from the tree, along with the
- * TestUpscaleExpressionMatchesTheRequestTheAppExpects that used to pin it — so
- * the claim this comment used to make, that changing one side fails the other's
- * test, is no longer true and is not a property anyone should rely on.
- *
- * What does hold it is this extension's own harness: the request made from here
- * is pinned by the flow.upscale cases in test/dispatch.test.mjs. That covers the
- * extension's half and nothing else.
- *
- * Be aware of what this operation is before wiring it to anything: it is
- * implemented and tested at both ends and called by nothing in the engine. The
- * Go-side upsample cluster is unreachable too — the chain ends at
- * Engine.SubmitVideo, which has no callers. See the Upsampling section of
- * internal/flowapi/generate.go.
- */
-async function runUpscale(cfg) {
-  try {
-    if (!window.grecaptcha || !window.grecaptcha.enterprise) {
-      return { error: 'grecaptcha is not loaded on this page' };
-    }
-    await new Promise((resolve) => window.grecaptcha.enterprise.ready(resolve));
-    const token = await window.grecaptcha.enterprise.execute(cfg.siteKey, { action: cfg.action });
-
-    // Position [0] is the media id, not the content id. This is the opposite of
-    // the generation calls, which take content ids in startImage/endImage, and
-    // getting it backwards returns a null payload rather than an error — which
-    // is exactly how it presented. Captured from the app's own SPrCad request.
-    //
-    // Position [1] is the resolution selector and [2] is the context block the
-    // app always sends: tool id 22, the project, then the captcha pair.
-    const arg = [
-      cfg.mediaId,
-      cfg.resolution,
-      [null, 22, null, null, null, cfg.projectId, null, null, null, null, [token, 1]],
-    ];
-
-    const body = new URLSearchParams();
-    body.set('f.req', JSON.stringify([[['SPrCad', JSON.stringify(arg), null, 'generic']]]));
-    const at = (window.WIZ_global_data && window.WIZ_global_data.SNlM0e) || '';
-    if (at) body.set('at', at);
-
-    // The source path names the project, and only the project. An earlier
-    // version appended `/edit/<mediaId>`; the app's own request does not, and
-    // the media id travels in arg[0] instead.
-    let url = '/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=SPrCad'
-      + '&source-path=' + encodeURIComponent('/project/' + cfg.projectId)
-      + '&hl=' + encodeURIComponent(navigator.language || 'en')
-      + '&rt=c';
-    if (cfg.buildLabel) url += '&bl=' + encodeURIComponent(cfg.buildLabel);
-
-    const resp = await fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-        'X-Same-Domain': '1',
-      },
-      body: body.toString(),
-    });
-    const text = await resp.text();
-
-    if (text.indexOf('PUBLIC_ERROR') !== -1) {
-      const m = text.match(/PUBLIC_ERROR_[A-Z_]+/);
-      return { error: m ? m[0] : 'PUBLIC_ERROR' };
-    }
-
-    // The body is a wrb.fr frame stream, and the payload is a JSON *string*
-    // inside it — so the image arrives with its quotes escaped as \". Scraping
-    // the raw text for a quoted base64 run therefore finds nothing at all: the
-    // character in front of the image is a backslash, not a quote, and every
-    // upscale would report "no image data" on a response that plainly has one.
-    // Parse the frame, then walk the decoded payload.
-    const line = text.split('\n').find((l) => l.trim().indexOf('[["wrb.fr"') === 0);
-    if (!line) {
-      // Carry a snippet of what actually came back. "No SPrCad frame" alone
-      // cannot be told apart from an upstream error page, a captcha rejection,
-      // or a frame id that moved — and the response is the only place that
-      // distinction lives.
-      return { error: 'the response carried no SPrCad frame: ' + text.trim().slice(0, 240) };
-    }
-
-    const outer = JSON.parse(line);
-    const inner = JSON.parse(outer[0][2]);
-
-    // The image is the longest base64-looking string anywhere in the payload.
-    // Walking beats a fixed path: the metadata around it moves between captures,
-    // and the image is unambiguous by size and alphabet.
-    let best = '';
-    const walk = (x) => {
-      if (typeof x === 'string') {
-        if (x.length > best.length && /^[A-Za-z0-9+/=\-_]{500,}$/.test(x)) best = x;
-      } else if (Array.isArray(x)) {
-        for (const v of x) walk(v);
-      } else if (x && typeof x === 'object') {
-        for (const v of Object.values(x)) walk(v);
-      }
-    };
-    walk(inner);
-
-    if (!best) {
-      // Carry what actually came back. "No image data" cannot be told apart from
-      // an error frame, a payload whose image moved, or a response that hands
-      // back a URL instead of bytes — and the response is where that distinction
-      // lives.
-      return { error: 'the response carried no image data: ' + JSON.stringify(inner).slice(0, 400) };
-    }
-    return { data: best };
-  } catch (e) {
-    return { error: String(e) };
-  }
-}
-
 /* ------------------------------------------------------------------ *
  * Operations
  * ------------------------------------------------------------------ */
@@ -408,7 +363,7 @@ async function handle(op, params = {}) {
           'tabs.list', 'tabs.open', 'tab.attach', 'tab.detach', 'tab.current',
           'events.read', 'cookies.list', 'cookies.names',
           'flow.fingerprint', 'flow.navigate', 'flow.projects',
-          'flow.captcha', 'flow.upscale', 'flow.at', 'status',
+          'flow.captcha', 'flow.at', 'status',
         ],
       };
 
@@ -471,10 +426,15 @@ async function handle(op, params = {}) {
     }
 
     case 'events.read': {
-      const limit = Number(params.limit) > 0 ? Number(params.limit) : 500;
-      const out = eventQueue.slice(-limit);
-      eventQueue = [];
-      return out;
+      // Always empty, and deliberately kept rather than removed.
+      //
+      // The buffer this used to drain is gone — nothing ever pushed into it. But
+      // the op itself is on the wire: the pinned bridge calls it, and the
+      // server's /v1/bridge/events and /v1/debug/events-raw read through it. An
+      // unknown operation would turn those two working routes into a 502, so the
+      // answer stays a well-formed empty list. `limit` is accepted and ignored
+      // for the same reason: a caller sending it should not get an error back.
+      return [];
     }
 
     case 'cookies.names': {
@@ -539,6 +499,11 @@ async function handle(op, params = {}) {
 
       const found = await cookiesForScope(domain, url);
       const kept = found.filter((c) => isEssentialCookie(c.name));
+
+      // Stamp the pull before answering. This is the read the backend actually
+      // syncs from, so it is what "Cookie Sync" in the popup is reporting.
+      updateState({ lastSyncTime: Date.now(), cookieCount: kept.length });
+
       return kept.map((c) => ({
         domain: c.domain,
         expirationDate: c.expirationDate,
@@ -590,29 +555,8 @@ async function handle(op, params = {}) {
       return out || { available: false, error: 'the page returned nothing' };
     }
 
-    case 'flow.upscale': {
-      // The source path the app expects names the media's editor route, so the
-      // project id is required. The media id is passed through when the caller
-      // has one — a caller holding only a content id is valid, and the app
-      // accepts the project route without it.
-      const projectId = String(params.projectId || '');
-      if (!projectId) throw new Error('flow.upscale needs a projectId');
-
-      const out = await inPage(runUpscale, [{
-        siteKey: cfg.recaptchaSiteKey || '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV',
-        action: 'IMAGE_GENERATION',
-        projectId,
-        mediaId: String(params.mediaId || ''),
-        contentId: String(params.contentId || ''),
-        resolution: Number(params.resolution) || 1,
-        buildLabel: String(params.buildLabel || ''),
-      }]);
-      if (out && out.data) state.upscales++;
-      return out || { error: 'the page returned nothing' };
-    }
-
     case 'status':
-      return { ...state, config: cfg, eventBuffer: eventQueue.length };
+      return { ...state, config: cfg };
 
     default:
       throw new Error(`Unknown operation: ${op}`);
@@ -636,13 +580,6 @@ function socketUrl(cfg) {
 
 function send(payload) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
-}
-
-function pushEvent(event, params) {
-  eventQueue.push({ event, params, at: Date.now() });
-  const max = config?.eventBufferSize || 500;
-  if (eventQueue.length > max) eventQueue = eventQueue.slice(-max);
-  send({ event, params });
 }
 
 function updateState(values) {
@@ -673,6 +610,19 @@ async function connect() {
         config: cfg,
       },
     });
+
+    // Prime the count the popup shows, so it is not blank until the backend
+    // happens to pull cookies. Scoped to one domain and filtered to the
+    // essential names, exactly like every other read here — an unscoped
+    // `getAll({})` would touch every cookie in the profile, which is the thing
+    // `cookies.list` refuses to do on purpose.
+    chrome.cookies
+      .getAll({ domain: 'google.com' })
+      .then((all) => {
+        const count = all.filter((c) => isEssentialCookie(c.name)).length;
+        updateState({ cookieCount: count });
+      })
+      .catch(() => {});
   };
 
   socket.onmessage = async (event) => {
@@ -728,14 +678,106 @@ chrome.runtime.onInstalled.addListener(connect);
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (!msg || !msg.op) return false;
   handle(msg.op, msg.params || {})
-    .then((result) => reply({ ok: true, ...result }))
+    .then((result) => {
+      // A list answer is wrapped rather than spread. `{...["a"]}` is `{0:"a"}` —
+      // spreading an array into an object silently drops its array-ness, so the
+      // popup's cookie export would iterate an object and find nothing. The
+      // popup reads `reply.result` for those ops.
+      reply(Array.isArray(result) ? { ok: true, result } : { ok: true, ...result });
+    })
     .catch((error) => reply({ ok: false, error: error?.message || String(error) }));
   return true;
 });
 
-// The event buffer stays, and events.read drains it, but nothing pushes into it
-// by default: observing page navigations would need the webNavigation permission,
-// and that buys a diagnostic nicety rather than a capability the backend uses.
-// pushEvent is the hook for anything that later wants it.
+/* ------------------------------------------------------------------ *
+ * Cookie rotation
+ *
+ * The one thing this extension says without being asked. Everything else is a
+ * reply; this is a rotation Google performed on its own schedule, which the
+ * backend cannot see and would otherwise only notice as an expired session.
+ * ------------------------------------------------------------------ */
+
+// A rotation arrives as a burst: Chrome fires one change per cookie, and signing
+// in rotates several at once. Announcing each one would put five near-identical
+// frames on the wire and make the backend re-read its jar five times for what is
+// one event. So the changes are collected and sent once the burst goes quiet.
+//
+// Tunable through config for the same reason `reconnectDelayMs` is: the right
+// window is a property of the deployment, not of the code.
+const ROTATION_DEBOUNCE_MS = 1500;
+
+let rotationTimer = null;
+const rotationPending = new Map();
+
+function rotationDebounceMs() {
+  const value = Number(config?.cookieRotationDebounceMs);
+  return Number.isFinite(value) && value >= 0 ? value : ROTATION_DEBOUNCE_MS;
+}
+
+/**
+ * Announce the rotating cookies that changed, once the burst has settled.
+ *
+ * The values are re-read rather than taken from the change event. The event
+ * carries the value Chrome saw at the instant it fired, and the debounce window
+ * exists precisely because the cookie can rotate again inside it — so the value
+ * on disk at the end is the one the backend needs, and the one in the event is
+ * the one that has already gone stale.
+ *
+ * A cookie that has disappeared is reported by name, because a merge cannot tell
+ * "unchanged" from "removed" from values alone, and treating a removed session
+ * cookie as unchanged is the failure this whole path exists to prevent.
+ */
+async function flushRotation() {
+  rotationTimer = null;
+
+  const changed = [...rotationPending.values()];
+  rotationPending.clear();
+  if (changed.length === 0) return;
+
+  const cookies = [];
+  const removed = [];
+  for (const c of changed) {
+    if (c.removed) {
+      removed.push(c.name);
+      continue;
+    }
+    const host = c.domain.replace(/^\./, '');
+    const one = await chrome.cookies.get({ url: `https://${host}/`, name: c.name }).catch(() => null);
+    // Gone between the event and the re-read: Chrome fires a removal for that
+    // case too, but the two can arrive out of order.
+    if (one) cookies.push(shapeCookie(one));
+    else removed.push(c.name);
+  }
+
+  // A rotation is the other half of "the cookies moved", so it restarts the sync
+  // clock the popup shows rather than waiting for the backend's next pull.
+  updateState({ lastSyncTime: Date.now() });
+
+  // A rotation that lands on a closed socket is dropped rather than queued:
+  // `send` is a no-op there, and the next `cookies.list` reads the same values.
+  // This event is an optimisation, not the source of truth.
+  send({ event: 'bridge.cookies_rotated', params: { cookies, removed, changedAt: Date.now() } });
+}
+
+function onCookieChanged(change) {
+  const c = change?.cookie;
+  if (!c || !isRotationDomain(c.domain) || !ROTATING_COOKIES.has(String(c.name))) return;
+
+  // Keyed by domain and name, so a cookie that rotates three times inside one
+  // window is announced once — at its final value, which is the point.
+  rotationPending.set(`${c.domain}\t${c.name}`, {
+    domain: String(c.domain),
+    name: String(c.name),
+    removed: !!change.removed,
+  });
+
+  if (rotationTimer) clearTimeout(rotationTimer);
+  rotationTimer = setTimeout(flushRotation, rotationDebounceMs());
+}
+
+// Passive. This observes cookies the user's own browsing already rotates: it
+// asks Chrome for nothing new — the `cookies` permission is held for
+// `cookies.list` regardless — and it never writes a cookie.
+chrome.cookies.onChanged.addListener(onCookieChanged);
 
 connect();

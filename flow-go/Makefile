@@ -1,12 +1,29 @@
 GO ?= go
 BINARY ?= flow-go
 
+# The daemon's bookkeeping.
+#
+# Both live in data/ because that is the runtime-state directory the engine
+# already owns and .gitignore already covers. They are overridable for anyone who
+# would rather keep them elsewhere.
+PID_FILE ?= data/bridge.pid
+LOG_FILE ?= data/bridge.log
+
 # clean-data and reset delete the account bundles, which cannot be rebuilt without
 # re-syncing from the browser. They refuse to run without CONFIRM=yes rather than
 # taking the session out from under someone who typed the target by accident.
 CONFIRM ?=
 
-.PHONY: all build run test test-race test-cover vet fmt check tidy \
+# Is a bridge daemon running? Written once as a variable because four targets need
+# the answer and they must agree on it — a second copy of this test is a second
+# place for it to drift.
+#
+# `kill -0` asks the kernel whether the pid exists rather than trusting the file:
+# a PID file outlives its process after a crash, and acting on a stale one is how
+# a cleanup target deletes the wrong thing.
+daemon_running = [ -f $(PID_FILE) ] && kill -0 "$$(cat $(PID_FILE))" 2>/dev/null
+
+.PHONY: all build run start stop status-daemon test test-race test-cover vet fmt check tidy \
         doctor projects stats cookies smoke-image \
         clean clean-data reset help
 
@@ -16,9 +33,67 @@ all: build
 build:
 	$(GO) build -o $(BINARY) .
 
-## run: listen for the extension and persist account bundles (no HTTP API)
+## run: listen for the extension in the foreground (no HTTP API)
 run:
 	$(GO) run . bridge
+
+## start: start the bridge as a background daemon (rebuilds first)
+#
+# The guard runs after `build`, so starting an already-running daemon still
+# rebuilds. The running process keeps the binary it was started from — macOS holds
+# the inode — which means **new code needs a stop and then a start**. The message
+# says so rather than leaving it to be discovered.
+start: build
+	@mkdir -p $(dir $(PID_FILE)) $(dir $(LOG_FILE))
+	@if $(daemon_running); then \
+		echo "Bridge daemon is already running (PID: $$(cat $(PID_FILE)))"; \
+		echo "  it is still running the binary from before this build — 'make stop' then 'make start' to pick up new code"; \
+	else \
+		nohup ./$(BINARY) bridge > $(LOG_FILE) 2>&1 & echo $$! > $(PID_FILE); \
+		sleep 1; \
+		if kill -0 "$$(cat $(PID_FILE))" 2>/dev/null; then \
+			echo "Bridge daemon started (PID: $$(cat $(PID_FILE)), log: $(LOG_FILE))"; \
+		else \
+			echo "The bridge daemon did not stay up — check $(LOG_FILE)"; \
+			rm -f $(PID_FILE); \
+			exit 1; \
+		fi; \
+	fi
+
+## stop: stop the background bridge daemon
+#
+# SIGTERM first, so the engine closes its socket and its database cleanly; SIGKILL
+# only if it is still there a second later. The PID file is removed either way —
+# leaving it would make the next `status-daemon` claim a process that is gone.
+stop:
+	@if [ -f $(PID_FILE) ]; then \
+		PID="$$(cat $(PID_FILE))"; \
+		if kill -0 "$$PID" 2>/dev/null; then \
+			kill -TERM "$$PID" 2>/dev/null || true; \
+			sleep 1; \
+			if kill -0 "$$PID" 2>/dev/null; then \
+				echo "  it did not exit on SIGTERM; sending SIGKILL"; \
+				kill -9 "$$PID" 2>/dev/null || true; \
+			fi; \
+			echo "Bridge daemon (PID: $$PID) stopped"; \
+		else \
+			echo "Stale PID file ($$PID is not running); cleaning up"; \
+		fi; \
+		rm -f $(PID_FILE); \
+	else \
+		echo "Bridge daemon is not running (no $(PID_FILE))"; \
+	fi
+
+## status-daemon: report whether the background bridge is running
+status-daemon:
+	@if $(daemon_running); then \
+		echo "Bridge daemon is RUNNING (PID: $$(cat $(PID_FILE)), ws://127.0.0.1:$${WS_PORT:-9222})"; \
+	else \
+		echo "Bridge daemon is STOPPED"; \
+		if lsof -nP -iTCP:"$${WS_PORT:-9222}" -sTCP:LISTEN >/dev/null 2>&1; then \
+			echo "  but something is listening on $${WS_PORT:-9222} — a foreground 'make run' or './flow bridge', which this PID file does not track"; \
+		fi; \
+	fi
 
 ## test: run the test suite
 test:
@@ -72,13 +147,32 @@ smoke-image:
 	@echo "smoke-image submits a real generation and spends one credit."
 	$(GO) run . image "a serene minimalist Japanese zen garden, perfectly balanced smooth dark river stones and a delicate ancient bonsai tree on mossy ground, concentric raked white sand ripples, soft warm golden hour sunlight, ultra-detailed macro photography, 8k"
 
-## clean: remove the binary and build artifacts
+## clean: remove the binary and build artifacts (a running daemon is left alone)
 clean:
 	rm -f $(BINARY)
 	$(GO) clean -testcache
+	@if $(daemon_running); then \
+		echo "a bridge daemon is running (PID: $$(cat $(PID_FILE))) — left $(PID_FILE) and $(LOG_FILE) in place"; \
+	else \
+		rm -f $(PID_FILE) $(LOG_FILE); \
+	fi
 
 ## clean-data: delete cookies/, data/ and output/ (requires CONFIRM=yes)
+#
+# The daemon check comes before the CONFIRM gate, because it is a hard blocker
+# rather than a question: data/ holds the database that daemon has open and the
+# PID file it is tracked by, so deleting it would leave a process running with
+# nothing pointing at it. Say so straight away instead of after a second round
+# trip through CONFIRM.
 clean-data:
+	@if $(daemon_running); then \
+		echo "A bridge daemon is running (PID: $$(cat $(PID_FILE)))."; \
+		echo "clean-data deletes data/, which holds the database it has open and the"; \
+		echo "PID file it is tracked by. Stop it first:"; \
+		echo; \
+		echo "  make stop"; \
+		exit 1; \
+	fi
 	@if [ "$(CONFIRM)" != "yes" ]; then \
 		echo "clean-data removes:"; \
 		echo "  cookies/   every account bundle — re-syncable only from the browser"; \
@@ -101,7 +195,19 @@ clean-data:
 # make runs the prerequisites in order — so `clean` would delete the binary and
 # *then* clean-data would refuse, leaving a refused command half-executed. A
 # target that says no must not have already done half the work.
+#
+# The daemon check is here for the same reason, one step earlier: `clean` runs
+# first and would delete the binary out from under a running daemon before
+# clean-data ever got the chance to refuse.
 reset:
+	@if $(daemon_running); then \
+		echo "A bridge daemon is running (PID: $$(cat $(PID_FILE)))."; \
+		echo "reset deletes data/, which holds the database it has open and the PID file"; \
+		echo "it is tracked by, and the binary it is running from. Stop it first:"; \
+		echo; \
+		echo "  make stop"; \
+		exit 1; \
+	fi
 	@if [ "$(CONFIRM)" != "yes" ]; then \
 		echo "reset runs 'clean' and 'clean-data': a full clean slate, including"; \
 		echo "every account bundle, the SQLite database and every downloaded asset."; \

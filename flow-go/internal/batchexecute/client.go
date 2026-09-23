@@ -2143,8 +2143,12 @@ type EditVideoRequest struct {
 //	  2,
 //	  [null, null, null, null, <uuid>, <uuid>] ]
 func buildEditArgument(req EditVideoRequest) []any {
+	trimEnd := req.TrimEnd
+	if trimEnd <= 0 {
+		trimEnd = 192
+	}
 	request := []any{
-		[]any{nil, req.SourceID, req.TrimStart, req.TrimEnd},
+		[]any{nil, req.SourceID, req.TrimStart, trimEnd},
 		[]any{nil, nil, []any{[]any{[]any{req.Prompt}}}},
 		req.Model,
 		// The capture carried 2 here, the same value a text submission carries at

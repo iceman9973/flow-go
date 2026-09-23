@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -3963,6 +3964,22 @@ func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error
 	}
 	if !e.Ready() {
 		return "", fmt.Errorf("engine: not ready — call Bootstrap first")
+	}
+
+	if info, err := os.Stat(id); err == nil && !info.IsDir() {
+		data, err := os.ReadFile(id)
+		if err != nil {
+			return "", fmt.Errorf("engine: read %s: %w", id, err)
+		}
+		mimeType := http.DetectContentType(data)
+		mediaID, contentID, err := e.UploadImageViaBatch(ctx, data, mimeType, filepath.Base(id))
+		if err != nil {
+			return "", fmt.Errorf("engine: upload condition image %s: %w", id, err)
+		}
+		if contentID != "" {
+			return contentID, nil
+		}
+		id = mediaID
 	}
 
 	// The engine's own cookies, not the bridge's — see Engine.Jar.

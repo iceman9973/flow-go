@@ -129,6 +129,43 @@ CREATE INDEX IF NOT EXISTS idx_media_media_id ON media(media_id);
 CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
 
 -- ----------------------------------------------------------------------------
+-- uploads: one row per local file put into a project, so the same file is not
+-- sent twice.
+-- ----------------------------------------------------------------------------
+--
+-- A video is the largest thing this engine sends, and editing one repeatedly is
+-- the normal way to use it: the same file goes up once and is then edited with
+-- different prompts. Without this table every edit re-uploads it, which for a
+-- 5 MB clip is slow and for a 100 MB one is unreasonable.
+--
+-- The key is (file_hash, project_id) rather than the path alone. The path is
+-- recorded for a human reading the table, but it is not what identifies the
+-- upload: the same file moved or copied is the same upload, and the same bytes
+-- in a different project is a different one — a media id is only addressable
+-- inside the project it was created in.
+--
+-- **A row here is a claim that the media id was valid at the time it was
+-- written, and nothing re-checks that.** A project that is emptied, or a media
+-- id that expires, leaves a row pointing at something unreachable, and the next
+-- upload of that file would reuse it and then fail at the edit. That is the
+-- trade `--force-upload` exists to escape, and it is why a hit is logged rather
+-- than passed over silently: the operator needs to be able to see that the
+-- upload did not happen.
+CREATE TABLE IF NOT EXISTS uploads (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path   TEXT NOT NULL,                     -- as given; for a human, not for matching
+    file_hash   TEXT NOT NULL,                     -- SHA-256 of the file's contents
+    media_id    TEXT NOT NULL,                     -- what the edit RPC takes
+    project_id  TEXT NOT NULL,                     -- media ids are project-scoped
+    bytes       INTEGER NOT NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- The lookup is always (hash, project), newest first, so the index carries both
+-- in that order and the id breaks the tie.
+CREATE INDEX IF NOT EXISTS idx_uploads_lookup ON uploads(file_hash, project_id, id DESC);
+
+-- ----------------------------------------------------------------------------
 -- request_logs: upstream call accounting, used for latency and error reporting.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS request_logs (

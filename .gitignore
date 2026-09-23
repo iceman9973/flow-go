@@ -1,9 +1,11 @@
 # Build artifacts. The binary is named after the module, so it sits beside the
 # module rather than at the repository root.
 /flow-go/flow-go
+/flow-go/flow
 /dist/
 *.exe
 *.test
+*.mp4
 
 # macOS metadata
 .DS_Store

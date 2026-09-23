@@ -444,6 +444,24 @@ var (
 	PollTimeout = envInt("POLL_TIMEOUT", 420)
 	// RequestTimeout bounds a single upstream HTTP call.
 	RequestTimeout = envInt("REQUEST_TIMEOUT", 90)
+	// UploadTimeout bounds one video upload, in seconds.
+	//
+	// Its own knob rather than sharing RequestTimeout, because the two measure
+	// different things. RequestTimeout bounds a JSON RPC of a few kilobytes; a
+	// video is orders of magnitude larger, so one number for both means either a
+	// needlessly long RPC timeout or an upload that fails on a slow link for a
+	// reason the operator cannot see. The transport's timeout is fixed when the
+	// client is built, so the upload needs its own client either way.
+	UploadTimeout = envInt("UPLOAD_TIMEOUT", 300)
+	// MaxUploadMB is the largest video the upload will send, in megabytes.
+	//
+	// A guard against pointing the command at the wrong file rather than a limit
+	// Flow is known to enforce — no such limit has been observed, and this port
+	// has never uploaded against a live account. So it is deliberately generous
+	// and deliberately overridable: refusing a legitimate 150 MB clip would be a
+	// worse failure than allowing a large one, and the whole cost of the guard is
+	// that a mistake is caught before several hundred megabytes leave the machine.
+	MaxUploadMB = envInt("MAX_UPLOAD_MB", 100)
 	// SessionTTL bounds how long a cached access token is trusted, in seconds.
 	// Google's bearer tokens live ~60 minutes; we refresh well before that.
 	SessionTTL = envInt("SESSION_TTL", 2400)

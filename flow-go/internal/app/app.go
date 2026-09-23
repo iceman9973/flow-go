@@ -39,6 +39,7 @@ var DefaultTargets = []string{
 // the engine can address `authuser=0` and nothing else, and every other signed-in
 // account is invisible — which reads as "one account" rather than "one readable".
 var DefaultCookieDomains = []string{
+	"flow.google.com",
 	"labs.google",
 	"google.com",
 	"accounts.google.com",

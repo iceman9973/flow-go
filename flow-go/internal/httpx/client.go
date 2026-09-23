@@ -96,6 +96,22 @@ type Request struct {
 	Headers     map[string]string
 	HeaderOrder []string
 	Body        []byte
+	// BodyReader streams the body instead of buffering it, and takes precedence
+	// over Body when set.
+	//
+	// It exists for the one caller that sends something large: a video upload.
+	// Buffering a 200 MB file into a []byte to hand it to Body would work and
+	// would put the whole thing in memory twice on the way out — once in the
+	// file read and once in the request — which is a bad trade for a feature
+	// whose whole point is that the file may be big.
+	BodyReader io.Reader
+	// BodyLength is how many bytes BodyReader will produce. It is required
+	// alongside BodyReader, and the reason is not cosmetic: fhttp, like
+	// net/http, only infers a length from three concrete reader types
+	// (*bytes.Buffer, *bytes.Reader, *strings.Reader). Anything else goes out
+	// with chunked transfer encoding — and an upload endpoint that was told the
+	// size when the session was created will not accept chunked.
+	BodyLength int64
 	// Cookies is a pre-rendered Cookie header value.
 	Cookies string
 	// DisableQUIC forces the HTTP/2 path for this request.
@@ -262,9 +278,17 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 }
 
 func (c *Client) doHTTP2(ctx context.Context, req *Request) (*Response, error) {
-	hreq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, strings.NewReader(string(req.Body)))
+	var body io.Reader = strings.NewReader(string(req.Body))
+	if req.BodyReader != nil {
+		body = req.BodyReader
+	}
+
+	hreq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, body)
 	if err != nil {
 		return nil, err
+	}
+	if req.BodyReader != nil && req.BodyLength > 0 {
+		hreq.ContentLength = req.BodyLength
 	}
 
 	hreq.Header[http.HeaderOrderKey] = pickOrder(req.HeaderOrder)
@@ -280,17 +304,25 @@ func (c *Client) doHTTP2(ctx context.Context, req *Request) (*Response, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	return &Response{Status: resp.StatusCode, Header: stdhttp.Header(resp.Header), Body: body}, nil
+	return &Response{Status: resp.StatusCode, Header: stdhttp.Header(resp.Header), Body: bodyBytes}, nil
 }
 
 func (c *Client) doQUIC(ctx context.Context, req *Request) (*Response, error) {
-	hreq, err := stdhttp.NewRequestWithContext(ctx, req.Method, req.URL, strings.NewReader(string(req.Body)))
+	var body io.Reader = strings.NewReader(string(req.Body))
+	if req.BodyReader != nil {
+		body = req.BodyReader
+	}
+
+	hreq, err := stdhttp.NewRequestWithContext(ctx, req.Method, req.URL, body)
 	if err != nil {
 		return nil, err
+	}
+	if req.BodyReader != nil && req.BodyLength > 0 {
+		hreq.ContentLength = req.BodyLength
 	}
 	for k, v := range defaultHeaders() {
 		hreq.Header.Set(k, v)
@@ -308,11 +340,11 @@ func (c *Client) doQUIC(ctx context.Context, req *Request) (*Response, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	return &Response{Status: resp.StatusCode, Header: resp.Header, Body: body}, nil
+	return &Response{Status: resp.StatusCode, Header: resp.Header, Body: bodyBytes}, nil
 }
 
 func applyHeaders(hreq *http.Request, req *Request) {

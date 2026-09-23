@@ -868,6 +868,81 @@ func (s *Store) RecentMedia(limit int) ([]Media, error) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Uploads
+ * ------------------------------------------------------------------ */
+
+// UploadRecord is one local file put into a project, so the same file is not
+// sent twice.
+type UploadRecord struct {
+	ID       int64  `json:"id"`
+	FilePath string `json:"file_path"`
+	// FileHash is SHA-256 of the file's contents, and it — not the path — is what
+	// identifies the upload. A file that was moved or copied is the same upload;
+	// the same bytes in a different project is a different one, because a media
+	// id is only addressable inside the project it was created in.
+	FileHash  string    `json:"file_hash"`
+	MediaID   string    `json:"media_id"`
+	ProjectID string    `json:"project_id"`
+	Bytes     int64     `json:"bytes"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// RecordUpload inserts an upload row.
+func (s *Store) RecordUpload(u UploadRecord) error {
+	_, err := s.db.Exec(`
+		INSERT INTO uploads (file_path, file_hash, media_id, project_id, bytes)
+		VALUES (?, ?, ?, ?, ?)
+	`, u.FilePath, u.FileHash, u.MediaID, u.ProjectID, u.Bytes)
+	return err
+}
+
+// FindUpload returns the most recent upload of a file into a project, or nil
+// when there is none.
+//
+// **Nil rather than an error for "no match", and that is the point.** The caller
+// asks this before every upload, so a miss is the ordinary answer rather than a
+// failure; returning an error would make the common path look like something
+// went wrong and invite a caller to treat a cold cache as a fault.
+//
+// Newest first, because a file uploaded twice — after a --force-upload, or into
+// a project that was cleared — has two rows and only the later one can be
+// expected to still resolve.
+//
+// A hit is a claim about the past: it says this media id was valid when it was
+// written, and nothing here re-checks that. See the note on the uploads table in
+// schema.sql.
+func (s *Store) FindUpload(fileHash, projectID string) (*UploadRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT id, file_path, file_hash, media_id, project_id, COALESCE(bytes, 0), created_at
+		  FROM uploads
+		 WHERE file_hash = ? AND project_id = ?
+		 ORDER BY id DESC
+		 LIMIT 1
+	`, fileHash, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+
+	var u UploadRecord
+	var createdAt sql.NullString
+	if err := rows.Scan(&u.ID, &u.FilePath, &u.FileHash, &u.MediaID, &u.ProjectID,
+		&u.Bytes, &createdAt); err != nil {
+		return nil, err
+	}
+	if createdAt.Valid {
+		if t, ok := parseSQLiteTime(createdAt.String); ok {
+			u.CreatedAt = t
+		}
+	}
+	return &u, rows.Err()
+}
+
+/* ------------------------------------------------------------------ *
  * Request logs
  * ------------------------------------------------------------------ */
 

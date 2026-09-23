@@ -44,6 +44,8 @@ func Run(args []string) int {
 		return runImage(args[1:])
 	case "edit":
 		return runEdit(args[1:])
+	case "upload-video", "upload":
+		return runUploadVideo(args[1:])
 	case "batch-all":
 		return runBatchAll(args[1:])
 	case "projects":
@@ -91,6 +93,7 @@ COMMANDS
   generate              Generate a video
   image                 Generate an image
   edit                  Edit an existing video
+  upload-video, upload  Upload a local video and print its media ID
   batch-all             Generate one image per account in cookies/account_*.json
   projects              List the account's Flow projects
   stats                 Print database statistics
@@ -155,16 +158,43 @@ IMAGE FLAGS
   --no-download         Skip writing the result to output/
 
 EDIT FLAGS
-  --source              The asset to edit, as a media ID or a content ID
-                        (required)
+  --source              The asset to edit: a media ID, a content ID, or a path
+                        to a local video. It may be given positionally instead —
+                        as a first argument that is a file, or as the first of
+                        two arguments, the second being the prompt.
   --prompt              What to change (required, or give it as a positional
                         argument)
   --model               Defaults to abra_edit
   --no-download         Skip writing the result to output/
+  --force-upload        Upload the file again even if it is already in this
+                        project
+
+  A local video is uploaded first, by a two-step Google Cloud Storage resumable
+  upload, and the media ID it returns is what the edit runs on. That is the only
+  way a local file reaches a project: the image path carries its bytes inside a
+  batchexecute payload, and video has no equivalent there.
+
+  A file already in this project is reused rather than sent again, matched on
+  SHA-256 of its contents — so editing one video repeatedly costs a single
+  upload. See UPLOAD-VIDEO below for what that cache does and does not promise.
 
   An edit cannot move accounts: its source is an asset inside the current
   account's project, so a switch would take the project with it.
 
+UPLOAD-VIDEO
+  flow-go upload-video <file.mp4>     mp4, m4v, mov, webm or mkv
+  flow-go upload <file.mp4>           the same command
+  --force-upload                      send the file again even if it is already
+                                      in this project
+
+  Prints the media ID, which is what edit --source takes.
+
+  A file already uploaded into this project is reused rather than sent again,
+  matched on SHA-256 of its contents rather than on its path — so editing one
+  video repeatedly costs a single upload, and editing a file in place sends the
+  new bytes instead of reusing the old media ID. A hit is never re-checked, so if
+  the media ID has since gone — the project was cleared, the asset removed —
+  --force-upload is the way past it.
 EXAMPLES
   flow-go bridge
   flow-go image "a single red paper boat"
@@ -172,6 +202,8 @@ EXAMPLES
   flow-go generate "a paper boat on a river" --duration 8
   flow-go generate "slow push in" --start-image ./frame.png --quality 360p
   flow-go generate "keep the style" --reference ./style-a.png --reference ./style-b.png
+  flow-go upload-video clip.mp4
+  flow-go edit clip.mp4 "make it a cybernetic neon city"
   flow-go edit --source <content-id> "make the boat drift slowly to the left"
   flow-go batch-all --prompt "a paper boat" --model narwhal
   flow-go stats
@@ -477,27 +509,45 @@ func runReferenceGenerate(ctx context.Context, a *app.App, prompt string,
 
 // runEdit edits an existing asset with abra_edit.
 //
-// The engine has had this path all along and nothing exposed it, so the
-// capability was unreachable from any operator surface. The source is an asset
-// id — a media id or a content id — and the engine resolves whichever it is
-// given to the content id the RPC actually wants.
+// The source may be an asset id — a media id or a content id, which the engine
+// resolves to the content id the RPC wants — or a path to a local video, which is
+// uploaded first. Both forms take the same flag, because which one you have is
+// not something the caller should have to say.
 func runEdit(args []string) int {
 	fs := flag.NewFlagSet("edit", flag.ExitOnError)
 	var common commonFlags
 	common.bind(fs)
-	source := fs.String("source", "", "the asset to edit: a media ID or a content ID")
+	source := fs.String("source", "",
+		"the asset to edit: a media ID, a content ID, or a path to a local video")
 	prompt := fs.String("prompt", "", "what to change")
 	model := fs.String("model", "", "edit model (default abra_edit)")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
+	forceUpload := fs.Bool("force-upload", false,
+		"upload the file again even if it is already in this project")
 	_ = fs.Parse(args)
 
-	// The prompt may be given positionally, as on generate and image. A source
-	// cannot be, because it is an opaque id and a bare id on the command line
-	// would be indistinguishable from a prompt.
-	*prompt = promptFromArgs(*prompt, fs.Args())
+	// Both the source and the prompt may be given positionally, so
+	// `flow-go edit clip.mp4 "make it neon"` reads the way it should.
+	*source, *prompt = resolveEditArgs(*source, *prompt, fs.Args())
+
 	if strings.TrimSpace(*source) == "" {
-		return fail(fmt.Errorf("--source is required: the asset to edit, as a media ID or " +
-			"a content ID"))
+		return fail(fmt.Errorf("--source is required: a media ID, a content ID, or a path to a " +
+			"local video (given positionally or with --source)"))
+	}
+
+	// A source that is neither a file nor something the RPC can address is
+	// reported here, where the reason is still visible. Passing it through would
+	// fail later as "not in the project listing", which names the symptom and
+	// sends the reader looking at their project rather than at their argument.
+	if !isLocalFile(*source) {
+		if strings.HasPrefix(*source, "http://") || strings.HasPrefix(*source, "https://") {
+			return fail(fmt.Errorf("--source takes a media ID, a content ID, or a local video "+
+				"path, and %s is a URL — download it first", *source))
+		}
+		if looksLikePath(*source) {
+			return fail(fmt.Errorf("%s is not a file; check the path, or pass a media ID or a "+
+				"content ID", *source))
+		}
 	}
 	if strings.TrimSpace(*prompt) == "" {
 		return fail(fmt.Errorf("--prompt is required (or give the prompt as an argument)"))
@@ -518,10 +568,38 @@ func runEdit(args []string) int {
 		return fail(err)
 	}
 
-	fmt.Printf("editing %s\n", short(*source))
+	// A local file is uploaded first; anything else is already an id and is
+	// passed through. The test is on the source, not on the flag it came from, so
+	// `--source clip.mp4` and a positional `clip.mp4` behave identically.
+	editSource := *source
+	if isLocalFile(editSource) {
+		info, statErr := os.Stat(editSource)
+		if statErr != nil {
+			return fail(fmt.Errorf("read %s: %w", editSource, statErr))
+		}
+		// "Resolving" rather than "uploading", because it may not upload: a file
+		// already in this project is reused from the cache, and a line promising
+		// an upload followed by a line saying there wasn't one reads as a bug.
+		fmt.Printf("resolving %s (%.1f MB) to a project media ID...\n", filepath.Base(editSource),
+			float64(info.Size())/(1024*1024))
+
+		uploaded, uploadErr := a.Engine.UploadVideo(ctx, editSource,
+			engine.UploadOptions{Force: *forceUpload})
+		if uploadErr != nil {
+			return fail(uploadErr)
+		}
+		if uploaded.Cached {
+			fmt.Printf("  already in this project — reusing media %s\n", uploaded.MediaID)
+		} else {
+			fmt.Printf("  uploaded as media %s\n", uploaded.MediaID)
+		}
+		editSource = uploaded.MediaID
+	}
+
+	fmt.Printf("editing %s\n", short(editSource))
 
 	outcome, err := a.Engine.EditVideoViaBatch(ctx, engine.BatchEditRequest{
-		Source:   *source,
+		Source:   editSource,
 		Prompt:   *prompt,
 		Model:    *model,
 		Wait:     !*noDownload,
@@ -531,6 +609,121 @@ func runEdit(args []string) int {
 		return fail(err)
 	}
 	printJSON(outcome)
+	return 0
+}
+
+// resolveEditArgs decides which positional argument is the source and which is
+// the prompt.
+//
+// Two signals, and they cover different cases. A first argument that is a file
+// that exists is a source whatever else is on the line, which is what keeps a
+// one-word prompt unambiguous — a prompt is not a path to something on disk.
+// Failing that, two or more arguments with nothing named is source-then-prompt,
+// because a prompt is one argument in practice: that is what lets a media id be
+// given positionally without `--source`.
+//
+// `--source` short-circuits both: a caller who named it has made a decision, so
+// every positional argument is the prompt.
+//
+// Split out from the command so the rule can be exercised directly. Running it
+// through `Run` reaches the bridge, which waits five seconds to become its host
+// before failing — five seconds per case for a decision that touches no network.
+func resolveEditArgs(source, prompt string, positional []string) (string, string) {
+	if strings.TrimSpace(source) == "" && len(positional) > 0 {
+		switch {
+		case isLocalFile(positional[0]):
+			source = positional[0]
+			positional = positional[1:]
+		case len(positional) >= 2:
+			source = positional[0]
+			positional = positional[1:]
+		}
+	}
+	return source, promptFromArgs(prompt, positional)
+}
+
+// isLocalFile reports whether a command-line argument names a file that exists.
+//
+// Directories are not files for this purpose: `flow-go edit ./clips "make it
+// neon"` should treat `./clips` as a prompt-shaped argument rather than as a
+// source, and the upload would refuse a directory anyway.
+func isLocalFile(value string) bool {
+	if strings.TrimSpace(value) == "" {
+		return false
+	}
+	info, err := os.Stat(value)
+	return err == nil && !info.IsDir()
+}
+
+// looksLikePath reports whether a source argument is shaped like a filesystem
+// path rather than an asset id.
+//
+// Only a separator is decisive, and that is deliberate. An id is a uuid or a hex
+// token with no separator in it, so seeing one settles it; guessing from a file
+// extension would mean duplicating the video-extension list here, and a bare
+// missing filename reading as an id is a smaller failure than a real id being
+// refused.
+func looksLikePath(value string) bool {
+	return strings.ContainsAny(value, `/\`)
+}
+
+/* ------------------------------------------------------------------ *
+ * upload-video
+ * ------------------------------------------------------------------ */
+
+// runUploadVideo puts a local video into the account's Flow project and prints
+// the media id.
+//
+// It exists because the upload and the edit are separable: a video uploaded once
+// can be edited repeatedly, and re-uploading it for every attempt would be slow
+// and would leave a copy of the file in the project each time. That reasoning is
+// what the upload cache now enforces for `edit` too, so this command is mostly a
+// way to get the id on its own.
+func runUploadVideo(args []string) int {
+	fs := flag.NewFlagSet("upload-video", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	forceUpload := fs.Bool("force-upload", false,
+		"upload again even if this file is already in the project")
+	_ = fs.Parse(args)
+
+	positional := fs.Args()
+	if len(positional) == 0 {
+		return fail(fmt.Errorf("a video file is required: flow-go upload-video <file.mp4>"))
+	}
+	if len(positional) > 1 {
+		return fail(fmt.Errorf("upload-video takes one file, and got %d", len(positional)))
+	}
+	path := positional[0]
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	attachBridge(ctx, a)
+
+	if err := bootstrap(ctx, a); err != nil {
+		return fail(err)
+	}
+
+	if info, statErr := os.Stat(path); statErr == nil {
+		fmt.Printf("resolving %s (%.1f MB) to a project media ID...\n", filepath.Base(path),
+			float64(info.Size())/(1024*1024))
+	}
+
+	result, err := a.Engine.UploadVideo(ctx, path, engine.UploadOptions{Force: *forceUpload})
+	if err != nil {
+		return fail(err)
+	}
+	if result.Cached {
+		fmt.Printf("  already in this project — reusing media %s\n", result.MediaID)
+	}
+	printJSON(result)
 	return 0
 }
 

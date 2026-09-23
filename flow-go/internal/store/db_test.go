@@ -821,3 +821,150 @@ func TestStatsAccountForEveryRow(t *testing.T) {
 			stats.Succeeded, stats.Failed, stats.InFlight, stats.Empty)
 	}
 }
+
+/* ------------------------------------------------------------------ *
+ * Uploads
+ * ------------------------------------------------------------------ */
+
+func TestRecordUploadRoundTrips(t *testing.T) {
+	st := openTemp(t)
+
+	want := UploadRecord{
+		FilePath:  "/videos/clip.mp4",
+		FileHash:  "a3f1…",
+		MediaID:   "9c9f39cc-3e4b-43eb-a51e-88c8532b9b59",
+		ProjectID: "proj-1",
+		Bytes:     42947,
+	}
+	if err := st.RecordUpload(want); err != nil {
+		t.Fatalf("RecordUpload: %v", err)
+	}
+
+	got, err := st.FindUpload(want.FileHash, want.ProjectID)
+	if err != nil {
+		t.Fatalf("FindUpload: %v", err)
+	}
+	if got == nil {
+		t.Fatal("FindUpload returned nil for a row that was just written")
+	}
+
+	if got.ID == 0 {
+		t.Error("the row came back without its id")
+	}
+	if got.MediaID != want.MediaID {
+		t.Errorf("media id = %q, want %q", got.MediaID, want.MediaID)
+	}
+	if got.FilePath != want.FilePath {
+		t.Errorf("file path = %q, want %q", got.FilePath, want.FilePath)
+	}
+	if got.Bytes != want.Bytes {
+		t.Errorf("bytes = %d, want %d", got.Bytes, want.Bytes)
+	}
+	if got.CreatedAt.IsZero() {
+		t.Error("created_at did not survive the round trip — the column defaults to " +
+			"CURRENT_TIMESTAMP and is read back as text, so a miss here is the parse failing")
+	}
+}
+
+// A miss is nil and no error. That is the whole contract: this is asked before
+// every upload, so a cold cache is the ordinary answer rather than a fault, and
+// a caller that had to treat it as one would log an error on the common path.
+func TestFindUploadMissesAreNilAndNotAnError(t *testing.T) {
+	st := openTemp(t)
+
+	if err := st.RecordUpload(UploadRecord{
+		FilePath:  "/videos/clip.mp4",
+		FileHash:  "hash-a",
+		MediaID:   "media-a",
+		ProjectID: "proj-1",
+		Bytes:     10,
+	}); err != nil {
+		t.Fatalf("RecordUpload: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		hash      string
+		projectID string
+	}{
+		{"a different hash", "hash-b", "proj-1"},
+		{"a different project", "hash-a", "proj-2"},
+		{"neither matches", "hash-b", "proj-2"},
+		{"an empty database is asked for something", "", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := st.FindUpload(tc.hash, tc.projectID)
+			if err != nil {
+				t.Errorf("a miss should not be an error: %v", err)
+			}
+			if got != nil {
+				t.Errorf("found %+v, want nil", got)
+			}
+		})
+	}
+}
+
+// The newest row wins. A file uploaded twice — after a --force-upload, or into a
+// project that was cleared — has two rows, and only the later one can be expected
+// to still resolve.
+func TestFindUploadReturnsTheNewestRow(t *testing.T) {
+	st := openTemp(t)
+
+	for _, mediaID := range []string{"first", "second", "third"} {
+		if err := st.RecordUpload(UploadRecord{
+			FilePath:  "/videos/clip.mp4",
+			FileHash:  "same-hash",
+			MediaID:   mediaID,
+			ProjectID: "proj-1",
+			Bytes:     10,
+		}); err != nil {
+			t.Fatalf("RecordUpload(%s): %v", mediaID, err)
+		}
+	}
+
+	got, err := st.FindUpload("same-hash", "proj-1")
+	if err != nil {
+		t.Fatalf("FindUpload: %v", err)
+	}
+	if got == nil {
+		t.Fatal("FindUpload returned nil")
+	}
+	if got.MediaID != "third" {
+		t.Errorf("media id = %q, want the newest row (%q)", got.MediaID, "third")
+	}
+}
+
+// The same bytes in two projects are two uploads: a media id is only addressable
+// inside the project it was created in, so a lookup that ignored the project
+// would hand back an id the edit RPC cannot use.
+func TestUploadsAreScopedToTheProject(t *testing.T) {
+	st := openTemp(t)
+
+	if err := st.RecordUpload(UploadRecord{
+		FilePath: "/videos/clip.mp4", FileHash: "same-hash",
+		MediaID: "media-in-one", ProjectID: "proj-1", Bytes: 10,
+	}); err != nil {
+		t.Fatalf("RecordUpload: %v", err)
+	}
+	if err := st.RecordUpload(UploadRecord{
+		FilePath: "/videos/clip.mp4", FileHash: "same-hash",
+		MediaID: "media-in-two", ProjectID: "proj-2", Bytes: 10,
+	}); err != nil {
+		t.Fatalf("RecordUpload: %v", err)
+	}
+
+	for projectID, want := range map[string]string{"proj-1": "media-in-one", "proj-2": "media-in-two"} {
+		got, err := st.FindUpload("same-hash", projectID)
+		if err != nil {
+			t.Fatalf("FindUpload(%s): %v", projectID, err)
+		}
+		if got == nil {
+			t.Fatalf("FindUpload(%s) returned nil", projectID)
+		}
+		if got.MediaID != want {
+			t.Errorf("project %s gave media id %q, want %q", projectID, got.MediaID, want)
+		}
+	}
+}

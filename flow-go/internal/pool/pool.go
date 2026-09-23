@@ -524,10 +524,10 @@ const acquirePollInterval = 200 * time.Millisecond
 
 // NoWorkerError reports that no worker can take the job, and why.
 //
-// The wording leads with "no worker available" because that is the phrase
-// statusFor maps to a 503, and the reason is appended rather than replacing it —
-// the message used to be exactly "no worker available (registered=0)", which
-// says what happened but nothing about what to do.
+// The wording leads with "no worker available" because that is the phrase a
+// caller or a log grep matches on, and the reason is appended rather than
+// replacing it — the message used to be exactly "no worker available
+// (registered=0)", which says what happened but nothing about what to do.
 type NoWorkerError struct {
 	// Reason states the cause in the operator's terms.
 	Reason string

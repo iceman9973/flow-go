@@ -1,7 +1,7 @@
 GO ?= go
 BINARY ?= flow-go
 
-.PHONY: all build run test vet fmt tidy clean stats help
+.PHONY: all build run test test-race vet fmt check tidy stats cookies clean help
 
 all: build
 
@@ -9,9 +9,9 @@ all: build
 build:
 	$(GO) build -o $(BINARY) .
 
-## run: start the API and the extension bridge
+## run: listen for the extension and persist account bundles (no HTTP API)
 run:
-	$(GO) run . serve
+	$(GO) run . bridge
 
 ## test: run the test suite
 test:
@@ -28,6 +28,13 @@ vet:
 ## fmt: format the source
 fmt:
 	$(GO) fmt ./...
+
+## check: formatting, vet, then the suite — the same set CI would run
+check:
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then echo "not gofmt-clean:"; echo "$$unformatted"; exit 1; fi
+	$(GO) vet ./...
+	$(GO) test ./...
 
 ## tidy: reconcile go.mod and go.sum
 tidy:

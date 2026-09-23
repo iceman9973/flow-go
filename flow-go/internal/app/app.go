@@ -3,20 +3,17 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/gofiber/fiber/v3"
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
-	"github.com/kodelyx/flow-go/flow-go/internal/server"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
 
@@ -143,43 +140,44 @@ func (a *App) Close() error {
 	return nil
 }
 
-// repairClaimEnv disables the automatic re-pairing window when set to "0".
-const repairClaimEnv = "FLOW_BRIDGE_REPAIR"
-
-// clearPairingMarker re-arms the bridge's first-pairing window.
+// clearPairingMarker removes what the bridge-token era left behind.
 //
-// The bridge token is trust-on-first-use: the backend generates a token on its
-// first run and accepts exactly one tokenless connection, which is how the
-// extension is handed it. That connection writes a `bridge-token.claimed`
-// marker, and from then on the token is required on every upgrade — including
-// from an extension whose `chrome.storage.local` has been cleared, which is
-// precisely what removing and re-adding an unpacked extension does.
+// The bridge is tokenless: it accepts any extension that connects, and there is
+// no pairing step for a human to perform. An install upgrading from the token
+// build still has `bridge-token` and `bridge-token.claimed` in the cookie
+// directory, and neither is read any more — `Bridge.EnsureToken` is a no-op kept
+// for compatibility. Deleting them at start-up is a migration, not a security
+// step.
 //
-// The module documents the way out of that state ("to re-pair, delete the claim
-// marker next to the token file"). This is that step taken at start-up, so
-// losing the token costs a restart instead of a hunt for a 43-character string
-// to paste into a form.
-//
-// Two things keep this narrow. The window closes again by itself on the first
-// connection that authenticates, and `EnsureToken` is only reachable through
-// `Bridge.Listen` while the process is starting — so the token is waived only in
-// the state a fresh process is already in, never while one is serving. Nothing
-// here weakens the upgrade check itself, and `/v1/session` keeps its own guard.
-//
-// Set FLOW_BRIDGE_REPAIR=0 to leave the marker alone.
+// It runs before the listener opens so that a stale marker is not the first thing
+// a reader finds while debugging a connection.
 func clearPairingMarker() {
 	_ = os.Remove(filepath.Join(config.CookieDir(), "bridge-token.claimed"))
 	_ = os.Remove(filepath.Join(config.CookieDir(), "bridge-token"))
 }
 
-// Serve starts the extension bridge, brings the engine up, and runs the HTTP API
-// until ctx is cancelled.
+// RunBridge starts the extension bridge and keeps it up until ctx is cancelled.
 //
-// Ordering matters: the bridge listener comes up first so the extension can
-// connect and hand over cookies, and the engine is only bootstrapped once. If
-// cookies are not available yet the engine reports "waiting for browser" rather
-// than failing, and a later bootstrap can be triggered by POST /api/sync-cookies.
-func (a *App) Serve(ctx context.Context, port int) error {
+// **This is the whole of the process.** The WebSocket listener is its only
+// surface: a connected Chrome profile is asked for its cookies, its page tokens
+// and its browser identity, and the bridge writes them into
+// `cookies/account_<key>.json` on the way in — `Bridge.SyncCookies` runs on every
+// connection, so persistence does not depend on anything below. Every generation
+// happens in a separate CLI run that reads one of those files, which is why there
+// is no HTTP server here and nothing generates over the network.
+//
+// The engine is still bootstrapped once a browser shows up, and that is not a
+// generation path: it is what registers the connected accounts and reads their
+// credit balances, so `flow-go stats` has something current to report. Without it
+// the accounts table would only move when an operator ran `flow-go credits`.
+//
+// One consequence of dropping the HTTP server worth knowing: `POST
+// /api/sync-cookies` used to be the way to re-run that registration after a new
+// profile connected. There is no replacement trigger, so a profile that attaches
+// after this bootstrap writes its bundle (fine — that is the file every
+// generation reads) but is not added to the accounts table until the next
+// `flow-go credits` or a restart.
+func (a *App) RunBridge(ctx context.Context) error {
 	// Before the listener opens, because the pairing window is decided by
 	// `EnsureToken` inside `Bridge.Listen` — clearing the marker afterwards would
 	// leave the window shut for the whole run.
@@ -194,58 +192,31 @@ func (a *App) Serve(ctx context.Context, port int) error {
 	}()
 
 	// Bootstrap once a browser shows up, in the background, so a slow or absent
-	// browser never blocks the API from starting.
+	// browser never holds up the listener — which is the part that has to work.
 	go func() {
 		waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
 
 		if err := a.Bridge.WaitForExtension(waitCtx, 60*time.Second); err != nil {
-			log.Printf("app: %v — starting without a live browser", err)
+			log.Printf("app: %v — listening anyway; a bundle is written when one connects", err)
 		}
 
 		bootCtx, bootCancel := context.WithTimeout(ctx, 60*time.Second)
 		defer bootCancel()
 		if err := a.Engine.Bootstrap(bootCtx); err != nil {
 			log.Printf("app: engine bootstrap failed: %v", err)
-			log.Printf("app: the API is up but generation will return 503 until cookies are available")
-			return
+			log.Printf("app: the bridge is still listening and still persisting bundles; " +
+				"only the account and credit records are missing")
 		}
 	}()
-
-	app := fiber.New(fiber.Config{
-		AppName:   "flow-go",
-		BodyLimit: 64 * 1024 * 1024,
-	})
-	server.RegisterRoutes(app, a.Engine, a.Bridge)
-
-	shutdownErr := make(chan error, 1)
-	go func() {
-		<-ctx.Done()
-		log.Println("app: shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		shutdownErr <- app.ShutdownWithContext(shutdownCtx)
-	}()
-
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	log.Printf("app: API listening on http://%s", addr)
-
-	if err := app.Listen(addr); err != nil {
-		if !errors.Is(err, os.ErrClosed) {
-			return fmt.Errorf("app: server stopped: %w", err)
-		}
-	}
 
 	select {
 	case err := <-bridgeErr:
 		if err != nil {
 			return err
 		}
-	case err := <-shutdownErr:
-		if err != nil {
-			return err
-		}
-	default:
+	case <-ctx.Done():
+		log.Println("app: shutting down")
 	}
 	return nil
 }

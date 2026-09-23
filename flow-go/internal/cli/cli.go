@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,8 +36,8 @@ func Run(args []string) int {
 	}
 
 	switch args[0] {
-	case "serve", "server":
-		return runServe(args[1:])
+	case "bridge", "serve", "server":
+		return runBridge(args[1:])
 	case "generate", "video":
 		return runGenerate(args[1:])
 	case "image":
@@ -74,15 +73,18 @@ func Run(args []string) int {
 func usage() string {
 	return `flow-go — Google Flow generation engine
 
-The browser supplies cookies and base information. Everything else — access
-tokens, project resolution, generation, polling, downloads, storage —
-happens here, in Go. No generation request travels through a browser.
+The browser supplies cookies and base information, and nothing else. Access
+tokens, project resolution, generation, polling, downloads and storage all
+happen here, in Go, over HTTPS. No generation request travels through a browser,
+and none travels through an HTTP server either.
 
 USAGE
   flow-go <command> [flags]
 
 COMMANDS
-  serve                 Start the HTTP API and the Flow Bridge extension bridge
+  bridge                Listen for the Flow Bridge extension and persist what it
+                        sends into cookies/account_<key>.json. This is the whole
+                        of that process: no HTTP API, no generation.
   doctor                Diagnose whether this machine can generate right now
   generate              Generate a video
   image                 Generate an image
@@ -98,6 +100,9 @@ COMMON FLAGS
   --proxy               Route upstream traffic through one exit IP
   --captcha             reCAPTCHA strategy: auto | broker | http | off
   --db                  Database path
+  --cookies             Run as one named account, e.g.
+                        cookies/account_<key>.json. Without it the freshest
+                        account file in cookies/ is used.
 
 DOCTOR FLAGS
   --probe               Make one authenticated upstream call to prove the
@@ -107,14 +112,12 @@ DOCTOR FLAGS
 
   Exits 0 when every required check passed and 1 when one did not, so it can
   gate a script. Nothing that can be read off the disk waits behind a network
-  call, and a running server is asked rather than re-derived.
+  call.
 
-  With a server running, nothing local is opened and nothing is written: the
-  server already holds the live jar and session, and it is the one asked. With
-  no server, doctor attaches the bridge and bootstraps the engine, which is the
-  same start-up a generation run performs — including the account identity it
-  adopts into the database. That write is idempotent, and it is the reason the
-  check can answer honestly rather than by inspection.
+  Doctor attaches the bridge and bootstraps the engine, which is the same
+  start-up a generation run performs — including the account identity it adopts
+  into the database. That write is idempotent, and it is the reason the check
+  can answer honestly rather than by inspection.
 
 GENERATE FLAGS
   --prompt              Prompt text (required)
@@ -138,10 +141,12 @@ IMAGE FLAGS
   --no-download         Skip writing the result to output/
 
 EXAMPLES
-  flow-go serve
+  flow-go bridge
+  flow-go image --prompt "a single red paper boat"
+  flow-go image --prompt "a red cube" --cookies cookies/account_ab12cd34ef56.json
   flow-go generate --prompt "a paper boat on a river" --duration 8
   flow-go generate --prompt "slow push in" --start-image ./frame.png --quality 360p
-  flow-go image --prompt "a single red paper boat"
+  flow-go batch-all --prompt "a paper boat" --model narwhal
   flow-go stats
 `
 }
@@ -163,18 +168,6 @@ type commonFlags struct {
 	// one command as one named account, and a setting that persists would make
 	// the next command silently use the previous account.
 	cookies string
-	// at, fsid and fingerprint are the browser-derived values taken from a
-	// running server's session, and are not flags: they are short-lived client
-	// state, not something a caller should be typing.
-	at   string
-	fsid string
-	// fingerprint is the browser identity the session was established under. It
-	// matters for any call that carries a reCAPTCHA token, because the token is
-	// checked against the client it was minted for.
-	fingerprint *flowapi.BrowserFingerprint
-	// jar is cookies adopted from a running server's session, held in memory. Not
-	// a flag: it is state this process took, not something a caller types.
-	jar *cookiejar.Jar
 }
 
 func (c *commonFlags) bind(fs *flag.FlagSet) {
@@ -193,130 +186,8 @@ func (c *commonFlags) build() (*app.App, error) {
 		ProxyURL:    c.proxy,
 		CaptchaMode: c.captcha,
 		DBPath:      c.db,
-		AtToken:     c.at,
-		Fsid:        c.fsid,
-		Fingerprint: c.fingerprint,
 		CookieFile:  c.cookies,
-		Jar:         c.jar,
 	})
-}
-
-// adoptRunningSession seeds this process from a server that has the browser.
-//
-// The bridge port admits exactly one host, and everything the engine takes from
-// the browser is short-lived: the cookies rotate, and the page tokens exist only
-// in a loaded page. A CLI running alongside the server therefore has two bad
-// options — no browser at all, or a cookie file that was last written whenever the
-// bridge happened to sync. This is the third: take a snapshot at start-up, so the
-// copy is never older than the run using it.
-//
-// Best-effort by design. A CLI with no server running is a supported case, and it
-// falls back to the persisted copy; the only cost of not asking is the staleness
-// that was already there.
-// runningSession is what a server with the browser can hand to a process without
-// one. Every field is something the browser supplied and cannot be derived.
-type runningSession struct {
-	ProjectID   string
-	At          string
-	Fsid        string
-	Fingerprint *flowapi.BrowserFingerprint
-	// Jar is the snapshot's cookies, carried in memory. See adoptRunningSession
-	// for why they are not written to disk.
-	Jar *cookiejar.Jar
-}
-
-func adoptRunningSession(ctx context.Context) (runningSession, bool) {
-	raw, err := os.ReadFile(filepath.Join(config.CookieDir(), "bridge-token"))
-	if err != nil {
-		return runningSession{}, false
-	}
-	token := strings.TrimSpace(string(raw))
-	if token == "" {
-		return runningSession{}, false
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	url := fmt.Sprintf("http://127.0.0.1:%d/v1/session", config.HTTPPort)
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return runningSession{}, false
-	}
-	req.Header.Set("X-Bridge-Token", token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return runningSession{}, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return runningSession{}, false
-	}
-
-	var snapshot struct {
-		Cookies     []cookiejar.Cookie          `json:"cookies"`
-		At          string                      `json:"at"`
-		Fsid        string                      `json:"fsid"`
-		ProjectID   string                      `json:"project_id"`
-		Fingerprint *flowapi.BrowserFingerprint `json:"fingerprint"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil || len(snapshot.Cookies) == 0 {
-		return runningSession{}, false
-	}
-
-	// Handed back in memory rather than written to disk.
-	//
-	// This used to save to `cookies/cookies.json` "so the bootstrap below picks it
-	// up without needing a new path through the engine" — and that write is what
-	// made a shared cookie file dangerous: a CLI running alongside a server would
-	// replace the session file with its own snapshot, and every other reader then
-	// acted as the CLI's account. The snapshot travels in the struct now.
-	jar := cookiejar.FromCookies(snapshot.Cookies, "server session")
-
-	// Say whether the fingerprint came across, because its absence is invisible
-	// later: the run still mints a token, still submits, and gets an empty result
-	// back with no error to explain it.
-	fingerprint := "none"
-	if snapshot.Fingerprint != nil && snapshot.Fingerprint.UserAgent != "" {
-		fingerprint = "adopted"
-	}
-	fmt.Printf("  session          taken from the running server (%d cookies, fingerprint %s)\n",
-		jar.Count(), fingerprint)
-
-	return runningSession{
-		ProjectID:   snapshot.ProjectID,
-		At:          snapshot.At,
-		Fsid:        snapshot.Fsid,
-		Fingerprint: snapshot.Fingerprint,
-		Jar:         jar,
-	}, true
-}
-
-// adoptSessionFor fills in what a running server can supply, leaving anything the
-// caller set explicitly alone. Returns whether a session was adopted, so the caller
-// knows whether it still needs to look for a browser itself.
-func adoptSessionFor(ctx context.Context, common *commonFlags) bool {
-	// Nothing to adopt when the caller named a cookie file. Adopting a running
-	// server's session writes the snapshot to `cookies/cookies.json` on the way
-	// through, and a run told which account to be must not touch that file — nor
-	// take a project id from whichever account the server happens to be acting
-	// as, which is a different one by definition.
-	if common.cookies != "" {
-		return false
-	}
-
-	session, ok := adoptRunningSession(ctx)
-	if !ok {
-		return false
-	}
-	if strings.TrimSpace(common.projectID) == "" {
-		common.projectID = session.ProjectID
-	}
-	common.at, common.fsid = session.At, session.Fsid
-	common.fingerprint = session.Fingerprint
-	common.jar = session.Jar
-	return true
 }
 
 // bridgeAttachWindow bounds how long this process waits to become the bridge host.
@@ -379,11 +250,18 @@ func attachBridgeWithin(ctx context.Context, a *app.App, window time.Duration, q
  * serve
  * ------------------------------------------------------------------ */
 
-func runServe(args []string) int {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+// runBridge is the whole of the bridge process: a WebSocket listener, and the
+// account bundles it writes.
+//
+// There is deliberately no HTTP surface and no `--port`. The bridge receives; the
+// CLI generates. A generation request that travelled through a listening socket
+// would have to be authenticated, would have to name an account, and would make
+// the process holding the browser the process that spends the credits — three
+// things this split exists to avoid.
+func runBridge(args []string) int {
+	fs := flag.NewFlagSet("bridge", flag.ExitOnError)
 	var common commonFlags
 	common.bind(fs)
-	port := fs.Int("port", config.HTTPPort, "HTTP API port")
 	_ = fs.Parse(args)
 
 	a, err := common.build()
@@ -396,14 +274,16 @@ func runServe(args []string) int {
 	defer stop()
 
 	fmt.Printf("flow-go %s\n", Version)
-	fmt.Printf("  API            http://127.0.0.1:%d\n", *port)
 	fmt.Printf("  extension      ws://127.0.0.1:%d  (load extension/ in Chrome)\n", config.WSPort)
+	fmt.Printf("  cookies        %s\n", config.CookieDir())
 	fmt.Printf("  database       %s\n", a.Store.Path())
 	fmt.Printf("  output         %s\n", config.OutputDir())
 	fmt.Println()
-	fmt.Println("Waiting for the Flow Bridge extension to connect...")
+	fmt.Println("Listening for the Flow Bridge extension. Bundles are written to")
+	fmt.Println("cookies/account_<key>.json as each profile connects; generate with")
+	fmt.Println("`flow-go image` or `flow-go generate` in another shell.")
 
-	if err := a.Serve(ctx, *port); err != nil {
+	if err := a.RunBridge(ctx); err != nil {
 		return fail(err)
 	}
 	return 0
@@ -434,17 +314,14 @@ func runGenerate(args []string) int {
 	resolution := fs.String("resolution", "", "ignored — not implemented on the batchexecute transport")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	var references stringList
-	fs.Var(&references, "reference", "ignored — use the HTTP API's /v1/videos/reference instead")
+	fs.Var(&references, "reference",
+		"ignored — reference-to-video has no batchexecute transport; use --start-image")
 	_ = fs.Parse(args)
 
 	if *prompt == "" {
 		return fail(fmt.Errorf("--prompt is required"))
 	}
 	warnIgnoredFlags(ignoredGenerateFlags(*aspect, *resolution, *seed, references))
-
-	// Seed from a running server before building, because the engine reads its
-	// cookies and page tokens at construction.
-	adopted := adoptSessionFor(context.Background(), &common)
 
 	a, err := common.build()
 	if err != nil {
@@ -455,12 +332,10 @@ func runGenerate(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// No server to take a session from, so try to be the bridge host ourselves —
-	// that is how a run with no server still gets cookies from the browser
-	// instead of from a snapshot.
-	if !adopted {
-		attachBridge(ctx, a)
-	}
+	// Try to become the bridge host, so a run with no bundle yet can still take
+	// cookies from the browser. When the `bridge` command already owns the port
+	// this is a no-op, and the account comes from cookies/ instead.
+	attachBridge(ctx, a)
 
 	if err := bootstrap(ctx, a); err != nil {
 		return fail(err)
@@ -551,10 +426,6 @@ func runImage(args []string) int {
 		warnIgnoredFlags([]string{fmt.Sprintf("--count %d (one asset per call)", *count)})
 	}
 
-	// Seed from a running server before building, because the engine reads its
-	// cookies and page tokens at construction.
-	adopted := adoptSessionFor(context.Background(), &common)
-
 	a, err := common.build()
 	if err != nil {
 		return fail(err)
@@ -564,10 +435,10 @@ func runImage(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// No server to take a session from, so try to be the bridge host ourselves.
-	if !adopted {
-		attachBridge(ctx, a)
-	}
+	// Try to become the bridge host, so a run with no bundle yet can still take
+	// cookies from the browser. When the `bridge` command already owns the port
+	// this is a no-op, and the account comes from cookies/ instead.
+	attachBridge(ctx, a)
 
 	if err := bootstrap(ctx, a); err != nil {
 		return fail(err)
@@ -616,17 +487,13 @@ func runProjects(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	adopted := adoptSessionFor(ctx, &common)
-
 	a, err := common.build()
 	if err != nil {
 		return fail(err)
 	}
 	defer a.Close()
 
-	if !adopted {
-		attachBridge(ctx, a)
-	}
+	attachBridge(ctx, a)
 
 	if err := bootstrap(ctx, a); err != nil {
 		return fail(err)
@@ -780,8 +647,8 @@ func runBatchAll(args []string) int {
 		return fail(fmt.Errorf("batch-all: list account cookie files: %w", err))
 	}
 	if len(paths) == 0 {
-		fmt.Fprintf(os.Stderr, "batch-all: no account_*.json in %s — run `flow-go serve` once "+
-			"with the extension attached so the bridge writes them\n", config.CookieDir())
+		fmt.Fprintf(os.Stderr, "batch-all: no account_*.json in %s — run `flow-go bridge` "+
+			"with the extension attached so it writes them\n", config.CookieDir())
 		return 1
 	}
 
@@ -972,10 +839,10 @@ func runCookies(args []string) int {
 		fmt.Printf("  no cookies at %s\n", strings.Join(candidates, " or "))
 		fmt.Println()
 		fmt.Println("  Options:")
-		fmt.Println("    1. Load extension/ in the browser and run `flow-go serve`;")
-		fmt.Println("       the extension hands over cookies automatically.")
-		fmt.Println("    2. POST a cookie dump to /api/sync-cookies.")
-		fmt.Println("    3. Write a JSON array of cookies to one of those paths yourself.")
+		fmt.Println("    1. Load extension/ in the browser and run `flow-go bridge`; the")
+		fmt.Println("       extension hands over cookies and the bridge writes")
+		fmt.Println("       cookies/account_<key>.json.")
+		fmt.Println("    2. Write a JSON array of cookies to one of those paths yourself.")
 		fmt.Println()
 		fmt.Println("  `flow-go doctor` checks this and everything downstream of it.")
 		return 1

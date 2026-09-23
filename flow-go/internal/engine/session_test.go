@@ -47,8 +47,9 @@ func TestPreflightPassesWithoutABrowser(t *testing.T) {
 
 // TestPreflightRejectsAnUnreadyEngine keeps the original gate's contract.
 //
-// The wording is load-bearing: statusFor matches "not ready" to decide on a 503,
-// and a caller may be matching on it too.
+// The wording is load-bearing: `statusFor` used to map "not ready" to a 503 for
+// the HTTP API, and that is gone — but the phrase is still what a caller or a log
+// grep matches on, so it is kept stable rather than reworded.
 func TestPreflightRejectsAnUnreadyEngine(t *testing.T) {
 	e := identityEngine(t, Options{}) // ready is false
 	e.accountID = "acct-test"
@@ -63,7 +64,7 @@ func TestPreflightRejectsAnUnreadyEngine(t *testing.T) {
 		t.Fatalf("error is %T, want *UnavailableError", err)
 	}
 	if !strings.Contains(err.Error(), "not ready") {
-		t.Errorf("error %q must keep the phrase statusFor matches on", err)
+		t.Errorf("error %q must keep the phrase callers match on", err)
 	}
 	if unavailable.Hint == "" {
 		t.Error("an unready engine should say how to make it ready")
@@ -84,15 +85,21 @@ func TestPreflightRejectsADeadSession(t *testing.T) {
 
 	var unavailable *UnavailableError
 	if !errors.As(err, &unavailable) {
-		t.Fatalf("error is %T, want *UnavailableError so the HTTP layer maps it without "+
-			"reading the wording", err)
+		t.Fatalf("error is %T, want *UnavailableError so a caller can tell "+
+			"'this will not work until something changes' from 'this request failed'", err)
 	}
 	if !strings.Contains(err.Error(), "session expired") {
 		t.Errorf("error %q should name the session, not the symptom", err)
 	}
 	// The action is the part that makes this useful rather than merely accurate.
-	if !strings.Contains(err.Error(), "bridge/refresh") {
+	// It has to name a command that exists: this hint used to say "call POST
+	// /v1/bridge/refresh", and removing the HTTP API turned that into advice
+	// leading to a refused connection.
+	if !strings.Contains(err.Error(), "flow-go bridge") {
 		t.Errorf("error %q should say what to do about it", err)
+	}
+	if strings.Contains(err.Error(), "/v1/") {
+		t.Errorf("error %q names an endpoint that no longer exists", err)
 	}
 }
 

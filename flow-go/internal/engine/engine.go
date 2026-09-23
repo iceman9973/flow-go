@@ -314,7 +314,7 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 	// then hand the fresh jar back so the client can swap it in and retry.
 	//
 	// Without this a 401 is terminal: every later call fails the same way until
-	// an operator calls /v1/bridge/refresh by hand.
+	// an operator re-syncs from the browser with `flow-go bridge`.
 	client.SetUnauthorizedHandler(func(ctx context.Context) (*cookiejar.Jar, error) {
 		if e.bridge == nil || !e.bridge.Connected() {
 			// The moment the engine learns the session cannot be recovered.

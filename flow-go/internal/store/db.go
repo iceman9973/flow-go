@@ -304,11 +304,11 @@ func firstLine(stmt string) string {
 // Account is one tracked signed-in account.
 //
 // The JSON tags are part of a wire contract, not decoration: this struct is
-// serialised directly by GET /v1/accounts and by `flow-go export`, so without
-// them the endpoint emitted Go field names — `AccountID`, `CookieHash`,
-// `SapisidFingerprint` — while every other endpoint in the API is snake_case.
-// Nothing in this repo unmarshals into this type, which is why adding the tags
-// is safe rather than a format change on both sides of a round trip.
+// serialised directly by `flow-go export`, so without them it emitted Go field
+// names — `AccountID`, `CookieHash`, `SapisidFingerprint` — while everything
+// else this tool writes is snake_case. Nothing in this repo unmarshals into this
+// type, which is why the tags are safe to add rather than a format change on both
+// sides of a round trip.
 type Account struct {
 	AccountID  string `json:"account_id"`
 	CookieHash string `json:"cookie_hash"`
@@ -595,10 +595,10 @@ func (s *Store) RecordAnchor(accountID, key, cookieHash, source string) error {
 
 // Generation is one submitted job.
 //
-// The JSON tags are the wire contract for GET /v1/jobs, GET /v1/jobs/:id and the
-// `generations` array of `flow-go export`. Without them a struct field serialises with
-// its Go field name, so the endpoints emitted `JobID` and `MediaIDs` next to the
-// snake_case every other endpoint uses — a client reading `job_id` got nothing, silently.
+// The JSON tags are the wire contract for the `generations` array of `flow-go
+// export`. Without them a struct field serialises with its Go field name, so the
+// export emitted `JobID` and `MediaIDs` next to the snake_case everything else
+// uses — a consumer reading `job_id` got nothing, silently.
 //
 // Two rules decide which fields carry omitempty, and they are the same rules
 // store.Account follows:
@@ -800,9 +800,9 @@ func (s *Store) RecentGenerations(limit int) ([]Generation, error) {
 
 // Media is a produced or downloaded asset.
 //
-// Tagged for the same reason as Generation: GET /v1/media and the `media` array of
-// `flow-go export` both marshal this struct directly, and untagged it emitted `MediaID`,
-// `FileName`, `FilePath` and `GenerationID`.
+// Tagged for the same reason as Generation: the `media` array of `flow-go export`
+// marshals this struct directly, and untagged it emitted `MediaID`, `FileName`,
+// `FilePath` and `GenerationID`.
 //
 // No field here takes omitempty, including the ones that are empty on every row today
 // (`resolution`). Each empty value is a fact about the asset — not downloaded yet, URL

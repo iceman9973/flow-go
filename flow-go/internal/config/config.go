@@ -385,16 +385,16 @@ func envFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-// Ports and timings. WS is the browser-Cdp bridge port; HTTP is the REST API.
-var (
-	WSPort   = envInt("WS_PORT", 9222)
-	HTTPPort = envInt("HTTP_PORT", 8200)
-)
+// WSPort is the port the extension bridge listens on. There is no HTTP port:
+// flow-go has no HTTP API, so `flow-go bridge` is a WebSocket listener and the
+// generation paths are CLI runs. HTTP_PORT is deliberately not read any more —
+// setting it has no effect.
+var WSPort = envInt("WS_PORT", 9222)
 
 // AccountIndex seeds which signed-in Google account the engine acts as, as an
-// `authuser` index. It is only a seed: once /v1/accounts/switch has been used,
-// the index it recorded is what the engine starts on, so a deliberate choice is
-// not undone by the next restart.
+// `authuser` index. It is only a seed: once an account has been chosen and
+// recorded, the stored index is what the engine starts on, so a deliberate choice
+// is not undone by the next restart.
 var AccountIndex = envInt("ACCOUNT_INDEX", 0)
 
 // ProjectID is a Flow project to generate into, for runs that should not have to

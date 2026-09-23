@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kodelyx/flow-go/flow-go/internal/app"
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
-	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
 
@@ -142,22 +142,24 @@ func TestDoctorMarkerSeparatesWarnFromFail(t *testing.T) {
 }
 
 func TestSessionActionNeverNamesAnEndpointThatIsNotListening(t *testing.T) {
-	// POST /v1/bridge/refresh exists only on a running server. Telling a caller
-	// with no server to call it sends them to a refused connection, which is
-	// worse than saying nothing at all.
-	withoutServer := sessionAction(false, false)
-	if strings.Contains(withoutServer, "/v1/bridge/refresh") {
-		t.Errorf("the no-server action names a server-only endpoint: %q", withoutServer)
-	}
-	if !strings.Contains(withoutServer, "serve") {
-		t.Errorf("the no-server action does not say how to get one: %q", withoutServer)
+	// The HTTP API is gone, so an action that says "POST /v1/bridge/refresh" or
+	// "start the server with `flow-go serve`" sends the reader to something that
+	// does not exist. Both branches have to name the command that does.
+	for _, attached := range []bool{true, false} {
+		got := sessionAction(attached)
+		if strings.Contains(got, "/v1/") {
+			t.Errorf("the action names an endpoint that no longer exists: %q", got)
+		}
+		if !strings.Contains(got, "bridge") {
+			t.Errorf("the action does not say what to run: %q", got)
+		}
 	}
 
-	if got := sessionAction(true, true); !strings.Contains(got, "/v1/bridge/refresh") {
-		t.Errorf("with a server and a browser attached the action should be the refresh: %q", got)
+	if got := sessionAction(true); !strings.Contains(got, "attached") {
+		t.Errorf("with a browser attached the action should say so: %q", got)
 	}
-	if got := sessionAction(true, false); !strings.Contains(got, "attach") {
-		t.Errorf("with a server and no browser the action should be to attach one: %q", got)
+	if got := sessionAction(false); !strings.Contains(got, "extension") {
+		t.Errorf("with no browser the action should be to load the extension: %q", got)
 	}
 }
 
@@ -165,48 +167,13 @@ func TestSessionActionNeverNamesAnEndpointThatIsNotListening(t *testing.T) {
  * The checks
  * ------------------------------------------------------------------ */
 
-func TestCheckCookiesPrefersTheRunningServersJar(t *testing.T) {
-	// A server that is spending credits is proof its jar works. A local file
-	// check that disagrees with it makes the report contradict itself.
-	cookieDir, _ := isolatedPoints(t)
-	writeJar(t, filepath.Join(cookieDir, "cookies.json"), credentialCookie(time.Now().Add(time.Hour)))
-
-	srv := &serverSnapshot{}
-	srv.Health.Bridge = bridge.Status{CookieCount: 15, HasCredentials: true}
-
-	got := checkCookies(srv)
-	if !got.OK {
-		t.Fatalf("checkCookies reported a failure against a healthy server jar: %+v", got)
-	}
-	if !strings.Contains(got.Detail, "server's jar") {
-		t.Errorf("the detail does not say which jar it read: %q", got.Detail)
-	}
-	if !strings.Contains(got.Detail, "CLI would read") {
-		t.Errorf("the detail does not report the CLI's own copy: %q", got.Detail)
-	}
-}
-
-func TestCheckCookiesStillReportsWhenTheServerJarHasNoCredentials(t *testing.T) {
-	isolatedPoints(t)
-	srv := &serverSnapshot{}
-	srv.Health.Bridge = bridge.Status{CookieCount: 15, HasCredentials: false}
-
-	got := checkCookies(srv)
-	if got.OK || !got.Fatal {
-		t.Fatalf("a server jar with no credentials should be a fatal finding: %+v", got)
-	}
-	if !strings.Contains(got.Detail, "none of them are credentials") {
-		t.Errorf("the detail does not say what is wrong: %q", got.Detail)
-	}
-}
-
 func TestCheckCookiesFailsWhenTheOnlyCookiesAreNotCredentials(t *testing.T) {
 	// The failure this guards: a signed-out browser still hands over plenty of
 	// cookies, and a count of them looks like a session.
 	cookieDir, _ := isolatedPoints(t)
 	writeJar(t, filepath.Join(cookieDir, "cookies.json"), analyticsCookie(), analyticsCookie())
 
-	got := checkCookies(nil)
+	got := checkCookies()
 	if got.OK || !got.Fatal {
 		t.Fatalf("a jar with no credential cookie should be fatal: %+v", got)
 	}
@@ -219,7 +186,7 @@ func TestCheckCookiesFailsOnAnExpiredCredential(t *testing.T) {
 	cookieDir, _ := isolatedPoints(t)
 	writeJar(t, filepath.Join(cookieDir, "cookies.json"), credentialCookie(time.Now().Add(-time.Hour)))
 
-	got := checkCookies(nil)
+	got := checkCookies()
 	if got.OK || !got.Fatal {
 		t.Fatalf("an expired credential should be fatal: %+v", got)
 	}
@@ -232,32 +199,36 @@ func TestCheckCookiesPassesWithAValidCredential(t *testing.T) {
 	cookieDir, _ := isolatedPoints(t)
 	writeJar(t, filepath.Join(cookieDir, "cookies.json"), credentialCookie(time.Now().Add(time.Hour)))
 
-	got := checkCookies(nil)
+	got := checkCookies()
 	if !got.OK {
 		t.Fatalf("a valid credential was reported as a failure: %+v", got)
 	}
 }
 
-func TestCheckCookiesReportsTheAbsenceWithoutAServer(t *testing.T) {
+func TestCheckCookiesReportsTheAbsenceOfAnyFile(t *testing.T) {
 	isolatedPoints(t)
 
-	got := checkCookies(nil)
+	got := checkCookies()
 	if got.OK || !got.Fatal {
-		t.Fatalf("no cookie file should be fatal with no server: %+v", got)
+		t.Fatalf("no cookie file should be fatal: %+v", got)
 	}
 	// Both candidates are named, because which one is missing is the first thing
 	// to check when a run behaves like it holds an old session.
 	if !strings.Contains(got.Detail, "cookies.json") {
 		t.Errorf("the detail does not name the paths it looked at: %q", got.Detail)
 	}
+	// The action has to name a command that exists. It used to offer `flow-go
+	// serve` and a POST to /api/sync-cookies, neither of which is there any more.
+	if !strings.Contains(got.Action, "flow-go bridge") {
+		t.Errorf("the action does not say how to produce a bundle: %q", got.Action)
+	}
 }
 
 func TestCheckBrowserIsNotFatalWithoutAnExtension(t *testing.T) {
-	// This is the boundary the whole Fatal flag exists for. The engine takes
-	// cookies, a token and a fingerprint from a snapshot and runs with no
-	// browser at all; a missing browser costs the ability to recover a dead
-	// session, not the ability to generate.
-	got := checkBrowser(bridge.Status{Connected: false})
+	// This is the boundary the whole Fatal flag exists for. A run works from a
+	// persisted bundle with no browser attached at all; a missing browser costs
+	// the ability to recover a dead session, not the ability to generate.
+	got := checkBrowser(bridge.Status{Connected: false}, nil)
 	if got.OK {
 		t.Fatalf("no extension should not be reported as passing: %+v", got)
 	}
@@ -273,7 +244,7 @@ func TestCheckBrowserNamesAGenericBridge(t *testing.T) {
 	// The generic CDP bridge attaches to the same port and advertises no flow.*
 	// operations. Generation still works through it, but the captcha broker does
 	// not, so rounding it to "connected" hides a real difference.
-	got := checkBrowser(bridge.Status{Connected: true, FlowOperations: false})
+	got := checkBrowser(bridge.Status{Connected: true, FlowOperations: false}, nil)
 	if !got.OK {
 		t.Fatalf("a generic bridge is still a connected browser: %+v", got)
 	}
@@ -284,43 +255,37 @@ func TestCheckBrowserNamesAGenericBridge(t *testing.T) {
 	flow := checkBrowser(bridge.Status{
 		Connected: true, Version: "1.0.0", FlowOperations: true,
 		ExtensionOps: []string{"flow.captcha", "flow.projects"},
-	})
+	}, nil)
 	if !strings.Contains(flow.Detail, "1.0.0") || !strings.Contains(flow.Detail, "2 flow operations") {
 		t.Errorf("the flow-bridge detail is missing what it advertises: %q", flow.Detail)
 	}
 }
 
-func TestCheckServerFlagsCompetingExtensions(t *testing.T) {
-	// Two signed-in profiles take turns owning the bridge's one cookie jar, so
-	// calls report the wrong account. The server reports it; this is where it
-	// becomes visible without reading JSON.
-	srv := &serverSnapshot{}
-	srv.Health.Status = "ok"
-	srv.Health.FlowExtensions = []string{"127.0.0.1:1", "127.0.0.1:2"}
-
-	got := checkServer(srv)
+// The competing-extensions finding moved from the server check to the browser
+// check when the HTTP API went. The list came from the engine either way, and the
+// browser check is the one that survives.
+func TestCheckBrowserFlagsCompetingExtensions(t *testing.T) {
+	// Two signed-in profiles take turns owning the bridge's single connection, so
+	// a run can report the wrong account. It is a configuration problem rather
+	// than a dead engine, which is why it is not fatal.
+	got := checkBrowser(
+		bridge.Status{Connected: true, Version: "1.0.0", FlowOperations: true},
+		[]string{"127.0.0.1:1", "127.0.0.1:2"},
+	)
 	if got.OK {
 		t.Fatalf("two Flow extensions should not pass: %+v", got)
 	}
 	if got.Fatal {
 		t.Error("competing extensions are a configuration problem, not a dead engine")
 	}
-}
-
-func TestCheckServerReportsTheHealthStatusAndAccount(t *testing.T) {
-	srv := &serverSnapshot{}
-	srv.Health.Status = "ok"
-	srv.Status.AccountID = "acct-0c960ba36880"
-	srv.Status.Pool = pool.Stats{TotalWorkers: 1}
-
-	got := checkServer(srv)
-	if !got.OK {
-		t.Fatalf("a healthy server was reported as failing: %+v", got)
+	if !strings.Contains(got.Detail, "2 Flow extensions") {
+		t.Errorf("the detail does not say how many are attached: %q", got.Detail)
 	}
-	for _, want := range []string{"status ok", "acct-0c960ba36880", "1 worker"} {
-		if !strings.Contains(got.Detail, want) {
-			t.Errorf("the detail is missing %q: %q", want, got.Detail)
-		}
+
+	// One attached profile is the normal case and must not be flagged.
+	if one := checkBrowser(bridge.Status{Connected: true, FlowOperations: true},
+		[]string{"127.0.0.1:1"}); !one.OK {
+		t.Errorf("a single attached profile should pass: %+v", one)
 	}
 }
 
@@ -362,19 +327,25 @@ func TestCheckDatabaseNamesEveryStatusBucket(t *testing.T) {
 	}
 }
 
-func TestStatsOfTreatsAnUnansweredStatsEndpointAsAbsent(t *testing.T) {
-	// A server that answers /health and then fails /stats is running an older
-	// build. That is a real thing that happens, and it must not be reported as a
-	// database with zero rows in it.
-	empty := &serverSnapshot{}
-	if got := statsOf(empty); got != nil {
-		t.Errorf("an unanswered /stats produced statistics: %+v", got)
-	}
+func TestLocalStatsReportsWhatTheStoreHas(t *testing.T) {
+	// The server's /stats endpoint is gone, so localStats is the only thing that
+	// feeds the database check its numbers. It reads the store directly, and the
+	// check treats a nil result as "no aggregates" rather than as a database with
+	// zero rows in it.
+	isolatedPoints(t)
 
-	present := &serverSnapshot{}
-	present.Stats.Database = store.SystemStats{DatabaseFile: "/x/flow.db", TotalGenerations: 3}
-	if got := statsOf(present); got == nil || got.TotalGenerations != 3 {
-		t.Errorf("an answered /stats was discarded: %+v", got)
+	a, err := app.Build(app.Config{})
+	if err != nil {
+		t.Fatalf("building the app: %v", err)
+	}
+	defer a.Close()
+
+	got := localStats(a)
+	if got == nil {
+		t.Fatal("localStats returned nil for a database it had just opened")
+	}
+	if got.TotalGenerations != 0 {
+		t.Errorf("a fresh database reported %d generations", got.TotalGenerations)
 	}
 }
 

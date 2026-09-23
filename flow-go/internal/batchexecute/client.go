@@ -793,9 +793,9 @@ type UnauthorizedHandler func(ctx context.Context) (*cookiejar.Jar, error)
 
 // SetUnauthorizedHandler installs the session refresher.
 //
-// Without one, a stale session is terminal for the client. That is how a running
-// engine behaves today: `/v1/credits` starts answering 401 and keeps answering
-// 401 until an operator calls /v1/bridge/refresh by hand.
+// Without one, a stale session is terminal for the client: a credit read starts
+// answering 401 and keeps answering 401 until an operator re-syncs from the
+// browser with `flow-go bridge`.
 func (c *Client) SetUnauthorizedHandler(fn UnauthorizedHandler) {
 	c.mu.Lock()
 	c.onUnauthorized = fn

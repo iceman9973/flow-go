@@ -2,10 +2,8 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +14,6 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
-	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
 
@@ -24,8 +21,7 @@ import (
  * doctor
  * ------------------------------------------------------------------ */
 
-// doctorAttachWindow is how long doctor waits for the extension when no server
-// owns the bridge port.
+// doctorAttachWindow is how long doctor waits for the extension.
 //
 // Shorter than a generation run's window on purpose. A run has nothing else to do
 // and every reason to wait; doctor is answering a question and has other checks
@@ -33,13 +29,6 @@ import (
 // immediately when it is loaded, and the 30-second alarm it also runs on is not
 // worth waiting for to change one word of one line.
 const doctorAttachWindow = 3 * time.Second
-
-// doctorServerTimeout bounds the "is a server up?" question.
-//
-// Short because the answer is a connect to localhost: a server that cannot
-// answer /health in this long is not going to answer usefully, and a doctor that
-// hangs is worse than one that says it could not tell.
-const doctorServerTimeout = 3 * time.Second
 
 // doctorCheck is one line of the diagnosis.
 //
@@ -111,13 +100,15 @@ func runDoctor(args []string) int {
 	return 1
 }
 
-// diagnose collects the checks, asking a running server first.
+// diagnose collects the checks.
 //
-// The server comes first because almost everything else is reported differently
-// depending on whether one is running: it holds the live cookie jar, the live
-// session, and the only /v1/bridge/refresh. Asking costs a connect to localhost,
-// which fails immediately when nothing is listening, so the checks that can be
-// read off the disk are not waiting behind a timeout.
+// There is no server to ask any more. The bridge process listens on the WebSocket
+// and writes bundles; every generation is a CLI run reading one of them. So this
+// always diagnoses the way a real run behaves — attach the bridge, bootstrap, make
+// one authenticated call — which is also what keeps the report honest: a
+// diagnostic that inspects state its own run path never touches is a second
+// implementation of the question, and the two drift until doctor says yes and the
+// run says no.
 func diagnose(ctx context.Context, common *commonFlags, probe bool) doctorReport {
 	report := doctorReport{
 		Version: Version,
@@ -129,29 +120,8 @@ func diagnose(ctx context.Context, common *commonFlags, probe bool) doctorReport
 		},
 	}
 
-	srv, up := probeServer(ctx)
-
-	// Passing the server through matters: when one is up it is the process that
-	// will make the calls, so its jar is the one that decides this check. Reading
-	// only the local file made the two halves of the report contradict each
-	// other — a "no cookie file" failure sitting next to a server happily
-	// spending credits.
-	report.Checks = append(report.Checks, checkCookies(srv))
-
-	if up {
-		report.Checks = append(report.Checks, checkServer(srv))
-		report.Checks = append(report.Checks, checkBrowser(srv.Health.Bridge))
-		report.Checks = append(report.Checks, checkSessionViaServer(ctx, srv, probe))
-		report.Checks = append(report.Checks, checkDatabase(report.Paths.Database, statsOf(srv)))
-	} else {
-		report.Checks = append(report.Checks, doctorCheck{
-			Name: "server",
-			OK:   true,
-			Detail: fmt.Sprintf("not running on 127.0.0.1:%d — the engine runs without one",
-				config.HTTPPort),
-		})
-		report.Checks = append(report.Checks, diagnoseLocally(ctx, common, probe, report.Paths.Database)...)
-	}
+	report.Checks = append(report.Checks, checkCookies())
+	report.Checks = append(report.Checks, diagnoseLocally(ctx, common, probe, report.Paths.Database)...)
 
 	report.Ready, report.Summary = summarise(report.Checks)
 	return report
@@ -168,15 +138,8 @@ func diagnose(ctx context.Context, common *commonFlags, probe bool) doctorReport
 // The cost of that fidelity is a side effect worth knowing about: bootstrapping
 // adopts an account identity, which writes to the accounts table. It is the same
 // write a generation makes, and it is idempotent — but a diagnostic that changes
-// state is worth saying out loud, so the help text says it. Nothing here runs
-// when a server is up, because then the server is asked instead.
+// state is worth saying out loud, so the help text says it.
 func diagnoseLocally(ctx context.Context, common *commonFlags, probe bool, dbPath string) []doctorCheck {
-	// A server was already ruled out, so this cannot adopt a session and the
-	// write it would otherwise perform on cookies.json cannot happen here. It is
-	// still called because --project-id and --email come through the same path a
-	// run would use.
-	adoptSessionFor(ctx, common)
-
 	a, err := common.build()
 	if err != nil {
 		return []doctorCheck{
@@ -191,13 +154,13 @@ func diagnoseLocally(ctx context.Context, common *commonFlags, probe bool, dbPat
 	attachBridgeWithin(ctx, a, doctorAttachWindow, true)
 
 	status := a.Bridge.Status()
-	browser := checkBrowser(status)
+	browser := checkBrowser(status, a.Engine.CompetingExtensions())
 
 	if err := bootstrap(ctx, a); err != nil {
 		return []doctorCheck{
 			browser,
 			{Name: "session", OK: false, Fatal: true, Detail: err.Error(),
-				Action: sessionAction(false, status.Connected)},
+				Action: sessionAction(status.Connected)},
 			checkDatabase(dbPath, localStats(a)),
 		}
 	}
@@ -212,7 +175,7 @@ func diagnoseLocally(ctx context.Context, common *commonFlags, probe bool, dbPat
 		switch {
 		case err != nil:
 			session = doctorCheck{Name: "session", OK: false, Fatal: true, Detail: err.Error(),
-				Action: sessionAction(false, status.Connected)}
+				Action: sessionAction(status.Connected)}
 		default:
 			session.Detail = fmt.Sprintf("upstream accepted the session — %d credits available", credits)
 		}
@@ -260,29 +223,10 @@ func summarise(checks []doctorCheck) (bool, string) {
 
 // checkCookies reports the credentials that would actually be used.
 //
-// srv is non-nil when a server is running, and then it is the server's jar that
-// decides the check: that is the process which will make the calls. The local
-// file is still reported alongside, because it is what a CLI run would use and
-// the two can legitimately differ — which is worth seeing rather than averaging
-// over.
-func checkCookies(srv *serverSnapshot) doctorCheck {
-	if srv != nil && srv.Health.Bridge.CookieCount > 0 {
-		detail := fmt.Sprintf("%d in the running server's jar", srv.Health.Bridge.CookieCount)
-		if !srv.Health.Bridge.HasCredentials {
-			return doctorCheck{
-				Name: "cookies", OK: false, Fatal: true,
-				Detail: detail + ", but none of them are credentials",
-				Action: "sign in to Flow in the browser the extension is loaded in",
-			}
-		}
-		if path, jar, err := loadCookieJar(); err == nil {
-			detail += fmt.Sprintf("; the CLI would read %d from %s", jar.Count(), path)
-		} else {
-			detail += "; a CLI run alongside it would find no cookie file"
-		}
-		return doctorCheck{Name: "cookies", OK: true, Detail: detail}
-	}
-
+// It reads the account file a run would read, which is now the only thing there
+// is: the bridge process holds no session of its own to ask, and a generation is
+// a separate process that loads one bundle from disk.
+func checkCookies() doctorCheck {
 	path, jar, err := loadCookieJar()
 	if err != nil {
 		return doctorCheck{
@@ -290,8 +234,8 @@ func checkCookies(srv *serverSnapshot) doctorCheck {
 			OK:     false,
 			Fatal:  true,
 			Detail: "no cookie file at " + strings.Join(cookieCandidates(), " or "),
-			Action: "load flow-go/extension in Chrome and run `flow-go serve`, " +
-				"or POST a cookie dump to /api/sync-cookies",
+			Action: "load flow-go/extension in Chrome and run `flow-go bridge` so it " +
+				"writes cookies/account_<key>.json",
 		}
 	}
 
@@ -314,38 +258,19 @@ func checkCookies(srv *serverSnapshot) doctorCheck {
 	return doctorCheck{Name: "cookies", OK: true, Detail: detail}
 }
 
-func checkServer(s *serverSnapshot) doctorCheck {
-	detail := fmt.Sprintf("running on 127.0.0.1:%d — status %s", config.HTTPPort, s.Health.Status)
-	if s.Status.AccountID != "" {
-		detail += ", account " + s.Status.AccountID
-	}
-	if n := s.Status.Pool.TotalWorkers; n > 0 {
-		detail += fmt.Sprintf(", %d worker(s)", n)
-	}
-
-	// More than one Flow extension attached is still worth flagging, but it is no
-	// longer the configuration it was. Each attached profile is now registered as
-	// its own account, so the pool routes between them and they all appear in the
-	// worker list — the old advice to close every profile but one would throw away
-	// working accounts. What is still single-account is the engine's own batch
-	// path, which reads one jar and follows whichever profile connected last.
-	if len(s.Health.FlowExtensions) > 1 {
-		return doctorCheck{
-			Name: "server", OK: false,
-			Detail: detail + fmt.Sprintf(" — %d Flow extensions attached, each registered as its own account",
-				len(s.Health.FlowExtensions)),
-			Action: "fine for the pool, but a batch result follows whichever profile connected last; " +
-				"close all but one if it has to belong to a known account",
-		}
-	}
-	return doctorCheck{Name: "server", OK: true, Detail: detail}
-}
-
-// checkBrowser reports the extension, and is deliberately not fatal: the engine
-// takes cookies, an access token and a fingerprint from a snapshot and runs with
-// no browser at all. What a missing browser costs is the ability to *recover* a
-// dead session, and that is what sessionAction says.
-func checkBrowser(status bridge.Status) doctorCheck {
+// checkBrowser reports the extension, and is deliberately not fatal: a run works
+// from a persisted bundle with no browser attached at all. What a missing browser
+// costs is the ability to *recover* a dead session, and that is what sessionAction
+// says.
+//
+// competing is the engine's list of attached Flow-capable extensions, and more than
+// one is worth flagging rather than rounding to "connected". The bridge holds a
+// single connection and `Current()` is whichever profile attached last, so a result
+// can belong to the other profile. It is not the configuration it used to be,
+// though: each attached profile is registered as its own account and the pool
+// routes between them, so the old advice to close every profile but one would throw
+// away working accounts.
+func checkBrowser(status bridge.Status, competing []string) doctorCheck {
 	if !status.Connected {
 		return doctorCheck{
 			Name:   "browser",
@@ -368,42 +293,17 @@ func checkBrowser(status bridge.Status) doctorCheck {
 		// not, so this is worth naming rather than rounding to "connected".
 		detail += ", but no flow operations — generic bridge only"
 	}
-	return doctorCheck{Name: "browser", OK: true, Detail: detail}
-}
 
-func checkSessionViaServer(ctx context.Context, s *serverSnapshot, probe bool) doctorCheck {
-	// The server has already recorded a dead session, so there is nothing to
-	// probe: the answer is in hand and costs no round trip. This is the field
-	// that exists precisely because `ready` stays true once it has been true.
-	if failure := s.Health.SessionFailure; failure != "" {
-		return doctorCheck{Name: "session", OK: false, Fatal: true, Detail: failure,
-			Action: sessionAction(true, s.Health.Bridge.Connected)}
-	}
-	if !s.Health.Ready {
+	if len(competing) > 1 {
 		return doctorCheck{
-			Name: "session", OK: false, Fatal: true,
-			Detail: "the server has not bootstrapped an account yet",
-			Action: "load the extension and sign in, or POST /api/sync-cookies with a cookie dump",
+			Name: "browser", OK: false,
+			Detail: detail + fmt.Sprintf("; %d Flow extensions attached, each registered as its own account",
+				len(competing)),
+			Action: "fine for the pool, but a run follows whichever profile connected last; " +
+				"close all but one if the result has to belong to a known account",
 		}
 	}
-	if !probe {
-		return doctorCheck{Name: "session", OK: true,
-			Detail: "the server reports ready; upstream not probed (--probe=false)"}
-	}
-
-	// The server makes the call, not this process: it holds the live session,
-	// and a second process asking the same question would answer it with a
-	// cookie file that is one rotation out of date.
-	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	var credits creditsResponse
-	if err := serverGet(probeCtx, "/v1/credits", &credits); err != nil {
-		return doctorCheck{Name: "session", OK: false, Fatal: true, Detail: err.Error(),
-			Action: sessionAction(true, s.Health.Bridge.Connected)}
-	}
-	return doctorCheck{Name: "session", OK: true,
-		Detail: fmt.Sprintf("upstream accepted the session — %d credits available", credits.Credits)}
+	return doctorCheck{Name: "browser", OK: true, Detail: detail}
 }
 
 func checkDatabase(path string, stats *store.SystemStats) doctorCheck {
@@ -432,96 +332,19 @@ func checkDatabase(path string, stats *store.SystemStats) doctorCheck {
 
 // sessionAction is the recovery step for a session the upstream will not accept.
 //
-// It depends on where the session can be renewed from, which is what decides the
-// step rather than the wording of it: POST /v1/bridge/refresh exists only on a
-// running server, and the extension only helps if it is attached. Telling a
-// caller to POST to an endpoint that is not listening is worse than saying
-// nothing.
-func sessionAction(serverUp, browserAttached bool) string {
-	switch {
-	case serverUp && browserAttached:
-		return "call POST /v1/bridge/refresh to have the page renew its own session, then retry"
-	case serverUp:
-		return "attach the browser extension, then call POST /v1/bridge/refresh and retry"
-	default:
-		return "load flow-go/extension in Chrome, then start the server with `flow-go serve`"
+// There is one step now, and it depends only on whether the browser is attached:
+// a dead session can only be renewed from the page that owns it, and the page is
+// only reachable through the extension. `flow-go bridge` is what puts the fresh
+// cookies where the next run will read them. This used to name
+// `POST /v1/bridge/refresh`, which no longer exists — telling a caller to POST to
+// an endpoint that is not listening is worse than saying nothing.
+func sessionAction(browserAttached bool) string {
+	if browserAttached {
+		return "the extension is attached: let the Flow tab reload, then run `flow-go bridge` " +
+			"to write fresh cookies, and retry"
 	}
-}
-
-/* ------------------------------------------------------------------ *
- * Talking to a running server
- * ------------------------------------------------------------------ */
-
-type serverSnapshot struct {
-	Health serverHealth
-	Status serverStatus
-	Stats  serverStats
-}
-
-type serverHealth struct {
-	Status              string        `json:"status"`
-	Ready               bool          `json:"ready"`
-	BearerPathAvailable bool          `json:"bearer_path_available"`
-	Bridge              bridge.Status `json:"bridge"`
-	FlowExtensions      []string      `json:"flow_extensions"`
-	Error               string        `json:"error"`
-	SessionFailure      string        `json:"session_failure"`
-}
-
-type serverStatus struct {
-	Ready               bool          `json:"ready"`
-	BearerPathAvailable bool          `json:"bearer_path_available"`
-	AccountID           string        `json:"account_id"`
-	Bridge              bridge.Status `json:"bridge"`
-	Pool                pool.Stats    `json:"pool"`
-	Error               string        `json:"error"`
-	SessionFailure      string        `json:"session_failure"`
-}
-
-type serverStats struct {
-	Database store.SystemStats `json:"database"`
-	Pool     pool.Stats        `json:"pool"`
-	Bridge   bridge.Status     `json:"bridge"`
-}
-
-type creditsResponse struct {
-	Credits   int    `json:"credits"`
-	AccountID string `json:"account_id"`
-	ProjectID string `json:"project_id"`
-	Source    string `json:"source"`
-	Error     string `json:"error"`
-}
-
-// probeServer asks a locally running server what it knows, and reports whether
-// one answered at all.
-//
-// /health is the gate, because it is the endpoint that exists to be cheap and to
-// always answer: a failure there means "no server", not "a broken server". The
-// other two are best-effort — a server answering /health and then failing /stats
-// is a running older build, which is a real thing that happens and is not a
-// reason to report that no server is running.
-func probeServer(ctx context.Context) (*serverSnapshot, bool) {
-	ctx, cancel := context.WithTimeout(ctx, doctorServerTimeout)
-	defer cancel()
-
-	var health serverHealth
-	if err := serverGet(ctx, "/health", &health); err != nil {
-		return nil, false
-	}
-
-	s := &serverSnapshot{Health: health}
-	_ = serverGet(ctx, "/status", &s.Status)
-	_ = serverGet(ctx, "/stats", &s.Stats)
-	return s, true
-}
-
-// statsOf returns the server's database aggregates, or nil when the server did
-// not answer /stats.
-func statsOf(s *serverSnapshot) *store.SystemStats {
-	if s.Stats.Database.DatabaseFile == "" && s.Stats.Database.TotalGenerations == 0 {
-		return nil
-	}
-	return &s.Stats.Database
+	return "load flow-go/extension in Chrome signed in to Flow, run `flow-go bridge` so it " +
+		"writes a bundle, then retry"
 }
 
 // localStats reads the aggregates straight from the store. Only called once the
@@ -532,33 +355,6 @@ func localStats(a *app.App) *store.SystemStats {
 		return nil
 	}
 	return &stats
-}
-
-func serverGet(ctx context.Context, path string, into any) error {
-	url := fmt.Sprintf("http://127.0.0.1:%d%s", config.HTTPPort, path)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// The body carries the reason for a 5xx, and the reason is the finding —
-		// "502" alone would send the reader to the server log for something the
-		// server already said out loud.
-		var failure struct {
-			Error string `json:"error"`
-		}
-		if json.NewDecoder(resp.Body).Decode(&failure) == nil && failure.Error != "" {
-			return fmt.Errorf("%s: %s", resp.Status, failure.Error)
-		}
-		return fmt.Errorf("%s returned %s", path, resp.Status)
-	}
-	return json.NewDecoder(resp.Body).Decode(into)
 }
 
 /* ------------------------------------------------------------------ *

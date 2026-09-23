@@ -38,16 +38,22 @@ type sessionDeath struct {
 }
 
 // sessionHint is what the caller can actually do about a dead session.
-const sessionHint = "attach the browser extension, then call POST /v1/bridge/refresh and retry"
+//
+// It names `flow-go bridge` rather than the endpoint it used to. The HTTP API is
+// gone, so a hint telling the reader to POST to /v1/bridge/refresh sends them to
+// a connection that will be refused — and a dead session is only ever fixed by
+// re-syncing from the page, which the bridge is the only thing that can do.
+const sessionHint = "attach the browser extension, then run `flow-go bridge` to write fresh cookies, and retry"
 
 // UnavailableError reports that the engine cannot serve the request, and that no
 // amount of retrying by the caller will change that until something outside the
 // process is fixed.
 //
-// It exists so the HTTP layer does not have to infer the status from the
-// wording. statusFor matched on substrings, which works until a message is
-// reworded — and a reworded message silently becoming a 502 instead of a 503 is
-// exactly the kind of change nobody notices.
+// The distinction it draws — unavailable rather than merely failed — used to be
+// what let the HTTP layer answer 503 instead of 502. There is no HTTP layer now,
+// but the separation is still the honest one: a caller can tell "this will not
+// work until something changes" apart from "this request failed", and the CLI
+// prints the reason and the hint rather than a bare error.
 type UnavailableError struct {
 	// Reason states what is wrong, in the operator's terms.
 	Reason string

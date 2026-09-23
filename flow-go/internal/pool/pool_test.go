@@ -91,10 +91,11 @@ func TestAcquireWithNoWorkersFailsImmediately(t *testing.T) {
 	if !errors.As(err, &noWorker) {
 		t.Fatalf("error is %T, want *NoWorkerError so the cause travels with it", err)
 	}
-	// statusFor maps this phrase to a 503. The reason is appended to it, so the
-	// phrase has to survive the append or the status silently changes.
+	// `statusFor` used to map this phrase to a 503; it went with the HTTP API.
+	// The phrase is still the one a caller or a log grep matches on, and the
+	// reason is appended to it, so it has to survive the append.
 	if !strings.Contains(err.Error(), "no worker available") {
-		t.Errorf("error %q must keep the phrase statusFor matches on", err)
+		t.Errorf("error %q must keep the phrase callers match on", err)
 	}
 	if !strings.Contains(err.Error(), "not bootstrapped") {
 		t.Errorf("error %q should name the likely cause, not just the symptom", err)
@@ -202,7 +203,7 @@ func TestExecuteOnAnEmptyPoolFailsImmediately(t *testing.T) {
 		t.Errorf("Execute took %s to report an empty pool", elapsed)
 	}
 	if !strings.Contains(err.Error(), "no worker available") {
-		t.Errorf("error %q must keep the phrase statusFor matches on", err)
+		t.Errorf("error %q must keep the phrase callers match on", err)
 	}
 }
 

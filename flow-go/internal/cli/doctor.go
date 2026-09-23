@@ -15,6 +15,7 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
+	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
@@ -322,15 +323,19 @@ func checkServer(s *serverSnapshot) doctorCheck {
 		detail += fmt.Sprintf(", %d worker(s)", n)
 	}
 
-	// More than one Flow extension attached is a configuration the engine cannot
-	// serve coherently: the bridge holds one cookie jar, so two signed-in
-	// profiles take turns owning it and calls report the wrong account. The
-	// server reports it; this is where it becomes visible without reading JSON.
+	// More than one Flow extension attached is still worth flagging, but it is no
+	// longer the configuration it was. Each attached profile is now registered as
+	// its own account, so the pool routes between them and they all appear in the
+	// worker list — the old advice to close every profile but one would throw away
+	// working accounts. What is still single-account is the engine's own batch
+	// path, which reads one jar and follows whichever profile connected last.
 	if len(s.Health.FlowExtensions) > 1 {
 		return doctorCheck{
 			Name: "server", OK: false,
-			Detail: detail + fmt.Sprintf(" — %d Flow extensions attached", len(s.Health.FlowExtensions)),
-			Action: "close all but one browser profile signed in to Flow",
+			Detail: detail + fmt.Sprintf(" — %d Flow extensions attached, each registered as its own account",
+				len(s.Health.FlowExtensions)),
+			Action: "fine for the pool, but a batch result follows whichever profile connected last; " +
+				"close all but one if it has to belong to a known account",
 		}
 	}
 	return doctorCheck{Name: "server", OK: true, Detail: detail}
@@ -576,6 +581,21 @@ func cookieCandidates() []string {
 
 // loadCookieJar returns the first candidate that reads, and its path.
 func loadCookieJar() (string, *cookiejar.Jar, error) {
+	// The per-account files first, because they are the source of truth now: the
+	// bridge writes one per signed-in profile and no longer writes a shared file
+	// at all. Newest first, so this reports the account that synced most recently
+	// rather than whichever filename happens to sort first.
+	if dumps, err := engine.DiscoverAccountJars(config.CookieDir()); err == nil {
+		for _, path := range dumps {
+			jar, loadErr := cookiejar.LoadFile(path)
+			if loadErr == nil && jar.Count() > 0 {
+				return path, jar, nil
+			}
+		}
+	}
+
+	// `cookies.json` last, and only for a file put there by hand: nothing writes
+	// it any more, so finding one means an operator placed it.
 	var lastErr error
 	for _, candidate := range cookieCandidates() {
 		jar, err := cookiejar.LoadFile(candidate)

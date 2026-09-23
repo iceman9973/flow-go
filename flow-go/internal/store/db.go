@@ -896,19 +896,14 @@ func (s *Store) LogRequest(accountID, endpoint string, status int, elapsedMS flo
 // left on it.
 const SettingKeyAccountIndex = "account_index"
 
-// SettingKeyBrowserFingerprint holds the browser identity generation calls must
-// present, and SettingKeyPageTokens the page's anti-CSRF token and session id.
-//
-// Both used to be files beside the cookie cache — `fingerprint.json` and
-// `page-tokens.json`. Neither is a cookie: the browser hands over cookies, and
-// these are values the engine derives and then remembers between runs, so
-// keeping them in `cookies/` made that directory hold things that are not
-// cookies. They are settings in every sense that matters, so they live with the
-// rest of what the engine remembers.
-const (
-	SettingKeyBrowserFingerprint = "browser_fingerprint"
-	SettingKeyPageTokens         = "page_tokens"
-)
+// The browser identity and the page tokens used to be settings here —
+// `browser_fingerprint` and `page_tokens` — and are not any more. Neither is
+// engine-wide: a fingerprint is the identity one signed-in profile's captcha
+// tokens are valid for, and page tokens belong to the page that carried them,
+// so a single row was the wrong shape the moment two accounts had to coexist.
+// Both live in the account's own bundle now, written by the bridge on every
+// sync, and are read from there. An older database may still hold the rows;
+// nothing reads them, and nothing needs to delete them.
 
 // Setting reads a stored value.
 //

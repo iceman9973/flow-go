@@ -4,10 +4,16 @@
  *
  * It carries two actions:
  *
- *   Copy Cookies       a cookie export, for when a dump has to be produced by
- *                      hand without going through the backend's HTTP surface.
- *   Open Google Flow   opens the app in a new tab, so the panel is still useful
- *                      when the backend is not running at all.
+ *   Copy Account Bundle   one account, self-contained: its cookies plus the
+ *                         project, the browser identity and the page tokens the
+ *                         backend would otherwise have to rediscover. For when a
+ *                         dump has to be produced by hand without going through
+ *                         the backend's HTTP surface. What lands on the
+ *                         clipboard is exactly what `cookiejar.LoadBundleFile`
+ *                         reads, so it can be saved as
+ *                         `cookies/account_<key>.json` and simply work.
+ *   Open Google Flow      opens the app in a new tab, so the panel is still
+ *                         useful when the backend is not running at all.
  *
  * There is deliberately no bridge-token field. Pairing is not a human step — the
  * extension connects tokenless on first run, the backend hands it a token over
@@ -36,6 +42,21 @@ async function send(op, params) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The same call, for the cases where a refusal has to be told from an answer.
+ *
+ * The worker replies `{ok: true, ...result}` on success and `{ok: false, error}`
+ * on failure, and both are *resolved* values — so a failed read is truthy and
+ * `send(...).at` is `undefined` rather than an error. Every live read below is
+ * best-effort, and this is what keeps a refusal out of the bundle instead of
+ * quietly writing an empty string into it.
+ */
+async function ask(op, params) {
+  const reply = await send(op, params);
+  if (!reply || reply.ok === false) return null;
+  return reply;
 }
 
 async function refresh() {
@@ -133,8 +154,22 @@ function paintVersion() {
 }
 
 /* ------------------------------------------------------------------ *
- * Cookie export
+ * Account bundle export
  * ------------------------------------------------------------------ */
+
+/**
+ * The Flow project the attached tab is sitting on, or '' when there is none.
+ *
+ * Read from the tab URL rather than asked of the backend, and the two are not
+ * the same question: the backend answers with the project it resolved at boot,
+ * which may be a configured one, or one it read from this tab minutes ago and
+ * which the operator has since navigated away from. What belongs in a dump is
+ * where the browser is now.
+ */
+function projectFromTabUrl(tabUrl) {
+  const match = /\/project\/([A-Za-z0-9_-]+)/.exec(String(tabUrl || ''));
+  return match ? match[1] : '';
+}
 
 /**
  * The essential cookies for every configured domain, de-duplicated.
@@ -145,10 +180,14 @@ function paintVersion() {
  * refused on purpose, and widening it here would export every cookie in the
  * profile — analytics for every Google property, plus a separate session for
  * Mail, Drive and the rest.
+ *
+ * `status` is passed in by the bundle export, which has already read it. Left
+ * optional so this stays callable on its own — the export is not the only thing
+ * that has ever wanted the cookies.
  */
-async function collectCookies() {
-  const status = await send('status');
-  const domains = status?.config?.cookieDomains || [];
+async function collectCookies(status) {
+  const cfg = (status || (await send('status')))?.config || {};
+  const domains = cfg.cookieDomains || [];
   if (domains.length === 0) throw new Error('no cookie domains are configured');
 
   const seen = new Set();
@@ -171,6 +210,59 @@ async function collectCookies() {
   return merged;
 }
 
+/**
+ * One account, self-contained, in the shape the backend reads back:
+ * `cookiejar.Bundle` — project_id, at, fsid, fingerprint, cookies.
+ *
+ * The three live values are best-effort, because each of them needs a Flow tab
+ * and the tab is closed more often than not. A bundle without them is still a
+ * credential — the engine resolves the project from the listing and primes for
+ * the token — so a missing one is reported rather than allowed to fail the
+ * export. What must not happen is a bundle that silently claims to be complete,
+ * which is why the caller says what it got.
+ *
+ * The fingerprint's field names are the bundle's, not the page's: the page
+ * reports `brands` and `platformFull`, and the file spells those `sec_ch_ua` and
+ * `platform`. Writing the page's names through unchanged would leave every field
+ * unset after a decode, with no error anywhere.
+ */
+async function collectBundle() {
+  const status = await send('status');
+
+  const bundle = {
+    project_id: projectFromTabUrl(status?.tabUrl),
+    at: '',
+    fsid: '',
+    cookies: [],
+  };
+
+  const tokens = await ask('flow.at');
+  if (tokens) {
+    bundle.at = String(tokens.at || '');
+    bundle.fsid = String(tokens.fsid || '');
+  }
+
+  const fp = await ask('flow.fingerprint');
+  if (fp?.userAgent) {
+    bundle.fingerprint = {
+      user_agent: String(fp.userAgent),
+      sec_ch_ua: String(fp.brands || ''),
+      platform: String(fp.platformFull || fp.platform || ''),
+      language: String(fp.language || ''),
+      mobile: String(fp.mobile || ''),
+    };
+  }
+
+  bundle.cookies = await collectCookies(status);
+  return bundle;
+}
+
+/** "a", "a and b", "a, b and c" — the popup has one line and no list markup. */
+function listOf(items) {
+  if (items.length <= 1) return items.join('');
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
 el('copy').addEventListener('click', async () => {
   const result = el('result');
   const button = el('copy');
@@ -179,12 +271,24 @@ el('copy').addEventListener('click', async () => {
   result.textContent = 'Collecting cookies…';
 
   try {
-    const cookies = await collectCookies();
-    if (cookies.length === 0) {
+    const bundle = await collectBundle();
+    if (bundle.cookies.length === 0) {
       throw new Error('no cookies were visible for the configured domains');
     }
-    await navigator.clipboard.writeText(JSON.stringify(cookies, null, 2));
-    result.textContent = `Copied ${cookies.length} cookies.`;
+    await navigator.clipboard.writeText(JSON.stringify(bundle, null, 2));
+
+    // Say what is actually in it. A bundle missing the identity and the page
+    // tokens is a different thing from a complete one, and the difference only
+    // shows up as a generation that comes back empty — so it is reported here
+    // rather than left for whoever pastes it to discover.
+    const extras = [];
+    if (bundle.project_id) extras.push('the project');
+    if (bundle.fingerprint) extras.push('the browser identity');
+    if (bundle.at || bundle.fsid) extras.push('the page tokens');
+
+    result.textContent = extras.length
+      ? `Copied ${bundle.cookies.length} cookies with ${listOf(extras)}.`
+      : `Copied ${bundle.cookies.length} cookies — no Flow tab, so no project, identity or page tokens.`;
     result.className = 'ok';
   } catch (error) {
     result.textContent = `Could not copy: ${error?.message || String(error)}`;

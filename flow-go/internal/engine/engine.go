@@ -29,6 +29,7 @@ import (
 	"github.com/kodelyx/flow-go/flow-go/internal/auth"
 	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
+	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
@@ -70,6 +71,21 @@ type Options struct {
 	// attached — a live page is always the better source.
 	AtToken string
 	Fsid    string
+	// CookieFile names one cookie file to act as, e.g.
+	// `cookies/account_27b104997fa0.json`.
+	//
+	// It short-circuits cookie loading entirely: no bridge sync, no fallback
+	// search, and no registration of the other attached profiles. That is the
+	// point — a run told which account to be has to be that account, and a live
+	// browser would otherwise choose by which Chrome window happens to be open.
+	CookieFile string
+	// Jar is cookies a caller already holds in memory — a CLI that adopted a
+	// running server's session has them and must not put them on disk, because
+	// writing them was what used to overwrite the shared cookie file.
+	//
+	// Ranks below CookieFile (an explicit path is an explicit instruction) and
+	// above the browser (a snapshot is never fresher than a live page).
+	Jar *cookiejar.Jar
 	// Fingerprint is the browser identity to present when no bridge is attached,
 	// taken from a SessionSnapshot for the same reason as AtToken and Fsid.
 	//
@@ -95,6 +111,14 @@ type Engine struct {
 	projectID string
 	client    *flowapi.Client
 	captcha   recaptcha.Provider
+	// primaryJar is the cookie set the engine acts as, captured at boot.
+	//
+	// Held here rather than read back off the bridge, because the bridge keeps
+	// only one jar: `SyncCookies` overwrites it for each attached profile in
+	// turn, so by the end of a boot that registered ten of them `bridge.Jar()`
+	// answers with the tenth one's cookies. A generation submitted as the primary
+	// account would then go out under another profile's session. See Engine.Jar.
+	primaryJar *cookiejar.Jar
 	// accountIndex is the signed-in Google account the engine acts as, sent as
 	// `authuser` on every upstream call. Zero is the first signed-in account.
 	accountIndex int
@@ -173,6 +197,12 @@ func (e *Engine) CompetingExtensions() []string {
 
 // warnOnCompetingExtensions says so once, loudly, when more than one narrow
 // extension is attached.
+//
+// It is no longer the whole story. registerConnectedExtensions registers each of
+// these as its own account, so the pool routes between them and /stats lists
+// them all. What is still single-account is the engine's own batch path, which
+// reads one jar and follows `Current()`. That residual is what this names, and
+// the wording says so rather than repeating the older, broader claim.
 func (e *Engine) warnOnCompetingExtensions() {
 	narrow := e.CompetingExtensions()
 	if len(narrow) < 2 {
@@ -189,11 +219,11 @@ func (e *Engine) warnOnCompetingExtensions() {
 		}
 	}
 
-	log.Printf("engine: %d Flow extensions are attached at once (%s). The bridge holds "+
-		"one cookie jar and uses whichever connected last, so the account and the project "+
-		"will move under this process — results will look right and belong to the other "+
-		"account. Close the extension, or the Flow tab, in every browser profile but one. "+
-		"Using %s.", len(narrow), strings.Join(narrow, ", "), current)
+	log.Printf("engine: %d Flow extensions are attached at once (%s). Each is registered "+
+		"as its own account, so the pool routes between them — but the engine's own batch "+
+		"path still acts as one account and follows whichever connected last, so a result "+
+		"can belong to the other profile. Close the extension, or the Flow tab, in every "+
+		"browser profile but one. Current: %s.", len(narrow), strings.Join(narrow, ", "), current)
 }
 
 // Fingerprint returns the browser identity adopted at start-up, or nil when the
@@ -202,6 +232,31 @@ func (e *Engine) Fingerprint() *flowapi.BrowserFingerprint {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.fingerprint
+}
+
+// Jar returns the cookies the engine acts as.
+//
+// Deliberately not `bridge.Jar()`, which answers with whichever extension synced
+// most recently. The bridge holds a single jar and `SyncCookies` overwrites it
+// once per attached profile, so a boot that registered ten profiles leaves the
+// bridge holding the tenth one's cookies — and a generation submitted as the
+// primary account then goes out under a different profile's session. That is the
+// cross-contamination this accessor exists to prevent.
+//
+// The bridge is still the fallback, for a caller that runs before Bootstrap has
+// captured one. It is not the primary source, and it is not consulted once
+// Bootstrap has run.
+func (e *Engine) Jar() *cookiejar.Jar {
+	e.mu.RLock()
+	jar := e.primaryJar
+	e.mu.RUnlock()
+	if jar != nil {
+		return jar
+	}
+	if e.bridge == nil {
+		return nil
+	}
+	return e.bridge.Jar()
 }
 
 // NewBatchexecuteClient builds a batchexecute client carrying this engine's
@@ -788,8 +843,12 @@ func (e *Engine) SessionSnapshot(ctx context.Context) (*SessionSnapshot, error) 
 
 	// Read outside the lock: reading the bridge can block, and holding the
 	// engine lock across it would stall every other caller.
+	//
+	// No bundle is passed: this is reached only when Bootstrap found no identity
+	// at all, and in that case the account's file held none either — so the only
+	// thing left to consult is the legacy file, which the helper still reads.
 	if fingerprint == nil {
-		fingerprint = e.browserFingerprint(ctx)
+		fingerprint = e.browserFingerprint(ctx, nil)
 	}
 	snapshot.Fingerprint = fingerprint
 	return snapshot, nil
@@ -935,10 +994,22 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// so the session, the project and every later call agree on it.
 	index := e.AccountIndex()
 
-	// Read the browser identity first, because two things below depend on it:
+	// Whatever the file knew about this account, if the jar came from one. A
+	// source that is not a path — a live browser, an adopted session — simply
+	// fails to load, which is the right answer: there is no file to consult.
+	//
+	// First, because it is the one source that already holds all three of the
+	// values this boot would otherwise rediscover: the browser identity, the
+	// project, and the page tokens. The engine keeps no copy of any of them —
+	// each belongs to one signed-in profile, and a single engine-wide row is
+	// what made two accounts present one profile's identity and one page's
+	// tokens.
+	primaryBundle, _ := cookiejar.LoadBundleFile(source)
+
+	// Read the browser identity next, because two things below depend on it:
 	// the captcha provider presents it when it mints a token, and every call
 	// this engine makes has to present the same identity as the token's.
-	browserFP := e.browserFingerprint(ctx)
+	browserFP := e.browserFingerprint(ctx, primaryBundle)
 
 	// The resolver, not a resolved client: whichever extension is attached can
 	// change after this point, and a provider holding a captured client reports
@@ -956,7 +1027,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// the bridge or from cookies.json. Everything below reads the account and the
 	// project off this value rather than off the engine's own fields, because a
 	// second account registered further down overwrites those.
-	primary := e.resolveAccount(ctx, jar, index, browserFP, captchaProvider)
+	primary := e.resolveAccount(ctx, jar, index, browserFP, captchaProvider, primaryBundle)
 	e.pool.Register(primary.Worker)
 
 	accountID := primary.AccountID
@@ -972,7 +1043,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// After the project resolution inside resolveAccount on purpose: that step may
 	// navigate the attached tab, and the tokens belong to whatever page is loaded
 	// when they are read.
-	atToken, fsid := e.pageTokens(ctx)
+	atToken, fsid := e.pageTokens(ctx, primaryBundle)
 
 	// Record the account. Credits are left unknown until a real check runs —
 	// writing a plausible-looking number here is exactly how the Python version
@@ -988,12 +1059,29 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// nothing at all, and the boot is the single-account one it has always been.
 	e.registerAccountDumps(ctx, browserFP, captchaProvider)
 
+	// Then every extension attached right now, each as its own account. After the
+	// dumps because Register replaces in place for a repeated account id, and the
+	// account that is live is the one whose cookies are current.
+	//
+	// Skipped when a cookie file was named. Registering the other profiles syncs
+	// their cookies, and that sync writes `cookies.json` — which a run told which
+	// account to be must not touch.
+	if e.opts.CookieFile == "" {
+		e.registerConnectedExtensions(ctx, browserFP)
+	}
+
 	e.mu.Lock()
 	e.accountID = accountID
 	e.projectID = projectID
 	e.client = client
 	e.captcha = captchaProvider
 	e.fingerprint = browserFP
+	// The jar this boot resolved, kept as the engine's own. `registerAccountDumps`
+	// and `registerConnectedExtensions` run above and each one syncs a profile,
+	// which moves the bridge's jar to that profile — so by here the bridge no
+	// longer holds this account's cookies, and reading them back from it would
+	// generate as whichever extension happened to be last.
+	e.primaryJar = jar
 	e.atToken = atToken
 	e.fsid = fsid
 	e.hasSession = hasSession
@@ -1077,7 +1165,24 @@ type accountBoot struct {
 // project listing — are best-effort by design and record their own failures, so
 // there is no error here to return rather than an error that is always nil.
 func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index int,
-	fp *flowapi.BrowserFingerprint, captcha recaptcha.Provider) *accountBoot {
+	fp *flowapi.BrowserFingerprint, captcha recaptcha.Provider, bundle *cookiejar.Bundle) *accountBoot {
+
+	// An account file carries what this would otherwise have to rediscover, so
+	// adopt what it holds before doing anything that costs a round trip.
+	//
+	// The identity is per account rather than per process: a bundle was written
+	// by one signed-in profile, and its fingerprint is the one that profile's
+	// captcha tokens are valid for. Using the engine's own would be the mismatch
+	// that gets a token rejected with no error at all, just an empty result.
+	if bundle != nil && !bundle.Fingerprint.Empty() {
+		fp = &flowapi.BrowserFingerprint{
+			UserAgent: bundle.Fingerprint.UserAgent,
+			Language:  bundle.Fingerprint.Language,
+			SecChUa:   bundle.Fingerprint.SecChUa,
+			Platform:  bundle.Fingerprint.Platform,
+			Mobile:    bundle.Fingerprint.Mobile,
+		}
+	}
 
 	provider := auth.NewProvider(jar, e.hc)
 	// The provider has to know which signed-in account to mint for, or it
@@ -1117,11 +1222,21 @@ func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index i
 	// Prefer the account's own project list over navigating a browser to read an
 	// editor URL: both are live, and only one of them drives a tab. The browser
 	// remains the fallback for when the listing is rejected.
-	projectID, projectSource := chooseProjectID(e.opts.ProjectID, e.opts.DefaultProjectID,
+	// A remembered project is worth more here than anywhere else: resolving one
+	// over the transport costs a round trip, and from the browser a tab
+	// navigation — and the file has already answered.
+	bundleProject := ""
+	if bundle != nil {
+		bundleProject = bundle.ProjectID
+	}
+	projectID, projectSource := chooseProjectID(e.opts.ProjectID, bundleProject, e.opts.DefaultProjectID,
 		func() string { return e.projectFromRPC(ctx, jar, index) },
 		func() string { return e.projectFromBrowser(ctx, index) })
-	if projectSource == projectSourceConfigured {
+	switch projectSource {
+	case projectSourceConfigured:
 		log.Printf("engine: using the configured project %s (FLOW_PROJECT_ID); no source was consulted", projectID)
+	case projectSourceBundle:
+		log.Printf("engine: using project %s, recorded in this account's own file", projectID)
 	}
 	if projectID == "" {
 		// Self-healing has already been tried: the listing was consulted, and an
@@ -1157,6 +1272,11 @@ func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index i
 	// actually run in — the client above was built with it — so the result of a
 	// routed job has to be able to read it back off the worker that served it.
 	worker.SetProjectID(projectID)
+	// The cookies and the token provider this account generates with, so a job
+	// served by this worker does not have to reach back to the engine for either
+	// — the engine's own copies name whichever account bootstrapped last.
+	worker.SetJar(jar)
+	worker.SetCaptcha(captcha)
 
 	return &accountBoot{
 		Index:      index,
@@ -1176,6 +1296,9 @@ type accountDump struct {
 	Label string
 	// Path is where the dump lives.
 	Path string
+	// Modified is the file's modification time, which is what orders the list:
+	// these are sync outputs, so the newest is the account that was last working.
+	Modified time.Time
 }
 
 // registerAccountDumps registers a worker for every cookies/account_*.json dump.
@@ -1216,7 +1339,26 @@ func (e *Engine) registerAccountDumps(ctx context.Context, fp *flowapi.BrowserFi
 		// select between. If it describes the same account as the primary jar the
 		// account id matches and Register replaces that worker in place, which is
 		// the right outcome — one account, one worker.
-		boot := e.resolveAccount(ctx, jar, 0, fp, captcha)
+		//
+		// The dump's own bundle, so a project it recorded is used rather than
+		// re-resolved, which is the whole reason the file carries one.
+		dumpBundle, _ := cookiejar.LoadBundleFile(dump.Path)
+
+		// And the gate: only an account that can actually generate gets registered.
+		//
+		// A file with cookies but no page tokens or no identity is the shape a
+		// sync leaves behind when no Flow tab was open — and `mergeBundle` only
+		// preserves what an earlier sync learned, so it stays that shape until a
+		// tab is opened. Registering it puts a worker in the pool whose every
+		// routed job comes back empty with nothing in the log to say why. This
+		// line is that "why", said once at boot instead.
+		if !dumpBundle.Complete() {
+			log.Printf("engine: skipping account %s: incomplete bundle "+
+				"(needs cookies, at/fsid, and fingerprint)", filepath.Base(dump.Path))
+			continue
+		}
+
+		boot := e.resolveAccount(ctx, jar, 0, fp, captcha, dumpBundle)
 		e.pool.Register(boot.Worker)
 		e.recordIdentity(boot.Identity, jar, boot.Session.Sku, 0)
 
@@ -1225,14 +1367,122 @@ func (e *Engine) registerAccountDumps(ctx context.Context, fp *flowapi.BrowserFi
 	}
 }
 
-// discoverAccountJars finds `account_<id>.json` dumps in dir, ordered by label.
+// registerConnectedExtensions registers a worker for every extension attached at
+// once, so several browser profiles become several accounts rather than a
+// warning nobody can act on.
 //
-// The order matters: the caller registers a worker per dump, and the pool's
-// round-robin tiebreak follows registration order. `os.ReadDir` already returns
-// entries sorted by filename, and while there is one accepted prefix that is the
-// same order — so this sort is a restatement rather than a correction. It is here
-// so the guarantee belongs to the function that makes it instead of to a property
-// of the directory reader two layers down.
+// This is what the warning it replaces could not do. `SyncCookies` writes each
+// profile's cookies to its own `account_<key>.json` as well as to the shared
+// `cookies.json`, so a second profile no longer erases the first — and this
+// registers the account each of those files describes.
+//
+// Index 0 for each, because a profile's own default account is the one its
+// extension syncs; the jar holds one account's cookies, so there is nothing to
+// select between. That is the same reasoning registerAccountDumps applies to a
+// dump, and it is why the two functions are near-copies: one registers the
+// accounts that are attached, the other the accounts that were written down.
+//
+// The primary account is registered by Bootstrap before this runs, so it appears
+// here too — the account id matches and Register replaces that worker in place,
+// which is the right outcome: one account, one worker.
+//
+// Failures are logged and skipped, for the same reason the dumps are: one
+// profile that cannot be read must not cost the operator the accounts that work.
+func (e *Engine) registerConnectedExtensions(ctx context.Context, fp *flowapi.BrowserFingerprint) {
+	if e.bridge == nil {
+		return
+	}
+
+	clients := e.bridge.Clients()
+
+	// Sorted, because a map's order is random and the pool's round-robin tiebreak
+	// follows registration order — an account that moves between boots for no
+	// reason is a support call waiting to happen.
+	addrs := make([]string, 0, len(clients))
+	for addr, client := range clients {
+		if client != nil && client.Surface().FlowOperations {
+			addrs = append(addrs, addr)
+		}
+	}
+	sort.Strings(addrs)
+
+	for _, addr := range addrs {
+		client := clients[addr]
+
+		jar, err := e.bridge.SyncCookies(ctx, client)
+		if err != nil {
+			log.Printf("engine: could not sync cookies from the extension at %s: %v", addr, err)
+			continue
+		}
+
+		// A provider bound to *this* client, not to `Current()`. The binding is
+		// the point: a captcha for this account has to be minted in the profile
+		// that is signed into it, because the widget scores the client that asks
+		// and a token minted in one profile and spent in another is the mismatch
+		// this engine's notes already warn about. Unlike the primary provider
+		// this resolver deliberately captures its client — for a per-account
+		// provider "whichever is attached" would be the wrong account.
+		captcha := recaptcha.Build(e.opts.CaptchaMode, e.hc, client, e.captchaPageURL,
+			func() *cdp.Client { return client }, userAgentOf(fp))
+
+		// The bundle the bridge has just written for this account, so a project
+		// or an identity recorded there is adopted rather than rediscovered.
+		connectedBundle, _ := cookiejar.LoadBundleFile(
+			e.bridge.AccountCookieFile(cookiejar.AccountKey(jar)))
+
+		// The same gate the dumps get, and it bites harder here.
+		//
+		// An attached profile whose bundle has never carried page tokens is one
+		// where no Flow tab has ever been open — the sync above read its cookies
+		// happily, because those need no tab, and could read neither the tokens
+		// nor the identity, because both need one. Such a profile cannot
+		// generate; it would sit in the pool as a worker that fails every job it
+		// is handed, and the pool would keep handing it jobs.
+		if !connectedBundle.Complete() {
+			log.Printf("engine: skipping extension at %s: incomplete bundle (no active Flow tab)", addr)
+			continue
+		}
+
+		boot := e.resolveAccount(ctx, jar, 0, fp, captcha, connectedBundle)
+		e.pool.Register(boot.Worker)
+		e.recordIdentity(boot.Identity, jar, boot.Session.Sku, 0)
+
+		log.Printf("engine: registered account %s from the extension at %s (project %s)",
+			boot.AccountID, addr, boot.ProjectID)
+	}
+}
+
+// DiscoverAccountJars lists the per-account cookie files in dir, sorted.
+//
+// The exported face of discoverAccountJars, for callers outside the engine — the
+// `batch-all` command is the one that exists. It returns paths rather than the
+// internal dump struct so that a caller which only wants to load them does not
+// have to know about labels and ordering rules it cannot act on anyway.
+func DiscoverAccountJars(dir string) ([]string, error) {
+	dumps, err := discoverAccountJars(dir)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(dumps))
+	for _, dump := range dumps {
+		paths = append(paths, dump.Path)
+	}
+	return paths, nil
+}
+
+// discoverAccountJars finds `account_<id>.json` dumps in dir, newest first.
+//
+// The order matters twice over: `loadJar` takes the first entry as the account a
+// browserless run acts as, and the caller of registerAccountDumps registers a
+// worker per dump, with the pool's round-robin tiebreak following registration
+// order.
+//
+// Newest first, because these files are sync outputs — the most recently written
+// one is the account that was last actually working. Name order is stable but
+// arbitrary, and with several profiles it can settle on an account whose session
+// expired days ago, which surfaces as an upstream fault rather than as a bad
+// choice of file. Ties break by label so the order stays total and reproducible
+// instead of following whatever `os.ReadDir` happened to return.
 //
 // A missing directory is not an error. It is the state of every setup that has
 // never written a dump, and the caller is expected to carry on with the single
@@ -1255,10 +1505,32 @@ func discoverAccountJars(dir string) ([]accountDump, error) {
 		if !ok {
 			continue
 		}
-		dumps = append(dumps, accountDump{Label: label, Path: filepath.Join(dir, entry.Name())})
+		info, err := entry.Info()
+		if err != nil {
+			// Vanished between the read and the stat. Not worth failing the whole
+			// listing over; the next sync will put it back.
+			continue
+		}
+		dumps = append(dumps, accountDump{
+			Label:    label,
+			Path:     filepath.Join(dir, entry.Name()),
+			Modified: info.ModTime(),
+		})
 	}
 
-	sort.Slice(dumps, func(i, j int) bool { return dumps[i].Label < dumps[j].Label })
+	// Newest first. These are sync outputs, so the most recently written file is
+	// the account that was last actually working, and that is the one a
+	// browserless run should act as. Name order is stable but arbitrary: with ten
+	// profiles it can settle on an account whose session expired days ago, which
+	// surfaces as an upstream fault rather than as a bad choice of file.
+	sort.Slice(dumps, func(i, j int) bool {
+		if dumps[i].Modified.Equal(dumps[j].Modified) {
+			// Ties broken by label, so the order stays total and reproducible
+			// rather than following whatever os.ReadDir happened to return.
+			return dumps[i].Label < dumps[j].Label
+		}
+		return dumps[i].Modified.After(dumps[j].Modified)
+	})
 	return dumps, nil
 }
 
@@ -1283,6 +1555,31 @@ func accountDumpLabel(name string) (string, bool) {
 }
 
 func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
+	// An explicit file wins outright and ends the search here.
+	//
+	// `--cookies` exists to run one command as one named account. Consulting the
+	// live browser instead would make that impossible to rely on: the bridge
+	// syncs whichever profile is attached, so the account would be decided by
+	// which Chrome window happens to be open rather than by the flag — and the
+	// sync writes over `cookies.json` on the way past.
+	if e.opts.CookieFile != "" {
+		jar, err := cookiejar.LoadFile(e.opts.CookieFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("engine: read --cookies %s: %w", e.opts.CookieFile, err)
+		}
+		if jar.Count() == 0 {
+			return nil, "", fmt.Errorf("engine: --cookies %s holds no cookies", e.opts.CookieFile)
+		}
+		return jar, e.opts.CookieFile, nil
+	}
+
+	// Then cookies the caller already holds in memory. A CLI that adopted a
+	// running server's session has them, and putting them on disk was exactly
+	// what used to overwrite the shared cookie file — so they stay here.
+	if e.opts.Jar != nil && e.opts.Jar.Count() > 0 {
+		return e.opts.Jar, "adopted session", nil
+	}
+
 	// Prefer a live browser, since its cookies are the freshest.
 	if client := e.bridge.Current(); client != nil && client.Connected() {
 		jar, err := e.bridge.SyncCookies(ctx, client)
@@ -1306,6 +1603,23 @@ func (e *Engine) loadJar(ctx context.Context) (*cookiejar.Jar, string, error) {
 	// setup is nothing — so the engine loaded a copy from hours earlier and every
 	// call answered 401. The synced file is tried first because it is the fresher
 	// of the two by construction.
+	// Then the per-account files, which are the source of truth now: the bridge
+	// writes one per signed-in profile and no longer writes a shared file at all.
+	// Newest first, so a browserless run acts as the account that synced most
+	// recently rather than as whichever filename sorts first.
+	if dumps, dumpErr := discoverAccountJars(config.CookieDir()); dumpErr == nil {
+		for _, dump := range dumps {
+			jar, err := cookiejar.LoadFile(dump.Path)
+			if err == nil && jar.Count() > 0 {
+				log.Printf("engine: no browser attached; acting as the account in %s",
+					filepath.Base(dump.Path))
+				return jar, dump.Path, nil
+			}
+		}
+	}
+
+	// `cookies.json` last, and only for a file put there by hand: nothing writes
+	// it any more.
 	candidates := []string{
 		filepath.Join(config.CookieDir(), "cookies.json"),
 		filepath.Join(config.DataDir(), "cookies.json"),
@@ -1337,6 +1651,7 @@ func (e *Engine) setError(err error) {
 // Where a boot's project id came from.
 const (
 	projectSourceExplicit   = "explicit"
+	projectSourceBundle     = "bundle"
 	projectSourceConfigured = "configured"
 	projectSourceRPC        = "rpc"
 	projectSourceBrowser    = "browser"
@@ -1345,15 +1660,25 @@ const (
 
 // chooseProjectID picks the Flow project a boot runs against.
 //
-// Four sources, and the ranking is deliberate:
+// Five sources, and the ranking is deliberate:
 //
 //	explicit   — the caller named it. Outranks everything.
 //	configured — FLOW_PROJECT_ID. Also an instruction, which is why a set value
 //	             stops the search: neither callback runs.
+//	bundle     — the account file remembers it. Ranks below both instructions and
+//	             above both discovery routes, because it saves a round trip or a
+//	             tab navigation and is the freshest thing on disk.
 //	rpc        — the account's project list over the transport. Live truth, and
 //	             it costs an HTTP call rather than a tab navigation.
 //	browser    — the open editor's URL. Also live truth, but it is the only
 //	             source that has to drive a browser to answer.
+//
+// The bundle sits *below* FLOW_PROJECT_ID on purpose. It is a remembered value,
+// and a remembered value goes stale — a project belongs to one signed-in account,
+// and one from another account does not open. An operator who sets the variable
+// is stating an instruction for this run, and an instruction has to outrank a
+// leftover. What the bundle does beat is the discovery, which is the point of
+// writing it down at all.
 //
 // The rpc source sits above the browser because the two are equally current and
 // only one of them navigates. The browser stays as the last resort rather than
@@ -1368,12 +1693,15 @@ const (
 //
 // A project id that is wrong fails visibly rather than silently: a project
 // belongs to one signed-in account, so another account's id does not open.
-func chooseProjectID(explicit, configured string, askRPC, askBrowser func() string) (id, source string) {
+func chooseProjectID(explicit, bundleProject, configured string, askRPC, askBrowser func() string) (id, source string) {
 	if explicit != "" {
 		return explicit, projectSourceExplicit
 	}
 	if configured != "" {
 		return configured, projectSourceConfigured
+	}
+	if bundleProject != "" {
+		return bundleProject, projectSourceBundle
 	}
 	if askRPC != nil {
 		if id := askRPC(); id != "" {
@@ -1507,8 +1835,10 @@ func (e *Engine) projectFromBrowser(ctx context.Context, accountIndex int) strin
 }
 
 // pageTokensFile is where the page tokens used to be kept: a file beside the
-// cookie cache. They live in the settings table now, so this is read only to
-// migrate a file written by an older build.
+// cookie cache, and then a row in the settings table. They are the account's own
+// now — the bridge writes them into that account's bundle on every sync — so
+// this is read only for an install that has not synced since, and is never
+// written or removed.
 func pageTokensFile() string {
 	return filepath.Join(config.CookieDir(), "page-tokens.json")
 }
@@ -1520,40 +1850,28 @@ type pageTokenSet struct {
 	Fsid string `json:"fsid,omitempty"`
 }
 
-// savePageTokens persists the pair in the settings table, best-effort.
-func (e *Engine) savePageTokens(tokens pageTokenSet) {
-	if tokens.At == "" && tokens.Fsid == "" {
-		return
+// persistedPageTokens is the pair a previous run recorded for this account, and
+// where it was found.
+//
+// The account's own file comes first: it is the copy a browser sync keeps
+// current, and the only one that is per account — a single engine-wide pair is
+// exactly what two accounts cannot share. The file below it is the leftover from
+// when this was a setting, read so an install that has not been through a sync
+// since does not lose the pair. It is deliberately neither written nor deleted:
+// removing it would be the one way to lose a value that nothing has replaced
+// yet, which is the mistake this codebase has already recorded once.
+func persistedPageTokens(bundle *cookiejar.Bundle) (pageTokenSet, string) {
+	if bundle != nil && (bundle.At != "" || bundle.Fsid != "") {
+		return pageTokenSet{At: bundle.At, Fsid: bundle.Fsid}, "this account's own file"
 	}
-	data, err := json.Marshal(tokens)
-	if err != nil {
-		return
+	if tokens := loadLegacyPageTokens(); tokens.At != "" || tokens.Fsid != "" {
+		return tokens, pageTokensFile()
 	}
-	if e.store == nil {
-		return
-	}
-	if err := e.store.SetSetting(store.SettingKeyPageTokens, string(data)); err != nil {
-		log.Printf("engine: could not persist the page tokens: %v", err)
-	}
+	return pageTokenSet{}, ""
 }
 
-// loadPageTokens reads the pair back, migrating a legacy file on the way.
-//
-// The file is removed only once the value is safely in the database. Deleting it
-// first would lose the pair outright on a store that cannot be written, and
-// these are the difference between a browserless run that works and one that
-// comes back empty with nothing in the log to say why.
-func (e *Engine) loadPageTokens() pageTokenSet {
-	if e.store != nil {
-		if raw, found, err := e.store.Setting(store.SettingKeyPageTokens); err == nil && found && raw != "" {
-			var tokens pageTokenSet
-			if err := json.Unmarshal([]byte(raw), &tokens); err == nil {
-				return tokens
-			}
-		}
-	}
-
-	// One-time migration from the file this used to be kept in.
+// loadLegacyPageTokens reads the pair an older build left in pageTokensFile.
+func loadLegacyPageTokens() pageTokenSet {
 	data, err := os.ReadFile(pageTokensFile())
 	if err != nil {
 		return pageTokenSet{}
@@ -1561,16 +1879,6 @@ func (e *Engine) loadPageTokens() pageTokenSet {
 	var tokens pageTokenSet
 	if err := json.Unmarshal(data, &tokens); err != nil {
 		return pageTokenSet{}
-	}
-	if e.store != nil {
-		if err := e.store.SetSetting(store.SettingKeyPageTokens, string(data)); err != nil {
-			log.Printf("engine: could not migrate %s into the database, leaving it in place: %v",
-				pageTokensFile(), err)
-			return tokens
-		}
-	}
-	if err := os.Remove(pageTokensFile()); err != nil {
-		log.Printf("engine: could not remove the migrated %s: %v", pageTokensFile(), err)
 	}
 	return tokens
 }
@@ -1584,22 +1892,40 @@ func (e *Engine) loadPageTokens() pageTokenSet {
 // session id the call goes out as it always did. In practice the priming path is
 // not a substitute for a captcha-bearing generation: a browserless run that had
 // the fingerprint and the cookies but neither of these came back empty, and the
-// same run with both from a session snapshot succeeded. So they are persisted
-// alongside the fingerprint rather than left to be re-derived.
-func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
+// same run with both from a session snapshot succeeded. So they are recorded
+// against the account rather than left to be re-derived.
+//
+// **The account's own pair is read before the live page, and that order is the
+// point.** `e.bridge.Current()` is whichever profile attached *last*, so with two
+// extensions connected it answers with the other account's page — and the failure
+// that produces is not a rejection but a silence: the request goes out under
+// account A's cookies carrying account B's tokens, and batchexecute answers with
+// an empty frame in under two seconds. A pair that belongs to the right account
+// is strictly better than a fresher one that belongs to the wrong account, and it
+// is not even stale for long — the sync at boot rewrites the bundle from that
+// profile's own page.
+//
+// bundle is the account file the jar came from, when it came from one: that is
+// where the pair recorded for *this* account lives.
+func (e *Engine) pageTokens(ctx context.Context, bundle *cookiejar.Bundle) (at, fsid string) {
+	// An explicit pair for this run wins outright, which is the same ranking
+	// chooseProjectID applies to a project: an instruction for this run, then what
+	// was remembered for this account, then what is live. A SessionSnapshot is only
+	// ever set on the CLI path — the server leaves these fields empty — so this
+	// costs the multi-profile case nothing.
+	if e.opts.AtToken != "" || e.opts.Fsid != "" {
+		return e.opts.AtToken, e.opts.Fsid
+	}
+
+	// Then this account's own pair, before the page. See the note above.
+	if persisted, source := persistedPageTokens(bundle); persisted.At != "" && persisted.Fsid != "" {
+		log.Printf("engine: adopting page tokens from %s (at %d chars, f.sid %d chars)",
+			source, len(persisted.At), len(persisted.Fsid))
+		return persisted.At, persisted.Fsid
+	}
+
+	// Nothing recorded for this account, so the live page is all that is left.
 	if e.bridge == nil || !e.bridge.Connected() {
-		// No browser to read from. A SessionSnapshot is the best source, because
-		// whoever supplied it is running right now.
-		if e.opts.AtToken != "" || e.opts.Fsid != "" {
-			return e.opts.AtToken, e.opts.Fsid
-		}
-		// Then the persisted copy, which is what lets a run with no browser at
-		// all present the same opening request the page would have.
-		if persisted := e.loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
-			log.Printf("engine: adopting the persisted page tokens (at %d chars, f.sid %d chars)",
-				len(persisted.At), len(persisted.Fsid))
-			return persisted.At, persisted.Fsid
-		}
 		return "", ""
 	}
 	client := e.bridge.Current()
@@ -1612,21 +1938,8 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 
 	raw, err := client.FlowAt(atCtx, "")
 	if err != nil {
-		// Same fallback as the fingerprint, and it matters more here. The comment
-		// above says priming is not a substitute — a run with the cookies and the
-		// fingerprint but neither of these came back empty — so discarding the
-		// persisted pair because a page happens to be missing defeats the reason
-		// they are persisted at all. A connected bridge with no Flow tab is the
-		// ordinary case, not a failure worth losing them over.
-		if persisted := e.loadPageTokens(); persisted.At != "" || persisted.Fsid != "" {
-			log.Printf("engine: the page could not supply its batchexecute tokens (%v); "+
-				"adopting the persisted pair instead (at %d chars, f.sid %d chars)",
-				err, len(persisted.At), len(persisted.Fsid))
-			return persisted.At, persisted.Fsid
-		}
-
 		log.Printf("engine: could not read the page's batchexecute tokens (%v) and none are "+
-			"persisted; batchexecute will prime for a token instead", err)
+			"recorded for this account; batchexecute will prime for a token instead", err)
 		return "", ""
 	}
 
@@ -1639,8 +1952,9 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 		return "", ""
 	}
 
-	// Persist so the next run does not need this page.
-	e.savePageTokens(pageTokenSet{At: out.At, Fsid: out.Fsid})
+	// Not recorded here. These belong to the account whose page carried them, and
+	// the bridge writes them into that account's own file on the next sync — one
+	// engine-wide copy is what made two accounts present one page's tokens.
 
 	if out.At == "" {
 		log.Printf("engine: the page did not carry an anti-CSRF token; " +
@@ -1657,42 +1971,43 @@ func (e *Engine) pageTokens(ctx context.Context) (at, fsid string) {
 }
 
 // fingerprintFile is where the browser identity used to be kept: a file beside
-// the cookie cache. It lives in the settings table now, so this is read only to
-// migrate a file written by an older build.
+// the cookie cache, and then a row in the settings table. It is the account's
+// own now — the bridge writes it into that account's bundle on every sync — so
+// this is read only for an install that has not synced since, and is never
+// written or removed.
 func fingerprintFile() string {
 	return filepath.Join(config.CookieDir(), "fingerprint.json")
 }
 
-// saveFingerprint persists the browser identity, best-effort.
-func (e *Engine) saveFingerprint(fp *flowapi.BrowserFingerprint) {
-	if fp == nil || fp.UserAgent == "" {
-		return
+// persistedFingerprint is the identity a previous run recorded for this account,
+// and where it was found.
+//
+// The account's own file comes first. The identity is per account, not per
+// process: a captcha token is only valid for the client it was minted under, and
+// a single engine-wide copy is what let two accounts present one profile's
+// identity — rejected upstream as unusual activity, with no error anywhere. The
+// file below it is the leftover from when this was a setting, read so an install
+// that has not been through a sync since does not lose it. Neither written nor
+// deleted, for the reason given on persistedPageTokens.
+func persistedFingerprint(bundle *cookiejar.Bundle) (*flowapi.BrowserFingerprint, string) {
+	if bundle != nil && !bundle.Fingerprint.Empty() {
+		return &flowapi.BrowserFingerprint{
+			UserAgent: bundle.Fingerprint.UserAgent,
+			Language:  bundle.Fingerprint.Language,
+			SecChUa:   bundle.Fingerprint.SecChUa,
+			Platform:  bundle.Fingerprint.Platform,
+			Mobile:    bundle.Fingerprint.Mobile,
+		}, "this account's own file"
 	}
-	data, err := json.Marshal(fp)
-	if err != nil {
-		return
+	if fp := loadLegacyFingerprint(); fp != nil {
+		return fp, fingerprintFile()
 	}
-	if e.store == nil {
-		return
-	}
-	if err := e.store.SetSetting(store.SettingKeyBrowserFingerprint, string(data)); err != nil {
-		log.Printf("engine: could not persist the fingerprint: %v", err)
-	}
+	return nil, ""
 }
 
-// loadFingerprint reads a previously persisted browser identity, migrating a
-// legacy file on the way. See loadPageTokens for why the file goes last.
-func (e *Engine) loadFingerprint() *flowapi.BrowserFingerprint {
-	if e.store != nil {
-		if raw, found, err := e.store.Setting(store.SettingKeyBrowserFingerprint); err == nil && found && raw != "" {
-			var fp flowapi.BrowserFingerprint
-			if err := json.Unmarshal([]byte(raw), &fp); err == nil && fp.UserAgent != "" {
-				return &fp
-			}
-		}
-	}
-
-	// One-time migration from the file this used to be kept in.
+// loadLegacyFingerprint reads the identity an older build left in
+// fingerprintFile, or nil when there is none to read.
+func loadLegacyFingerprint() *flowapi.BrowserFingerprint {
 	data, err := os.ReadFile(fingerprintFile())
 	if err != nil {
 		return nil
@@ -1701,45 +2016,47 @@ func (e *Engine) loadFingerprint() *flowapi.BrowserFingerprint {
 	if err := json.Unmarshal(data, &fp); err != nil || fp.UserAgent == "" {
 		return nil
 	}
-	if e.store != nil {
-		if err := e.store.SetSetting(store.SettingKeyBrowserFingerprint, string(data)); err != nil {
-			log.Printf("engine: could not migrate %s into the database, leaving it in place: %v",
-				fingerprintFile(), err)
-			return &fp
-		}
-	}
-	if err := os.Remove(fingerprintFile()); err != nil {
-		log.Printf("engine: could not remove the migrated %s: %v", fingerprintFile(), err)
-	}
 	return &fp
 }
 
 // browserFingerprint reads the browser's request identity so generation calls
-// can present it. Returns nil when the browser cannot be reached, in which case
-// the client falls back to a generic Chrome profile — fine for read-only calls,
-// but generation requests will be rejected as unusual activity.
-func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerprint {
+// can present it. Returns nil when no source can supply one, in which case the
+// client falls back to a generic Chrome profile — fine for read-only calls, but
+// generation requests will be rejected as unusual activity.
+//
+// **The account's own identity is read before the live browser, for the same
+// reason pageTokens reads its pair first.** `bridge.Fingerprint` goes through
+// whichever client is `Current()`, so with two profiles attached it describes the
+// other one — and a captcha token minted for account B's client and presented
+// with account A's cookies is rejected as unusual activity, which reads as a
+// captcha failure and is really a fingerprint mismatch.
+//
+// Reading the recorded copy first is also why it can no longer be thrown away. As
+// a *fallback* it was discarded whenever a browser was attached but had no Flow
+// tab open, which made attaching the extension worse than not attaching it.
+//
+// bundle is the account file the jar came from, when it came from one. It is
+// consulted ahead of the legacy file because it is the copy a browser sync keeps
+// current, and the only one that is per account.
+func (e *Engine) browserFingerprint(ctx context.Context, bundle *cookiejar.Bundle) *flowapi.BrowserFingerprint {
+	// An explicit identity for this run wins outright — the same ranking
+	// chooseProjectID applies, and only the CLI ever sets one.
+	if e.opts.Fingerprint != nil {
+		log.Printf("engine: adopting the fingerprint from the session snapshot — %s",
+			truncate(e.opts.Fingerprint.UserAgent, 70))
+		return e.opts.Fingerprint
+	}
+
+	// Then the account's own identity, before the browser. See the note above.
+	if fp, source := persistedFingerprint(bundle); fp != nil && fp.UserAgent != "" {
+		log.Printf("engine: adopting fingerprint from %s — %s",
+			source, truncate(fp.UserAgent, 70))
+		return fp
+	}
+
+	// Nothing recorded for this account, so the live browser is all that is left.
 	if e.bridge == nil || !e.bridge.Connected() {
-		// No browser to read from. A SessionSnapshot is the best source, because
-		// whoever supplied it is running right now.
-		if e.opts.Fingerprint != nil {
-			log.Printf("engine: adopting the fingerprint from the session snapshot — %s",
-				truncate(e.opts.Fingerprint.UserAgent, 70))
-			return e.opts.Fingerprint
-		}
-
-		// Then the persisted copy, which is what makes a standalone run possible
-		// at all. Without it the provider falls back to its pinned user agent,
-		// which is a *different machine* from this one — and a captcha token
-		// minted under one client and spent under another is rejected with no
-		// error at all, just an empty result.
-		if fp := e.loadFingerprint(); fp != nil {
-			log.Printf("engine: adopting the persisted fingerprint — %s",
-				truncate(fp.UserAgent, 70))
-			return fp
-		}
-
-		log.Printf("engine: no browser, no snapshot and no persisted fingerprint; " +
+		log.Printf("engine: no browser, no snapshot and no recorded fingerprint; " +
 			"a captcha-bearing call will present the pinned default and is likely to " +
 			"come back empty. Run once with the browser attached to record one")
 		return nil
@@ -1750,25 +2067,9 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 
 	fp, err := e.bridge.Fingerprint(fpCtx)
 	if err != nil {
-		// A connected bridge that cannot supply an identity is the ordinary
-		// case, not an exception: it means no Flow tab is open to read one from,
-		// and the tab is closed more often than not. That is what the persisted
-		// copy is for — the whole point of keeping it is to make a run possible
-		// with no page at all — so falling back here is the same decision as
-		// falling back above, and it used to not happen.
-		//
-		// The effect was that attaching the extension without a Flow tab was
-		// *worse* than not attaching it: the disconnected path found the
-		// persisted copy and the connected path threw it away, so every
-		// generation came back empty with nothing in the log to say why.
-		if persisted := e.loadFingerprint(); persisted != nil {
-			log.Printf("engine: the browser could not supply a fingerprint (%v); "+
-				"adopting the persisted one — %s", err, truncate(persisted.UserAgent, 70))
-			return persisted
-		}
-
 		log.Printf("engine: could not read the browser fingerprint (%v) and none is "+
-			"persisted; generation requests will not match the reCAPTCHA assessment", err)
+			"recorded for this account; generation requests will not match the "+
+			"reCAPTCHA assessment", err)
 		return nil
 	}
 
@@ -1779,8 +2080,10 @@ func (e *Engine) browserFingerprint(ctx context.Context) *flowapi.BrowserFingerp
 		Platform:  fp.PlatformFull,
 		Mobile:    fp.Mobile,
 	}
-	// Persist it so the next run does not need this browser at all.
-	e.saveFingerprint(adopted)
+	// Deliberately not recorded here. The identity belongs to the account that
+	// was signed in when it was read, and the bridge writes it into that
+	// account's own file on the next sync. An engine-wide copy is the thing that
+	// made two accounts present one profile's identity.
 
 	log.Printf("engine: adopting the browser fingerprint — %s", truncate(fp.UserAgent, 70))
 	return adopted
@@ -2790,7 +3093,10 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 	}
 	_ = rowID
 
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's. `bridge.Jar()` answers with
+	// whichever attached profile synced last, which is a different account
+	// entirely once more than one extension is connected — see Engine.Jar.
+	jar := e.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
@@ -2819,7 +3125,13 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 			// The switch re-bootstrapped, so both the client and the project now
 			// belong to the account that was just left behind and have to be
 			// rebuilt before anything is sent under them.
-			if switchedJar := e.bridge.Jar(); switchedJar != nil {
+			//
+			// `e.Jar()` and not `e.bridge.Jar()`: the re-bootstrap captured the
+			// new account's cookies as the primary jar, while the bridge's is
+			// whichever profile synced last — so reading the bridge here would
+			// rebuild the client under the wrong account, which is precisely the
+			// account this branch just decided not to use.
+			if switchedJar := e.Jar(); switchedJar != nil {
 				jar = switchedJar
 				client = e.newBatchexecuteClient(jar, e.hc)
 				if id := e.ProjectID(); id != "" {
@@ -3746,7 +4058,8 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
 	}
 
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's — see Engine.Jar.
+	jar := e.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
 		e.finishJob(jobID, "failed", nil, start, err, accountID)

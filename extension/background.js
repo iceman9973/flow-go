@@ -208,6 +208,22 @@ async function listScopedTabs() {
   return tabs.filter((t) => urlAllowed(t.url, cfg));
 }
 
+/**
+ * The tab the bridge would act on right now, or null. A lookup, never an action.
+ *
+ * Deliberately not `resolveTab`, which opens a tab when none is in scope: this
+ * is called from the status op, and the popup polls that once a second. A status
+ * read that created tabs as a side effect would be the worst kind of surprise.
+ */
+async function currentScopedTab() {
+  if (attachedTabId !== null) {
+    const tab = await chrome.tabs.get(attachedTabId).catch(() => null);
+    if (tab) return tab;
+  }
+  const scoped = await listScopedTabs();
+  return scoped.length > 0 ? scoped[0] : null;
+}
+
 async function resolveTab(tabId = null) {
   if (tabId) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -555,8 +571,20 @@ async function handle(op, params = {}) {
       return out || { available: false, error: 'the page returned nothing' };
     }
 
-    case 'status':
-      return { ...state, config: cfg };
+    case 'status': {
+      // The tab is reported here rather than only when some other op happens to
+      // resolve one. The popup reads `tabUrl` on its first paint, before any op
+      // has run, and the bundle export reads it to name the project — so a value
+      // that is only ever set as a side effect of something else would leave both
+      // of them describing a browser that is not there.
+      const tab = await currentScopedTab();
+      return {
+        ...state,
+        tabUrl: tab?.url || null,
+        tabTitle: tab?.title || null,
+        config: cfg,
+      };
+    }
 
     default:
       throw new Error(`Unknown operation: ${op}`);

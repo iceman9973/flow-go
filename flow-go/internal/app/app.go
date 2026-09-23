@@ -13,6 +13,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/kodelyx/flow-go/flow-go/internal/bridge"
 	"github.com/kodelyx/flow-go/flow-go/internal/config"
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/engine"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
 	"github.com/kodelyx/flow-go/flow-go/internal/server"
@@ -54,6 +55,12 @@ type Config struct {
 	Targets       []string
 	CookieDomains []string
 	DBPath        string
+	// CookieFile names one cookie file to run as, instead of the usual search.
+	// Empty means the engine looks for a live browser and then a persisted copy.
+	CookieFile string
+	// Jar is cookies the caller already holds in memory, which the engine uses
+	// rather than putting them on disk. See engine.Options.Jar.
+	Jar *cookiejar.Jar
 	// AtToken and Fsid are the page tokens to use when no browser is attached.
 	// A process that has taken a SessionSnapshot from one that has a browser
 	// supplies them; a live page always takes precedence.
@@ -114,6 +121,8 @@ func Build(cfg Config) (*App, error) {
 		AtToken:      cfg.AtToken,
 		Fsid:         cfg.Fsid,
 		Fingerprint:  cfg.Fingerprint,
+		CookieFile:   cfg.CookieFile,
+		Jar:          cfg.Jar,
 		// The env value is a default, not an instruction, so it ranks below the
 		// browser. An explicit cfg.ProjectID still outranks both.
 		DefaultProjectID: config.ProjectID,

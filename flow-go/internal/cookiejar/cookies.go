@@ -148,6 +148,70 @@ func IsEssential(name string) bool {
 	return false
 }
 
+// AccountIdentityNames are the cookies a per-account file is named after.
+//
+// Deliberately excludes the rotating pair — `__Secure-1PSIDTS` and
+// `__Secure-3PSIDTS` — and `SIDCC`. A key derived from those would change every
+// few hours and leave a fresh file behind on each rotation, which is the exact
+// opposite of "the file this account already has". What is left is the stable
+// credential set: the SAPISID family, the account's own session ids, and EMAIL
+// when the Flow app has set it.
+var AccountIdentityNames = []string{
+	"EMAIL",
+	"SAPISID",
+	"APISID",
+	"__Secure-1PSID",
+	"__Secure-3PSID",
+	"SID",
+	"HSID",
+	"SSID",
+}
+
+// AccountKey returns a short, stable digest of the account a jar belongs to.
+//
+// It names that account's file in the cookie directory, so it has to come out
+// the same across runs for one signed-in account and differently for two. The
+// material is the identity cookies above, taken in name order so the order they
+// happen to arrive in cannot change the answer.
+//
+// Empty means the jar carries none of them — a jar that cannot be attributed to
+// any account, and so must not be given a file of its own.
+func AccountKey(jar *Jar) string {
+	if jar == nil {
+		return ""
+	}
+
+	present := make(map[string]string)
+	for _, ck := range jar.cookies {
+		for _, want := range AccountIdentityNames {
+			if strings.EqualFold(ck.Name, want) {
+				present[strings.ToLower(want)] = ck.Value
+				break
+			}
+		}
+	}
+	if len(present) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(present))
+	for name := range present {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var material strings.Builder
+	for _, name := range names {
+		material.WriteString(name)
+		material.WriteByte('=')
+		material.WriteString(present[name])
+		material.WriteByte('\n')
+	}
+
+	sum := sha256.Sum256([]byte(material.String()))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 // Cookies returns a copy of the underlying slice.
 func (j *Jar) Cookies() []Cookie {
 	if j == nil {
@@ -335,6 +399,14 @@ func LoadFile(path string) (*Jar, error) {
 	var list []Cookie
 	if err := json.Unmarshal(data, &list); err == nil && len(list) > 0 {
 		return newJar(list, path), nil
+	}
+
+	// A bundle: an object whose `cookies` is an *array*. Checked before the legacy
+	// object below, whose `cookies` is a *string* — the two shapes share a key and
+	// differ in type, so the order here is what tells them apart.
+	var bundle Bundle
+	if err := json.Unmarshal(data, &bundle); err == nil && len(bundle.Cookies) > 0 {
+		return newJar(bundle.Cookies, path), nil
 	}
 
 	var legacy struct {

@@ -731,14 +731,18 @@ await check('config.set with a new token replies, then reconnects', async () => 
 /* ------------------------------------------------------------------ *
  * The popup
  *
- * It carries one action — a cookie export — and deliberately no bridge-token
- * field. Pairing is not a human step: the extension dials tokenless on first
- * run, the backend hands it a token over that connection via `config.set`, and
- * the extension persists it and reconnects with it. The form for pasting one by
- * hand was the fallback for that handover failing, and it is gone.
+ * It carries two actions — an account-bundle export and opening Flow — and
+ * deliberately no bridge-token field. Pairing is not a human step: the extension
+ * dials tokenless on first run, the backend hands it a token over that
+ * connection via `config.set`, and the extension persists it and reconnects with
+ * it. The form for pasting one by hand was the fallback for that handover
+ * failing, and it is gone.
  *
- * So the test here is about absence, and it is the only thing that would notice
- * the form creeping back: nothing else in this suite touches the popup's DOM.
+ * The first check is about that absence, and it is the only thing that would
+ * notice the form creeping back. The rest drive the export, because the bundle
+ * is a cross-language contract: the popup writes JSON that
+ * `cookiejar.LoadBundleFile` decodes, and a field spelled the page's way rather
+ * than the file's is invisible — it decodes to an empty string, not an error.
  *
  * These run after the socket tests because they read config through the popup's
  * own channel, which needs no socket.
@@ -747,8 +751,9 @@ await check('config.set with a new token replies, then reconnects', async () => 
 /**
  * A DOM just large enough to run the popup's own logic.
  *
- * It records which ids were asked for, because what the popup test asserts now
- * is what the script does *not* reach for.
+ * It records which ids were asked for, because one of the things asserted below
+ * is what the script does *not* reach for — and it can fire a click, so the
+ * export itself is exercised rather than merely inspected.
  */
 function makeDom() {
   const nodes = new Map();
@@ -778,6 +783,11 @@ function makeDom() {
       if (!handler) throw new Error(`no submit handler was registered on ${id}`);
       return handler({ preventDefault() {} });
     },
+    async click(id) {
+      const handler = listeners.get(`${id}:click`);
+      if (!handler) throw new Error(`no click handler was registered on ${id}`);
+      await handler({ preventDefault() {} });
+    },
   };
 }
 
@@ -786,8 +796,28 @@ Object.defineProperty(globalThis, 'document', {
   value: dom.document, configurable: true, writable: true,
 });
 
+// The popup writes the export through the clipboard API. Chrome provides it, so
+// the harness has to as well, or the handler throws before there is anything to
+// inspect.
+let clipboardText = null;
+globalThis.navigator.clipboard = {
+  writeText: async (text) => { clipboardText = text; },
+};
+
 await import(path.join(stage, 'popup.js'));
 await new Promise((resolve) => setTimeout(resolve, 20));
+
+/**
+ * Ask the worker through the popup's own channel.
+ *
+ * Deliberately not `call`, which goes over the socket: the socket is closed by
+ * the `config.set` case above, and the worker's `send` refuses to write on a
+ * socket that is not open — so a socket call made here never gets a reply and
+ * the whole run hangs rather than failing. The popup channel needs no socket,
+ * which is why the popup still works when the backend is down.
+ */
+const askWorker = (op, params) =>
+  chromeStub.runtime.sendMessage(params ? { op, params } : { op });
 
 await check('the popup exposes no bridge-token surface', async () => {
   // Every id the script touched while rendering. A form that came back would
@@ -802,6 +832,59 @@ await check('the popup exposes no bridge-token surface', async () => {
     () => dom.submit('tokenForm'),
     /no submit handler was registered on tokenForm/,
   );
+});
+
+await check('status reports the tab the bridge would act on', async () => {
+  // Read by the popup's own first paint and by the export below. A value that is
+  // only ever set as a side effect of some other op would leave both of them
+  // describing a browser that is not there, and the export would name no project.
+  const status = await askWorker('status');
+  assert.equal(status.tabUrl, FLOW_URL);
+  assert.equal(status.tabTitle, 'Flow');
+});
+
+await check('the popup copies a bundle cookiejar.LoadBundleFile can read', async () => {
+  await dom.click('copy');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(clipboardText, 'nothing reached the clipboard');
+  const bundle = JSON.parse(clipboardText);
+
+  // The top-level keys are cookiejar.Bundle's JSON tags and nothing else: a field
+  // the file does not have decodes to nothing, with no error anywhere.
+  assert.deepEqual(
+    Object.keys(bundle).sort(),
+    ['at', 'cookies', 'fingerprint', 'fsid', 'project_id'],
+  );
+
+  // The project comes from the tab the browser is on, which is what the tab
+  // reports — not the backend's answer, which is what it resolved at boot.
+  assert.equal(bundle.project_id, 'abc123');
+  assert.equal(bundle.at, 'at-value');
+  assert.equal(bundle.fsid, '-56329636');
+
+  // The identity is renamed on the way through: the page reports `brands` and
+  // `platformFull`, the file spells those `sec_ch_ua` and `platform`. Writing the
+  // page's names through unchanged is the failure this pins — every field would
+  // come back unset after a decode, with nothing to point at it.
+  assert.deepEqual(
+    Object.keys(bundle.fingerprint).sort(),
+    ['language', 'mobile', 'platform', 'sec_ch_ua', 'user_agent'],
+  );
+  assert.match(bundle.fingerprint.user_agent, /^Mozilla\/5\.0/);
+  assert.equal(bundle.fingerprint.sec_ch_ua, '"Chromium";v="140", "Google Chrome";v="140"');
+  assert.equal(bundle.fingerprint.platform, '"macOS"');
+  assert.equal(bundle.fingerprint.language, 'en-US');
+  assert.equal(bundle.fingerprint.mobile, '?0');
+
+  // And the cookies are cookiejar.Cookie's tags, values included — this is the
+  // credential, so a bundle that carried names without values would still parse.
+  assert.ok(bundle.cookies.length > 0, 'the bundle must carry the credential');
+  assert.deepEqual(Object.keys(bundle.cookies[0]).sort(), [
+    'domain', 'expirationDate', 'hostOnly', 'httpOnly', 'name', 'path',
+    'sameSite', 'secure', 'session', 'storeId', 'value',
+  ]);
+  assert.ok(bundle.cookies.some((c) => c.name === 'SAPISID'));
 });
 
 /* ------------------------------------------------------------------ *

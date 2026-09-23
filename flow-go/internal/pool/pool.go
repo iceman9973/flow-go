@@ -25,7 +25,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/flowapi"
+	"github.com/kodelyx/flow-go/flow-go/internal/recaptcha"
 )
 
 // State is a worker's availability.
@@ -118,6 +120,54 @@ type Worker struct {
 	// necessarily addressable by the other. Held behind the mutex because the
 	// engine sets it once at registration while generation reads it per job.
 	projectID string
+
+	// jar is this account's cookies, and captcha mints its reCAPTCHA tokens.
+	//
+	// Both are per worker for the same reason projectID is: they belong to the
+	// signed-in account rather than to the process. A generation routed to this
+	// worker has to open with this account's cookies and a token minted in the
+	// browser profile that is signed into it — a token minted under one profile
+	// and spent under another is rejected with no error at all, just an empty
+	// result, which is the failure mode this whole struct exists to avoid.
+	//
+	// Behind the mutex for the same reason as projectID: written once at
+	// registration, read per job.
+	jar     *cookiejar.Jar
+	captcha recaptcha.Provider
+}
+
+// SetJar records the cookies this account generates with.
+//
+// Call it before the worker is registered, alongside SetCreditsReader and
+// SetProjectID, so no job can be routed to a worker whose cookies are missing.
+func (w *Worker) SetJar(jar *cookiejar.Jar) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.jar = jar
+}
+
+// Jar returns this account's cookies, or nil when none were recorded.
+func (w *Worker) Jar() *cookiejar.Jar {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.jar
+}
+
+// SetCaptcha records the provider that mints this account's reCAPTCHA tokens.
+func (w *Worker) SetCaptcha(provider recaptcha.Provider) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.captcha = provider
+}
+
+// Captcha returns this account's token provider, or nil when none was recorded.
+//
+// A nil provider is not an error: it means this account has no way to mint one,
+// and the caller falls back the same way it does when the provider itself fails.
+func (w *Worker) Captcha() recaptcha.Provider {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.captcha
 }
 
 // NewWorker wraps a client.

@@ -43,6 +43,8 @@ func Run(args []string) int {
 		return runGenerate(args[1:])
 	case "image":
 		return runImage(args[1:])
+	case "batch-all":
+		return runBatchAll(args[1:])
 	case "projects":
 		return runProjects(args[1:])
 	case "stats":
@@ -84,6 +86,7 @@ COMMANDS
   doctor                Diagnose whether this machine can generate right now
   generate              Generate a video
   image                 Generate an image
+  batch-all             Generate one image per account in cookies/account_*.json
   projects              List the account's Flow projects
   stats                 Print database statistics
   export [file]         Export statistics as JSON
@@ -153,6 +156,13 @@ type commonFlags struct {
 	captcha   string
 	db        string
 	email     string
+	// cookies is an explicit cookie file to run as, e.g.
+	// `cookies/account_27b104997fa0.json`. Empty means the usual search.
+	//
+	// It is a flag rather than an env var because its whole purpose is to run
+	// one command as one named account, and a setting that persists would make
+	// the next command silently use the previous account.
+	cookies string
 	// at, fsid and fingerprint are the browser-derived values taken from a
 	// running server's session, and are not flags: they are short-lived client
 	// state, not something a caller should be typing.
@@ -162,6 +172,9 @@ type commonFlags struct {
 	// matters for any call that carries a reCAPTCHA token, because the token is
 	// checked against the client it was minted for.
 	fingerprint *flowapi.BrowserFingerprint
+	// jar is cookies adopted from a running server's session, held in memory. Not
+	// a flag: it is state this process took, not something a caller types.
+	jar *cookiejar.Jar
 }
 
 func (c *commonFlags) bind(fs *flag.FlagSet) {
@@ -170,6 +183,8 @@ func (c *commonFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.captcha, "captcha", "auto", "reCAPTCHA strategy: auto|broker|http|off")
 	fs.StringVar(&c.db, "db", "", "database path")
 	fs.StringVar(&c.email, "email", "", "account email, used as the OAuth login hint")
+	fs.StringVar(&c.cookies, "cookies", "",
+		"cookie file to run as, e.g. cookies/account_<key>.json (default: the usual search)")
 }
 
 func (c *commonFlags) build() (*app.App, error) {
@@ -181,6 +196,8 @@ func (c *commonFlags) build() (*app.App, error) {
 		AtToken:     c.at,
 		Fsid:        c.fsid,
 		Fingerprint: c.fingerprint,
+		CookieFile:  c.cookies,
+		Jar:         c.jar,
 	})
 }
 
@@ -203,6 +220,9 @@ type runningSession struct {
 	At          string
 	Fsid        string
 	Fingerprint *flowapi.BrowserFingerprint
+	// Jar is the snapshot's cookies, carried in memory. See adoptRunningSession
+	// for why they are not written to disk.
+	Jar *cookiejar.Jar
 }
 
 func adoptRunningSession(ctx context.Context) (runningSession, bool) {
@@ -245,12 +265,14 @@ func adoptRunningSession(ctx context.Context) (runningSession, bool) {
 		return runningSession{}, false
 	}
 
-	// Persist where the engine looks for it, so the bootstrap below picks it up
-	// without needing a new path through the engine.
+	// Handed back in memory rather than written to disk.
+	//
+	// This used to save to `cookies/cookies.json` "so the bootstrap below picks it
+	// up without needing a new path through the engine" — and that write is what
+	// made a shared cookie file dangerous: a CLI running alongside a server would
+	// replace the session file with its own snapshot, and every other reader then
+	// acted as the CLI's account. The snapshot travels in the struct now.
 	jar := cookiejar.FromCookies(snapshot.Cookies, "server session")
-	if err := jar.Save(filepath.Join(config.CookieDir(), "cookies.json")); err != nil {
-		return runningSession{}, false
-	}
 
 	// Say whether the fingerprint came across, because its absence is invisible
 	// later: the run still mints a token, still submits, and gets an empty result
@@ -267,6 +289,7 @@ func adoptRunningSession(ctx context.Context) (runningSession, bool) {
 		At:          snapshot.At,
 		Fsid:        snapshot.Fsid,
 		Fingerprint: snapshot.Fingerprint,
+		Jar:         jar,
 	}, true
 }
 
@@ -274,6 +297,15 @@ func adoptRunningSession(ctx context.Context) (runningSession, bool) {
 // caller set explicitly alone. Returns whether a session was adopted, so the caller
 // knows whether it still needs to look for a browser itself.
 func adoptSessionFor(ctx context.Context, common *commonFlags) bool {
+	// Nothing to adopt when the caller named a cookie file. Adopting a running
+	// server's session writes the snapshot to `cookies/cookies.json` on the way
+	// through, and a run told which account to be must not touch that file — nor
+	// take a project id from whichever account the server happens to be acting
+	// as, which is a different one by definition.
+	if common.cookies != "" {
+		return false
+	}
+
 	session, ok := adoptRunningSession(ctx)
 	if !ok {
 		return false
@@ -283,6 +315,7 @@ func adoptSessionFor(ctx context.Context, common *commonFlags) bool {
 	}
 	common.at, common.fsid = session.At, session.Fsid
 	common.fingerprint = session.Fingerprint
+	common.jar = session.Jar
 	return true
 }
 
@@ -714,6 +747,139 @@ func runStats(args []string) int {
 }
 
 /* ------------------------------------------------------------------ *
+ * batch-all
+ * ------------------------------------------------------------------ */
+
+// runBatchAll generates one image per account, one account at a time.
+//
+// Deliberately sequential, and deliberately one engine per account. These files
+// do not share a session — each `account_<key>.json` is a different signed-in
+// identity — so a single engine would have its cookies replaced by whichever
+// account booted last, and every image after the first would silently belong to
+// the wrong one. Opening an engine per file is what keeps them apart, and it is
+// also what makes the run forgiving: one account failing leaves the rest alone.
+//
+// The per-account plumbing is `--cookies`, which is why this needs no new
+// generation path — each iteration is an ordinary single-account run.
+func runBatchAll(args []string) int {
+	fs := flag.NewFlagSet("batch-all", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	prompt := fs.String("prompt", "", "prompt to generate (required)")
+	model := fs.String("model", "narwhal", "image model: narwhal|lite|pro")
+	download := fs.Bool("download", true, "write the results to output/")
+	_ = fs.Parse(args)
+
+	if strings.TrimSpace(*prompt) == "" {
+		fmt.Fprintln(os.Stderr, "batch-all: --prompt is required")
+		return 2
+	}
+
+	paths, err := engine.DiscoverAccountJars(config.CookieDir())
+	if err != nil {
+		return fail(fmt.Errorf("batch-all: list account cookie files: %w", err))
+	}
+	if len(paths) == 0 {
+		fmt.Fprintf(os.Stderr, "batch-all: no account_*.json in %s — run `flow-go serve` once "+
+			"with the extension attached so the bridge writes them\n", config.CookieDir())
+		return 1
+	}
+
+	ctx := context.Background()
+	fmt.Printf("\n  flow-go — batch-all over %d account(s)\n", len(paths))
+	fmt.Println("  " + strings.Repeat("-", 52))
+
+	var ok, skipped, failed int
+	for i, path := range paths {
+		fmt.Printf("  [%d/%d] %s\n", i+1, len(paths), filepath.Base(path))
+
+		// Checked here rather than left to the engine: a file with no credential
+		// cookie has no session to act as, and the failure it produces upstream
+		// reads like a server fault rather than like an unusable input.
+		jar, loadErr := cookiejar.LoadFile(path)
+		if loadErr != nil {
+			fmt.Printf("        skipped: %v\n", loadErr)
+			skipped++
+			continue
+		}
+		if !jar.HasAuthCookies() {
+			fmt.Printf("        skipped: no credential cookies in the file\n")
+			skipped++
+			continue
+		}
+
+		// Then the rest of what a run needs, which lives on the bundle. The two
+		// checks are split rather than folded into one `Complete()` because they
+		// say different things: a file with no credential cookie is a different
+		// mistake from one whose sync never had a Flow tab open, and an operator
+		// acts on them differently.
+		//
+		// Cookies alone cannot generate. Without the page tokens batchexecute has
+		// to prime for a token, and without the identity a captcha token is
+		// rejected with no error at all — both of which surface upstream as a
+		// server fault rather than as an unusable input. Skipping here names the
+		// real cause before a credit is spent on discovering it.
+		bundle, bundleErr := cookiejar.LoadBundleFile(path)
+		if bundleErr != nil {
+			fmt.Printf("        skipped: %v\n", bundleErr)
+			skipped++
+			continue
+		}
+		if !bundle.Complete() {
+			fmt.Printf("        skipped: bundle incomplete (missing tokens or fingerprint)\n")
+			skipped++
+			continue
+		}
+
+		perAccount := common
+		perAccount.cookies = path
+
+		a, buildErr := perAccount.build()
+		if buildErr != nil {
+			fmt.Printf("        failed to open: %v\n", buildErr)
+			failed++
+			continue
+		}
+
+		if bootErr := bootstrap(ctx, a); bootErr != nil {
+			fmt.Printf("        bootstrap failed: %v\n", bootErr)
+			_ = a.Close()
+			failed++
+			continue
+		}
+
+		outcome, genErr := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
+			Prompt:   *prompt,
+			Model:    *model,
+			Download: *download,
+		})
+		_ = a.Close()
+
+		if genErr != nil {
+			fmt.Printf("        FAILED: %v\n", genErr)
+			failed++
+			continue
+		}
+
+		ok++
+		if len(outcome.Files) == 0 {
+			fmt.Printf("        SUCCESS but nothing was downloaded (account %s)\n", outcome.AccountID)
+			continue
+		}
+		for _, file := range outcome.Files {
+			fmt.Printf("        SUCCESS -> %s (account %s)\n", file.Path, outcome.AccountID)
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("  %d succeeded, %d skipped, %d failed\n\n", ok, skipped, failed)
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
  * export
  * ------------------------------------------------------------------ */
 
@@ -785,7 +951,22 @@ func runCookies(args []string) int {
 	// would come to disagree.
 	candidates := cookieCandidates()
 
-	path, jar, _ := loadCookieJar()
+	// An explicit --cookies names the file, so this reports that one rather than
+	// whatever the default search would have found. Without this the flag looked
+	// honoured on every command except the one whose whole job is reading a jar.
+	var path string
+	var jar *cookiejar.Jar
+	if common.cookies != "" {
+		path = common.cookies
+		jar, _ = cookiejar.LoadFile(path)
+		if jar == nil {
+			fmt.Printf("  could not read --cookies %s\n", path)
+			fmt.Println()
+			return 1
+		}
+	} else {
+		path, jar, _ = loadCookieJar()
+	}
 
 	if path == "" {
 		fmt.Printf("  no cookies at %s\n", strings.Join(candidates, " or "))

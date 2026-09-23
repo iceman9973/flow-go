@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +77,16 @@ type Bridge struct {
 	// lastJar is the most recent cookie set pulled from the browser.
 	lastJar *cookiejar.Jar
 
+	// jars holds the most recent cookie set per connected extension, keyed by the
+	// client's address.
+	//
+	// `lastJar` is the account the engine acts as; this is what lets several
+	// browser profiles be attached at once without one overwriting another's
+	// cookies. An entry deliberately outlives its client: a profile whose browser
+	// has closed still has an account the engine can resolve and route to, which
+	// is the same reason `cookies.json` is written to disk at all.
+	jars map[string]*cookiejar.Jar
+
 	// cookieFile persists the last synced cookies so the engine can keep running
 	// after the browser closes, which is the whole point of syncing them.
 	cookieFile string
@@ -117,6 +129,7 @@ func NewBridge(targets, cookieDomains []string, dataDir string) *Bridge {
 		DataDir:        dataDir,
 		BlockedMethods: DefaultBlockedMethods,
 		clients:        make(map[string]*cdp.Client),
+		jars:           make(map[string]*cookiejar.Jar),
 		cookieFile:     filepath.Join(dataDir, "cookies.json"),
 	}
 }
@@ -369,16 +382,171 @@ func (b *Bridge) SyncCookies(ctx context.Context, client *cdp.Client) (*cookieja
 
 	b.mu.Lock()
 	b.lastJar = jar
+	b.jars[client.RemoteAddr] = jar
 	b.mu.Unlock()
 
-	if err := jar.Save(b.cookieFile); err != nil {
-		log.Printf("bridge: could not persist cookies: %v", err)
+	// Only ever per account.
+	//
+	// `cookies.json` used to be written here too, and it is what made a
+	// multi-profile setup incoherent: every profile wrote the same path, so it
+	// held whichever synced last, and a profile with an expired session
+	// connecting last would replace a working one with it. The account files are
+	// the source of truth now; `cookies.json` is still *read*, and only when no
+	// account file exists at all.
+	key := cookiejar.AccountKey(jar)
+	if key == "" {
+		// Nothing here identifies an account, so there is no file this could
+		// correctly be written to. Saying so beats inventing a name — a shared
+		// file is the thing being removed.
+		log.Printf("bridge: synced %d cookies (%d credential cookies, %d unrelated dropped) from %s, "+
+			"but none of them identify an account, so nothing was persisted",
+			jar.Count(), countAuth(jar), skipped, client.RemoteAddr)
+		return jar, nil
+	}
+
+	path := b.AccountCookieFile(key)
+	bundle := b.bundleFor(ctx, client, jar, path)
+	if err := bundle.Save(path); err != nil {
+		log.Printf("bridge: could not persist the account bundle for %s: %v", key, err)
 	} else {
-		log.Printf("bridge: synced %d cookies (%d credential cookies, %d unrelated dropped) to %s",
-			jar.Count(), countAuth(jar), skipped, b.cookieFile)
+		log.Printf("bridge: synced %d cookies (%d credential cookies, %d unrelated dropped) from %s to %s "+
+			"(project %q, page tokens %t, fingerprint %t)",
+			jar.Count(), countAuth(jar), skipped, client.RemoteAddr, path,
+			bundle.ProjectID, bundle.At != "" && bundle.Fsid != "", !bundle.Fingerprint.Empty())
 	}
 
 	return jar, nil
+}
+
+// bundleFor assembles the self-contained account file for one client.
+//
+// Everything here is best-effort except the cookies. A profile with no Flow tab
+// open has no fingerprint to read and no project in its tab URL, and that must
+// not stop the sync: the file is still worth writing, and a field that could not
+// be read is left exactly as the file already had it.
+//
+// That merge is the point of loading the existing bundle first. A project id in
+// particular is expensive to relearn — it takes an editor tab — so a sync that
+// happened to find no tab open must not blank the one already on record.
+func (b *Bridge) bundleFor(ctx context.Context, client *cdp.Client, jar *cookiejar.Jar, path string) *cookiejar.Bundle {
+	existing, _ := cookiejar.LoadBundleFile(path)
+
+	projectID := ""
+	if tab, err := client.CurrentTab(ctx); err == nil && tab != nil {
+		projectID = projectIDFromFlowURL(tab.URL)
+	}
+	at, fsid := pageTokensOf(ctx, client)
+
+	return mergeBundle(existing, jar.Cookies(), fingerprintOf(ctx, client), at, fsid, projectID)
+}
+
+// mergeBundle folds a fresh sync into what the file already holds.
+//
+// Only the cookies are replaced outright. Everything else is filled in when this
+// sync could read it and left exactly as it was when it could not, because a
+// profile with no Flow tab open reports no fingerprint, no page tokens and no
+// project in its URL — and a sync must not be able to blank what an earlier one
+// learned. A project id is the one that costs the most to get back: relearning it
+// takes an editor tab.
+func mergeBundle(existing *cookiejar.Bundle, cookies []cookiejar.Cookie,
+	fp *cookiejar.Fingerprint, at, fsid, projectID string) *cookiejar.Bundle {
+
+	bundle := existing
+	if bundle == nil {
+		bundle = &cookiejar.Bundle{}
+	}
+
+	bundle.Cookies = cookies
+
+	if !fp.Empty() {
+		bundle.Fingerprint = fp
+	}
+	if at != "" {
+		bundle.At = at
+	}
+	if fsid != "" {
+		bundle.Fsid = fsid
+	}
+	if bundle.ProjectID == "" {
+		bundle.ProjectID = projectID
+	}
+
+	return bundle
+}
+
+// fingerprintOf reads one client's browser identity, or nil when it cannot.
+//
+// Per client rather than through Bridge.Fingerprint, which reads whichever
+// client is current: writing one profile's identity into another profile's
+// bundle is the mismatch this whole area exists to avoid, since a captcha token
+// is only valid for the client it was minted for.
+func fingerprintOf(ctx context.Context, client *cdp.Client) *cookiejar.Fingerprint {
+	if client == nil || !client.Connected() {
+		return nil
+	}
+
+	raw, err := client.FlowFingerprint(ctx, fingerprintExpression)
+	if err != nil {
+		return nil
+	}
+	var fp Fingerprint
+	if err := json.Unmarshal(raw, &fp); err != nil || fp.UserAgent == "" {
+		return nil
+	}
+	return &cookiejar.Fingerprint{
+		UserAgent: fp.UserAgent,
+		SecChUa:   fp.Brands,
+		Platform:  fp.PlatformFull,
+		Language:  fp.Language,
+		Mobile:    fp.Mobile,
+	}
+}
+
+// pageTokensOf reads one client's batchexecute page tokens, which only a loaded
+// page has.
+func pageTokensOf(ctx context.Context, client *cdp.Client) (at, fsid string) {
+	if client == nil || !client.Connected() {
+		return "", ""
+	}
+
+	raw, err := client.FlowAt(ctx, "")
+	if err != nil {
+		return "", ""
+	}
+	var out struct {
+		At   string `json:"at"`
+		Fsid string `json:"fsid"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", ""
+	}
+	return out.At, out.Fsid
+}
+
+// AccountCookieFile is where one account's cookies are kept.
+//
+// Named after the account's own identity rather than a sequential slot, so
+// re-syncing updates the file that account already has instead of allocating a
+// new one — which is the property that matters, and the one a slot number only
+// has if something else remembers which slot belongs to whom.
+// `discoverAccountJars` reads exactly this shape.
+func (b *Bridge) AccountCookieFile(key string) string {
+	return filepath.Join(filepath.Dir(b.cookieFile), "account_"+key+".json")
+}
+
+// JarFor returns the most recent cookies synced from one connected extension, or
+// nil when that client has never synced.
+//
+// This is what lets each attached profile be resolved as its own account: the
+// engine asks for the jar belonging to a specific client rather than for "the"
+// jar, which is only ever whichever synced last.
+func (b *Bridge) JarFor(client *cdp.Client) *cookiejar.Jar {
+	if client == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.jars[client.RemoteAddr]
 }
 
 func countAuth(jar *cookiejar.Jar) int {
@@ -394,8 +562,13 @@ func countAuth(jar *cookiejar.Jar) int {
 	return n
 }
 
-// Jar returns the most recently synced cookies, falling back to the persisted
-// copy so the engine works with the browser closed.
+// Jar returns the most recently synced cookies, falling back to a persisted copy
+// so the engine works with the browser closed.
+//
+// The fallback order is the account files first and `cookies.json` last. That
+// file is no longer written — see SyncCookies — so preferring it would mean a
+// browserless run acted as whatever stale session had been left there rather
+// than as one of the accounts the bridge is actually keeping.
 func (b *Bridge) Jar() *cookiejar.Jar {
 	b.mu.RLock()
 	if b.lastJar != nil {
@@ -405,10 +578,61 @@ func (b *Bridge) Jar() *cookiejar.Jar {
 	}
 	b.mu.RUnlock()
 
-	if jar, err := cookiejar.LoadFile(b.cookieFile); err == nil {
+	if jar := b.firstPersistedJar(); jar != nil {
 		b.mu.Lock()
 		b.lastJar = jar
 		b.mu.Unlock()
+		return jar
+	}
+	return nil
+}
+
+// firstPersistedJar loads the freshest usable account file, falling back to the
+// legacy shared file only when there is none.
+//
+// Newest first, matching discoverAccountJars: these files are sync outputs, so
+// the most recently written one is the account that was last actually working
+// and therefore the one most likely to still have a live session. Name order is
+// stable but arbitrary, and with several profiles it can settle on an account
+// whose session expired days ago.
+func (b *Bridge) firstPersistedJar() *cookiejar.Jar {
+	dir := filepath.Dir(b.cookieFile)
+
+	if entries, err := os.ReadDir(dir); err == nil {
+		type candidate struct {
+			name     string
+			modified time.Time
+		}
+		var found []candidate
+
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasPrefix(name, "account_") || !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			found = append(found, candidate{name: name, modified: info.ModTime()})
+		}
+
+		sort.Slice(found, func(i, j int) bool {
+			if found[i].modified.Equal(found[j].modified) {
+				return found[i].name < found[j].name
+			}
+			return found[i].modified.After(found[j].modified)
+		})
+
+		for _, c := range found {
+			jar, err := cookiejar.LoadFile(filepath.Join(dir, c.name))
+			if err == nil && jar.Count() > 0 {
+				return jar
+			}
+		}
+	}
+
+	if jar, err := cookiejar.LoadFile(b.cookieFile); err == nil {
 		return jar
 	}
 	return nil

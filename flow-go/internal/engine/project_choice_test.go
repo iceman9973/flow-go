@@ -3,12 +3,13 @@ package engine
 import "testing"
 
 // The ranking exists because the sources are not interchangeable: two are
-// instructions, two are discovery, and only one of the discovery routes drives a
-// browser.
+// instructions, one is a remembered answer, and only one of the discovery routes
+// drives a browser.
+
 func TestChooseProjectIDRanksExplicitOverEverything(t *testing.T) {
 	rpcAsked, browserAsked := false, false
 
-	id, source := chooseProjectID("explicit-id", "configured-id",
+	id, source := chooseProjectID("explicit-id", "bundle-id", "configured-id",
 		func() string { rpcAsked = true; return "from-rpc" },
 		func() string { browserAsked = true; return "from-browser" })
 
@@ -25,10 +26,15 @@ func TestChooseProjectIDRanksExplicitOverEverything(t *testing.T) {
 
 // The point of FLOW_PROJECT_ID: a configured project means nothing is searched
 // for, so no tab is navigated.
+//
+// A bundle is passed here deliberately. It is a remembered value, and a
+// remembered value goes stale — a project belongs to one signed-in account, and
+// one from another account does not open — so an operator's instruction for this
+// run has to outrank a leftover from the last one.
 func TestChooseProjectIDSkipsEverySearchWhenConfigured(t *testing.T) {
 	rpcAsked, browserAsked := false, false
 
-	id, source := chooseProjectID("", "configured-id",
+	id, source := chooseProjectID("", "bundle-id", "configured-id",
 		func() string { rpcAsked = true; return "from-rpc" },
 		func() string { browserAsked = true; return "from-browser" })
 
@@ -43,12 +49,33 @@ func TestChooseProjectIDSkipsEverySearchWhenConfigured(t *testing.T) {
 	}
 }
 
+// TestChooseProjectIDUsesTheBundleWithoutAsking is what the bundle is for: a
+// project the account file already recorded should cost neither a round trip nor
+// a tab navigation.
+func TestChooseProjectIDUsesTheBundleWithoutAsking(t *testing.T) {
+	rpcAsked, browserAsked := false, false
+
+	id, source := chooseProjectID("", "bundle-id", "",
+		func() string { rpcAsked = true; return "from-rpc" },
+		func() string { browserAsked = true; return "from-browser" })
+
+	if id != "bundle-id" {
+		t.Fatalf("id = %q, want the one the file recorded", id)
+	}
+	if source != projectSourceBundle {
+		t.Fatalf("source = %q, want %q", source, projectSourceBundle)
+	}
+	if rpcAsked || browserAsked {
+		t.Fatal("a source was consulted even though the account file answered")
+	}
+}
+
 // The listing is live truth and costs an HTTP call, so it is preferred over the
 // navigation — and the browser must not be reached once it has answered.
 func TestChooseProjectIDPrefersTheListingOverTheBrowser(t *testing.T) {
 	browserAsked := false
 
-	id, source := chooseProjectID("", "",
+	id, source := chooseProjectID("", "", "",
 		func() string { return "from-rpc" },
 		func() string { browserAsked = true; return "from-browser" })
 
@@ -66,7 +93,7 @@ func TestChooseProjectIDPrefersTheListingOverTheBrowser(t *testing.T) {
 // A rejected listing still has to fall through, or a transport problem would
 // take the browser route away with it.
 func TestChooseProjectIDFallsBackToTheBrowserWhenTheListingFails(t *testing.T) {
-	id, source := chooseProjectID("", "",
+	id, source := chooseProjectID("", "", "",
 		func() string { return "" },
 		func() string { return "from-browser" })
 
@@ -84,7 +111,7 @@ func TestChooseProjectIDReportsNothingWhenEverySourceIsEmpty(t *testing.T) {
 		"browser said no":   func() string { return "" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			id, source := chooseProjectID("", "", func() string { return "" }, ask)
+			id, source := chooseProjectID("", "", "", func() string { return "" }, ask)
 
 			if id != "" {
 				t.Fatalf("id = %q, want empty", id)

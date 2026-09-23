@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // A dump is named `account_<id>.json` and nothing else in the directory counts.
@@ -73,13 +74,27 @@ func TestDiscoverAccountJars(t *testing.T) {
 		// Everything the real cookie directory holds, none of which is a dump.
 		"cookies.json", "fingerprint.json", "page-tokens.json",
 		"bridge-token", "bridge-token.claimed",
-		// The dumps, deliberately written out of order.
-		"account_zeta.json", "account_alpha.json", "account_mid.json",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
+
+	// The dumps, with their mtimes set explicitly rather than left to whatever
+	// the filesystem produced. That is what makes "newest first" something this
+	// test states, instead of a coincidence of the order they were created in.
+	base := time.Now().Add(-time.Hour)
+	for i, name := range []string{"account_zeta.json", "account_alpha.json", "account_mid.json"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		when := base.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatalf("chtimes %s: %v", name, err)
+		}
+	}
+
 	if err := os.Mkdir(filepath.Join(dir, "account_dir.json"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -98,15 +113,44 @@ func TestDiscoverAccountJars(t *testing.T) {
 		if filepath.Base(d.Path) != "account_"+d.Label+".json" {
 			t.Errorf("dump %q has path %q, which does not name it", d.Label, d.Path)
 		}
+		if d.Modified.IsZero() {
+			t.Errorf("dump %q has no modification time, so it cannot be ordered", d.Label)
+		}
 	}
 
-	want := []string{"alpha", "mid", "zeta"}
+	// Newest first: mid was written last, then alpha, then zeta.
+	want := []string{"mid", "alpha", "zeta"}
 	if len(labels) != len(want) {
 		t.Fatalf("labels = %v, want %v — three dumps and nothing else", labels, want)
 	}
 	for i := range want {
 		if labels[i] != want[i] {
-			t.Fatalf("labels = %v, want %v", labels, want)
+			t.Fatalf("labels = %v, want %v (newest first)", labels, want)
 		}
+	}
+}
+
+// TestDiscoverAccountJarsBreaksTiesByName keeps the order total: two files
+// written in the same instant must not come back in an order that depends on
+// whatever the directory reader happened to return.
+func TestDiscoverAccountJarsBreaksTiesByName(t *testing.T) {
+	dir := t.TempDir()
+	when := time.Now().Add(-time.Hour)
+	for _, name := range []string{"account_bbb.json", "account_aaa.json"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatalf("chtimes %s: %v", name, err)
+		}
+	}
+
+	dumps, err := discoverAccountJars(dir)
+	if err != nil {
+		t.Fatalf("discoverAccountJars: %v", err)
+	}
+	if len(dumps) != 2 || dumps[0].Label != "aaa" || dumps[1].Label != "bbb" {
+		t.Fatalf("dumps = %v, want aaa then bbb", dumps)
 	}
 }

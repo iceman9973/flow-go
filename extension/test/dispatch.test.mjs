@@ -156,6 +156,55 @@ let workerOnMessage = null;
 // way to exercise it is to fire the event Chrome would have fired.
 let cookiesOnChanged = null;
 
+// The idle-close lifecycle is only observable through the alarm, so the stub
+// records what was armed and lets a test fire it. The tab is not closed when the
+// countdown is armed — it is closed when the alarm goes off, which is two
+// minutes later in Chrome and a direct call here.
+const armedAlarms = new Map();
+
+// Every alarm name armed, in order. A count is what distinguishes "the countdown
+// was restarted by a later dispatch" from "the countdown was never cleared" —
+// the map above cannot tell those apart, because arming the same name twice
+// leaves one entry either way.
+const alarmCreations = [];
+
+let alarmsOnAlarm = null;
+
+// Every tab this run removed. Recorded so a test can tell "closed the tab it
+// created" from "closed something else" — and both from "closed nothing", which
+// is the failure the safety rule exists to prevent.
+const removedTabs = [];
+
+// The worker's tabs.onRemoved listener, so a test can simulate the user closing
+// a tab by hand.
+let tabsOnRemoved = null;
+
+// Distinct ids for created tabs. The single hardcoded 99 this used to return was
+// fine while nothing created two tabs in one run; the idle-close tests do.
+let nextTabId = 100;
+
+// Every tab id this run created, in order. The single-flight check counts these:
+// two concurrent callers must produce one tab between them, not two.
+const createdTabIds = [];
+
+// A hook that runs inside `tabs.create`, while the dispatch that called it is
+// still in flight. It exists for one assertion — that an idle alarm arriving
+// mid-operation defers instead of closing — which is otherwise unreachable: the
+// in-flight count is internal, and the honest alternative is a test that waits
+// out a real 45-second operation.
+let duringTabCreate = null;
+
+// When non-zero, a created tab starts at `about:blank` and reaches its target
+// URL this many milliseconds later. That models what Chrome actually reports:
+// a tab exists before it has navigated, and `listScopedTabs` filters on the URL
+// — so for a moment the tab is open but not *in scope*.
+//
+// Without it the duplicate-tab race cannot be reproduced at all, because the
+// stub hands back a tab that is already in scope and every later caller finds
+// it. That is exactly how the first version of the single-flight check passed
+// against a build with no lock in it.
+let loadingTab = 0;
+
 const chromeStub = {
   runtime: {
     getManifest: () => ({ version: '1.0.0' }),
@@ -174,7 +223,11 @@ const chromeStub = {
         workerOnMessage(msg, {}, (reply) => resolve(reply));
       }),
   },
-  alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
+  alarms: {
+    create: (name, info) => { armedAlarms.set(name, info); alarmCreations.push(name); },
+    clear: async (name) => { armedAlarms.delete(name); return true; },
+    onAlarm: { addListener: (fn) => { alarmsOnAlarm = fn; } },
+  },
   action: {
     setBadgeText: async ({ text }) => { badgeText = text; },
     setBadgeBackgroundColor: async () => {},
@@ -194,8 +247,21 @@ const chromeStub = {
       return tab;
     },
     create: async ({ url }) => {
-      const tab = { id: 99, url, title: 'New' };
+      const tab = { id: nextTabId++, url: loadingTab ? 'about:blank' : url, title: 'New' };
       tabs.push(tab);
+      createdTabIds.push(tab.id);
+
+      if (loadingTab) {
+        // The navigation lands a moment later, as it does in a browser. The tab
+        // is in `tabs` the whole time and out of *scope* until then.
+        setTimeout(() => { tab.url = url; }, loadingTab);
+      }
+
+      if (duringTabCreate) {
+        const fn = duringTabCreate;
+        duringTabCreate = null;
+        await fn();
+      }
       return tab;
     },
     update: async (id, { url }) => {
@@ -203,6 +269,15 @@ const chromeStub = {
       tab.url = url;
       return tab;
     },
+    // Throws for an unknown id, as Chrome does, so `closeIdleFlowTab`'s catch is
+    // reached by the real path rather than being dead code.
+    remove: async (id) => {
+      const at = tabs.findIndex((t) => t.id === id);
+      if (at === -1) throw new Error(`No tab ${id}`);
+      removedTabs.push(id);
+      tabs.splice(at, 1);
+    },
+    onRemoved: { addListener: (fn) => { tabsOnRemoved = fn; } },
   },
   cookies: {
     onChanged: {
@@ -841,6 +916,254 @@ await check('status reports the tab the bridge would act on', async () => {
   const status = await askWorker('status');
   assert.equal(status.tabUrl, FLOW_URL);
   assert.equal(status.tabTitle, 'Flow');
+});
+
+/* ------------------------------------------------------------------ *
+ * The auto-created tab's lifecycle
+ *
+ * A tab the backend needed once should not sit in the browser for good, and a
+ * tab the user opened must never be touched. Both halves are asserted here,
+ * because only one of them shows up in normal use: a feature that closes the
+ * wrong tab looks exactly like one that works, right up until it takes a tab
+ * someone was using.
+ *
+ * The alarm is the seam. The tab is not closed when the countdown is armed, it
+ * is closed when the alarm fires — two minutes later in Chrome, and a direct
+ * call here.
+ *
+ * Every op below goes through `askWorker` rather than `call`. The socket is
+ * closed by the `config.set` case above and the worker refuses to write on a
+ * socket that is not open, so a socket call made here never gets a reply and the
+ * run hangs instead of failing — which is what these did when first written.
+ * ------------------------------------------------------------------ */
+
+/** The popup channel, with an error reply turned into a throw. */
+const ask = async (op, params) => {
+  const reply = await askWorker(op, params);
+  if (!reply?.ok) throw new Error(`${op}: ${reply?.error?.message || 'no reply'}`);
+  return reply;
+};
+
+await check('tabs.open reports the tab it created, then the idle alarm closes it', async () => {
+  const opened = await ask('tabs.open', { url: FLOW_URL });
+
+  // The shape the backend decodes. Nothing asserted it before this, even though
+  // `tabs.open` is on the pinned bridge's surface.
+  assert.deepEqual(Object.keys(opened).sort(), ['ok', 'tabId', 'title', 'url']);
+  assert.equal(opened.url, FLOW_URL);
+  assert.equal(typeof opened.tabId, 'number');
+
+  assert.ok(
+    armedAlarms.has('closeIdleFlowTab'),
+    'opening a tab for ourselves must arm the idle countdown',
+  );
+  assert.equal(armedAlarms.get('closeIdleFlowTab').delayInMinutes, 2);
+
+  // Arming is not closing. The tab has to survive until the alarm actually goes
+  // off, or a generation would lose the tab it is running in.
+  assert.deepEqual(removedTabs, [], 'nothing may be closed while the countdown is merely armed');
+  assert.ok(tabs.some((t) => t.id === opened.tabId));
+
+  await alarmsOnAlarm({ name: 'closeIdleFlowTab' });
+
+  assert.deepEqual(removedTabs, [opened.tabId], 'the idle alarm should close the tab it opened');
+  assert.equal(
+    tabs.some((t) => t.id === opened.tabId),
+    false,
+    'the tab should be gone from the browser',
+  );
+  assert.ok(!armedAlarms.has('closeIdleFlowTab'), 'the countdown should clear once it has fired');
+});
+
+await check('a tab the user opened is never armed and never closed', async () => {
+  // Tab 1 is the Flow tab the harness already had open — the user's, not ours.
+  // Resolving it must not adopt it as something we are allowed to close.
+  const attached = await ask('tab.attach', { tabId: 1 });
+  assert.equal(attached.tabId, 1);
+
+  assert.ok(
+    !armedAlarms.has('closeIdleFlowTab'),
+    'attaching to a tab the user opened must not arm the close countdown',
+  );
+
+  const before = removedTabs.length;
+  await alarmsOnAlarm({ name: 'closeIdleFlowTab' });
+
+  assert.equal(removedTabs.length, before, 'an idle alarm must never close a user tab');
+  assert.ok(tabs.some((t) => t.id === 1), "the user's tab must still be there");
+});
+
+await check('every dispatch restarts the idle countdown', async () => {
+  const armedCount = () => alarmCreations.filter((n) => n === 'closeIdleFlowTab').length;
+
+  await ask('tabs.open', { url: FLOW_URL });
+  const afterOpen = armedCount();
+
+  // A later op must re-arm it. In Chrome `alarms.create` on an existing name
+  // replaces the pending alarm, so this is what restarts the two minutes and
+  // keeps a tab alive across a run.
+  await ask('ping');
+  assert.equal(
+    armedCount(),
+    afterOpen + 1,
+    'a dispatch must restart the countdown, or a long run loses its tab mid-job',
+  );
+
+  await alarmsOnAlarm({ name: 'closeIdleFlowTab' }); // leave nothing armed for the next test
+});
+
+await check('an idle alarm during an operation defers instead of closing', async () => {
+  const first = await ask('tabs.open', { url: FLOW_URL });
+
+  // Fire the alarm from inside the next dispatch, while it is still in flight.
+  // This is the only way to reach the deferral: the in-flight count is internal,
+  // and the honest alternative is a test that waits out a real 45-second op.
+  let fired = 0;
+  duringTabCreate = async () => {
+    fired += 1;
+    await alarmsOnAlarm({ name: 'closeIdleFlowTab' });
+  };
+  await ask('tabs.open', { url: FLOW_URL });
+  duringTabCreate = null;
+
+  assert.equal(fired, 1, 'the fixture never interleaved, so this asserts nothing');
+  assert.ok(
+    tabs.some((t) => t.id === first.tabId),
+    'a tab must not be closed while an operation is still using one',
+  );
+  assert.ok(
+    armedAlarms.has('closeIdleFlowTab'),
+    'the countdown must be rescheduled rather than dropped, or the tab is never reclaimed',
+  );
+
+  await alarmsOnAlarm({ name: 'closeIdleFlowTab' }); // leave nothing armed for the next test
+});
+
+await check('closing the auto-created tab by hand clears the countdown', async () => {
+  const opened = await ask('tabs.open', { url: FLOW_URL });
+  assert.ok(armedAlarms.has('closeIdleFlowTab'));
+
+  // The user closes it themselves. Chrome removes the tab and fires the event —
+  // the array is spliced here rather than through `tabs.remove`, because
+  // `removedTabs` records what the *worker* removed and this must not count.
+  tabs.splice(tabs.findIndex((t) => t.id === opened.tabId), 1);
+  tabsOnRemoved(opened.tabId);
+
+  assert.ok(
+    !armedAlarms.has('closeIdleFlowTab'),
+    'a countdown left armed for a closed tab would fire against an id Chrome has released',
+  );
+
+  const before = removedTabs.length;
+  await alarmsOnAlarm({ name: 'closeIdleFlowTab' });
+  assert.equal(removedTabs.length, before, 'a cleared countdown must close nothing');
+});
+
+/* ------------------------------------------------------------------ *
+ * Single-flight tab resolution
+ *
+ * A generation starts several backend calls at once and each asks for a tab. If
+ * they are allowed to interleave, more than one finds the scope empty and the
+ * user gets duplicate Flow tabs side by side.
+ *
+ * `duringTabCreate` is what makes this deterministic: it runs while the first
+ * caller is inside `chrome.tabs.create`, which is exactly the window the bug
+ * needs — a second caller arriving with a tab under construction and the scope
+ * still looking empty.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Run `fn` with only `keep` in the tab scope, restoring the fixture afterwards.
+ *
+ * Resolution creates a tab only when the scope is empty, and the fixture starts
+ * with the user's Flow tab in it — so a check that needs a creation has to clear
+ * the scope first, and put it back so the popup checks below still find a tab to
+ * name the project from.
+ */
+async function withScopeOnly(keep, fn) {
+  await ask('tab.detach');
+  const saved = tabs.splice(0, tabs.length);
+  tabs.push(...keep);
+  try {
+    return await fn();
+  } finally {
+    tabs.splice(0, tabs.length);
+    tabs.push(...saved);
+  }
+}
+
+await check('concurrent callers share one tab creation', async () => {
+  await withScopeOnly([], async () => {
+    const before = createdTabIds.length;
+
+    // The tab is created and pushed, but has not navigated yet — open, and not
+    // in scope. This is the window the duplicate-tab bug lives in, and without
+    // modelling it the check passes against a build with no lock at all.
+    loadingTab = 30;
+    let concurrent = null;
+    duringTabCreate = () => {
+      // A second caller arrives mid-creation. It must join the flight rather
+      // than start one of its own — this is the duplicate-tab bug, exactly.
+      concurrent = ask('tab.attach', {});
+    };
+
+    try {
+      const first = await ask('tab.attach', {});
+      const second = await concurrent;
+
+      assert.equal(
+        createdTabIds.length - before,
+        1,
+        `two concurrent callers created ${createdTabIds.length - before} tabs, want 1`,
+      );
+      assert.equal(first.tabId, second.tabId, 'both callers must be handed the same tab');
+    } finally {
+      duringTabCreate = null;
+      loadingTab = 0;
+      await alarmsOnAlarm({ name: 'closeIdleFlowTab' }); // leave nothing armed
+    }
+  });
+});
+
+await check('a caller that names a tab is not folded into the flight', async () => {
+  await withScopeOnly([], async () => {
+    let named = null;
+    duringTabCreate = () => {
+      // The user opens a Flow tab at this exact moment, and a caller names it.
+      // A named request is a specific ask, not "find me a tab", so it must get
+      // what it asked for rather than whatever the flight settles on.
+      tabs.push({ id: 1, url: FLOW_URL, title: 'Flow' });
+      named = ask('tab.attach', { tabId: 1 });
+    };
+
+    const created = await ask('tab.attach', {});
+    const explicit = await named;
+    duringTabCreate = null;
+
+    assert.equal(explicit.tabId, 1, 'the named tab must win over the flight');
+    assert.notEqual(created.tabId, 1, 'the nameless caller should have created its own');
+
+    await alarmsOnAlarm({ name: 'closeIdleFlowTab' }); // leave nothing armed
+  });
+});
+
+await check('the flight is released once it settles', async () => {
+  await withScopeOnly([], async () => {
+    const first = await ask('tab.attach', {});
+
+    // The tab goes away — closed by the user, or crashed. A lock that was never
+    // cleared would keep handing this dead tab to every later caller, and the
+    // extension would stop opening tabs for good: a stuck lock is worse than the
+    // duplicate it prevents.
+    tabs.splice(tabs.findIndex((t) => t.id === first.tabId), 1);
+    tabsOnRemoved(first.tabId);
+
+    const second = await ask('tab.attach', {});
+    assert.notEqual(second.tabId, first.tabId, 'a settled flight must not be reused');
+    assert.ok(tabs.some((t) => t.id === second.tabId), 'the second caller should have a live tab');
+
+    await alarmsOnAlarm({ name: 'closeIdleFlowTab' }); // leave nothing armed
+  });
 });
 
 await check('the popup copies a bundle cookiejar.LoadBundleFile can read', async () => {

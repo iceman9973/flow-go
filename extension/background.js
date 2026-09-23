@@ -43,6 +43,38 @@ let reconnectTimer = null;
 let attachedTabId = null;
 let config = null;
 
+// The tab this extension opened for itself, and nothing else.
+//
+// The backend asks for a tab when it needs project discovery or a captcha mint,
+// and `resolveTab` opens one when none is in scope. Those tabs used to stay in
+// the browser for good. This is the id of the one tab we are allowed to close —
+// which is what gives the idle timer something to close, and, more importantly,
+// what makes it structurally unable to close a tab the user opened.
+//
+// It is a tab *id* rather than a flag, and that distinction earns its keep:
+// `attachedTabId` can move on to one of the user's tabs while ours is still
+// open, and ours should still be reclaimed.
+let autoCreatedTabId = null;
+
+// How many operations are being handled right now.
+//
+// The idle countdown is restarted when a dispatch begins, which covers a burst
+// of quick commands. It does not cover one slow one: `tabs.open` and `resolveTab`
+// each wait up to 45s for a tab to reach its target, and a captcha mint waits on
+// the page. A timer firing in the middle of either would close the tab out from
+// under the operation using it, so the close is deferred while anything is in
+// flight — and rescheduled rather than dropped, so the tab is still reclaimed
+// once the work finishes.
+let inFlightOps = 0;
+
+// The tab resolution currently in flight, if any. See `resolveTab`.
+//
+// A generation starts several backend calls at once — project discovery, the
+// identity check, the captcha probe — and each asks for a tab. They arrive
+// close enough together that more than one can find the scope empty, so without
+// this they each open a tab and the user gets duplicates side by side.
+let tabResolvingPromise = null;
+
 // A 500-entry event buffer used to live here, and `events.read` drained it. It is
 // gone: nothing ever pushed into it, because observing page navigations would need
 // the webNavigation permission and that buys a diagnostic rather than a capability
@@ -224,11 +256,61 @@ async function currentScopedTab() {
   return scoped.length > 0 ? scoped[0] : null;
 }
 
+/**
+ * The tab the bridge should act on, opening one if nothing is in scope.
+ *
+ * **Single-flight.** A generation starts several backend calls at once — project
+ * discovery, the identity check, the captcha probe — and each of them asks for a
+ * tab. Without a lock they interleave like this:
+ *
+ *   1. Call 1 finds nothing in scope and creates a tab.
+ *   2. Call 2 asks `listScopedTabs()` while that tab is still navigating, so it
+ *      is not in scope *yet* and the listing does not include it.
+ *   3. Call 2 creates a second tab.
+ *
+ * Two Flow tabs side by side, from one command. The lock makes every caller
+ * after the first wait on the same resolution, so there is one creation per
+ * flight and the rest share its answer.
+ *
+ * Note what makes this sufficient rather than merely helpful: `waitForTab`
+ * resolves only once the new tab's URL is inside the scope, and `listScopedTabs`
+ * filters on exactly that predicate. So by the time the flight settles the tab
+ * is visible to the next listing, and a later caller finds it instead of
+ * creating another.
+ *
+ * A caller that *named* a tab is exempt. `tabId` is a specific request rather
+ * than "find me a tab", and folding it into the flight would hand it whichever
+ * tab the flight happened to settle on.
+ */
 async function resolveTab(tabId = null) {
   if (tabId) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab && urlAllowed(tab.url, await ensureConfig())) return tab;
   }
+
+  if (tabResolvingPromise) return tabResolvingPromise;
+
+  tabResolvingPromise = _resolveTabInternal();
+  try {
+    return await tabResolvingPromise;
+  } finally {
+    // Cleared by the owner of the flight, never by a waiter. A waiter clearing
+    // this would let a third caller open a second flight while the first was
+    // still resolving — which is the duplicate this lock exists to prevent,
+    // arriving by a new route.
+    tabResolvingPromise = null;
+  }
+}
+
+/**
+ * The body of `resolveTab`, run at most once at a time.
+ *
+ * Kept separate so the lock above stays small enough to read at a glance.
+ * Everything that can create a tab lives in here, which is what makes "one
+ * creation per flight" a property of the structure rather than of a check
+ * somebody has to remember to keep.
+ */
+async function _resolveTabInternal() {
   if (attachedTabId !== null) {
     const tab = await chrome.tabs.get(attachedTabId).catch(() => null);
     if (tab && urlAllowed(tab.url, await ensureConfig())) return tab;
@@ -242,7 +324,14 @@ async function resolveTab(tabId = null) {
   const target = (cfg.targetUrlPrefixes || [])[0];
   if (!target) throw new Error('No tab inside the configured scope is open, and no target to open');
 
+  // Ours to close. This is the only branch in this function that *created* a
+  // tab — every path above returns one that was already open, so the countdown
+  // is never armed for a tab the user made. Arming it here, and not after the
+  // wait, also means a tab that never finishes loading is still reclaimed.
   const created = await chrome.tabs.create({ url: target, active: false });
+  autoCreatedTabId = created.id;
+  scheduleAutoTabClose();
+
   await waitForTab(created.id, (t) => urlAllowed(t.url, cfg), 45000, target);
   return chrome.tabs.get(created.id);
 }
@@ -268,6 +357,77 @@ async function waitForTab(tabId, predicate, timeoutMs = 45000, what = 'The tab')
     await sleep(250);
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * The auto-created tab's lifecycle
+ *
+ * A tab the backend needed once should not sit in the browser for good, and a
+ * tab the user opened must never be touched. `autoCreatedTabId` is the whole of
+ * that distinction: it is set only where this extension called
+ * `chrome.tabs.create`, and never on a path that found an already-open tab. The
+ * close below therefore cannot reach a tab the user made.
+ * ------------------------------------------------------------------ */
+
+const AUTO_CLOSE_ALARM = 'closeIdleFlowTab';
+
+/**
+ * Restart the two-minute idle countdown.
+ *
+ * Called where an auto-created tab appears and at the top of every dispatch, so
+ * the countdown restarts while work is happening and only expires once nothing
+ * has been asked of this extension for two minutes.
+ *
+ * A no-op when there is no auto-created tab. Arming the alarm anyway would leave
+ * a timer running that can only ever do nothing, and it would fire against
+ * whatever id Chrome had handed out next.
+ */
+function scheduleAutoTabClose() {
+  if (autoCreatedTabId !== null) {
+    chrome.alarms.create(AUTO_CLOSE_ALARM, { delayInMinutes: 2 });
+  }
+}
+
+/**
+ * Close the auto-created tab, if it is still ours and still idle.
+ *
+ * Two guards, and both matter. `autoCreatedTabId === null` means there is
+ * nothing we are allowed to close. `inFlightOps > 0` means an operation is using
+ * a tab right now, so the countdown is restarted instead of closing — a dispatch
+ * that outlives the delay must not have its tab pulled out from under it.
+ */
+async function closeIdleFlowTab() {
+  if (autoCreatedTabId === null) return;
+
+  if (inFlightOps > 0) {
+    scheduleAutoTabClose();
+    return;
+  }
+
+  const tabId = autoCreatedTabId;
+  autoCreatedTabId = null;
+  chrome.alarms.clear(AUTO_CLOSE_ALARM);
+
+  // Detach before removing: the tab is about to stop existing, and an attached
+  // id that outlives its tab makes `tab.current` answer null for a tab the
+  // backend still believes it is holding.
+  if (attachedTabId === tabId) detach();
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+    /* Already closed — by the user, or by an earlier run of this timer. */
+  }
+}
+
+// A tab closed by hand must not leave the countdown armed for an id Chrome has
+// already released. Without this the alarm would fire on a dead id, and in the
+// worst case Chrome would have handed that number to a different tab by then.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === autoCreatedTabId) {
+    autoCreatedTabId = null;
+    chrome.alarms.clear(AUTO_CLOSE_ALARM);
+  }
+});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -361,7 +521,31 @@ async function mintCaptcha(siteKey, action) {
  * Operations
  * ------------------------------------------------------------------ */
 
+/**
+ * The entry point every caller goes through — the socket, and the popup's
+ * runtime message — so neither has to remember to keep the idle countdown alive.
+ *
+ * The counter is what makes refreshing here sufficient. Refreshing on entry
+ * alone covers a burst of quick commands but not one that outlives the
+ * two-minute delay, and `closeIdleFlowTab` reads this counter to defer rather
+ * than close while anything is still in flight.
+ *
+ * The body lives in `dispatch` so this wrapper stays small enough to see: it is
+ * the only place the countdown and the in-flight count are maintained, and a
+ * `try/finally` around a 200-line switch is exactly the kind of thing that gets
+ * broken by a later edit.
+ */
 async function handle(op, params = {}) {
+  inFlightOps += 1;
+  scheduleAutoTabClose();
+  try {
+    return await dispatch(op, params);
+  } finally {
+    inFlightOps -= 1;
+  }
+}
+
+async function dispatch(op, params = {}) {
   const cfg = await ensureConfig();
 
   switch (op) {
@@ -422,6 +606,13 @@ async function handle(op, params = {}) {
       const url = String(params.url || '');
       if (!urlAllowed(url, cfg)) throw new Error(`Refusing to open a URL outside the tab scope: ${url}`);
       const created = await chrome.tabs.create({ url, active: params.active !== false });
+      // Ours as well, and this is the one case where a tab we created is
+      // deliberately in front of the user — `active` defaults to true here,
+      // unlike in `resolveTab`. It is still reclaimed on the same idle
+      // countdown, and the refresh at the top of every dispatch is what keeps
+      // that countdown away from work in progress.
+      autoCreatedTabId = created.id;
+      scheduleAutoTabClose();
       const tab = await waitForTab(created.id, (t) => urlAllowed(t.url, cfg), 45000, url);
       return { tabId: tab.id, url: tab.url, title: tab.title || null };
     }
@@ -695,6 +886,10 @@ function scheduleReconnect() {
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'keepAlive') connect();
+  // The idle countdown for the tab this extension opened for itself. Nothing
+  // else in this worker closes a tab, and this cannot reach one the user made —
+  // see `autoCreatedTabId`.
+  if (alarm.name === AUTO_CLOSE_ALARM) closeIdleFlowTab();
 });
 
 chrome.runtime.onStartup.addListener(connect);

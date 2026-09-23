@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kodelyx/flow-go/flow-go/internal/cdp"
@@ -493,6 +494,14 @@ func (p *BrokerProvider) Token(ctx context.Context, action string) (string, erro
 // Chain tries providers in order and returns the first usable token.
 type Chain struct {
 	providers []Provider
+
+	// mu guards last. A chain is read and written from whichever goroutine is
+	// minting, and the pool mints per worker, so this is not single-threaded in
+	// the server case.
+	mu sync.Mutex
+	// last names the provider that supplied the most recent token, or "" when
+	// the chain has not produced one.
+	last string
 }
 
 // NewChain builds a chain from the given providers.
@@ -507,6 +516,7 @@ func (c *Chain) Token(ctx context.Context, action string) (string, error) {
 		token, err := p.Token(ctx, action)
 		if err == nil && token != "" {
 			log.Printf("recaptcha: token acquired via %s (%d chars)", p.Name(), len(token))
+			c.setLast(p.Name())
 			return token, nil
 		}
 		if err != nil {
@@ -514,10 +524,41 @@ func (c *Chain) Token(ctx context.Context, action string) (string, error) {
 			log.Printf("recaptcha: provider %s failed: %v", p.Name(), err)
 		}
 	}
+	c.setLast("")
 	if lastErr != nil {
 		return "", lastErr
 	}
 	return "", nil
+}
+
+// LastProvider names the provider that supplied the most recent token, or ""
+// when the chain has not produced one.
+//
+// It exists because Name() reports the whole chain — "chain(http,empty)" — which
+// says what was *tried* and not what won. That is exactly the question that
+// matters when a token is refused: whether this run actually used the browser,
+// or whether the broker failed and the chain fell through to the transport.
+// Before this, those two were distinguishable only by reading the log.
+func (c *Chain) LastProvider() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.last
+}
+
+func (c *Chain) setLast(name string) {
+	c.mu.Lock()
+	c.last = name
+	c.mu.Unlock()
+}
+
+// LastProviderReporter is implemented by providers that can name which
+// underlying strategy supplied the most recent token.
+//
+// It is a separate interface rather than a method on Provider so that a provider
+// with nothing to report — the empty one, a test double — needs no change, and
+// so that a caller can ask without assuming it holds a chain.
+type LastProviderReporter interface {
+	LastProvider() string
 }
 
 // Name identifies the chain in logs.
@@ -527,6 +568,37 @@ func (c *Chain) Name() string {
 		names = append(names, p.Name())
 	}
 	return "chain(" + strings.Join(names, ",") + ")"
+}
+
+/* ------------------------------------------------------------------ *
+ * Page-only minting
+ * ------------------------------------------------------------------ */
+
+// NewPageProvider builds a provider that mints only from a real page: the Flow
+// extension's own captcha operation when one is attached, and the CDP broker
+// otherwise.
+//
+// **There is deliberately no transport fallback.** This is what a caller asks
+// for when it already has the transport's answer and that answer was refused —
+// handing back another token from the same source would be asking the same
+// question again. A chain that ended in HTTP here would return a token
+// indistinguishable from the one just rejected, and the caller would have spent
+// a round trip to learn nothing.
+//
+// Either argument may be nil, and a provider built from nothing answers with an
+// empty token rather than an error. Callers must treat an empty token as "no
+// escalation" — passing it on as a captcha replacement would resend the token
+// that was just refused, because an empty replacement means "keep the one you
+// have".
+func NewPageProvider(broker *cdp.Client, pageURL PageURLResolver, current func() *cdp.Client) Provider {
+	providers := make([]Provider, 0, 2)
+	if current != nil {
+		providers = append(providers, NewFlow(current))
+	}
+	if broker != nil {
+		providers = append(providers, NewBroker(broker, "", pageURL))
+	}
+	return NewChain(providers...)
 }
 
 /* ------------------------------------------------------------------ *

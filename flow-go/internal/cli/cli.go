@@ -42,6 +42,8 @@ func Run(args []string) int {
 		return runGenerate(args[1:])
 	case "image":
 		return runImage(args[1:])
+	case "edit":
+		return runEdit(args[1:])
 	case "batch-all":
 		return runBatchAll(args[1:])
 	case "projects":
@@ -88,6 +90,7 @@ COMMANDS
   doctor                Diagnose whether this machine can generate right now
   generate              Generate a video
   image                 Generate an image
+  edit                  Edit an existing video
   batch-all             Generate one image per account in cookies/account_*.json
   projects              List the account's Flow projects
   stats                 Print database statistics
@@ -98,11 +101,17 @@ COMMANDS
 COMMON FLAGS
   --project-id          Flow project ID (default: resolved from the session)
   --proxy               Route upstream traffic through one exit IP
+                        (default: $FLOW_PROXY)
   --captcha             reCAPTCHA strategy: auto | broker | http | off
+                        (default: $FLOW_RECAPTCHA, else auto)
   --db                  Database path
   --cookies             Run as one named account, e.g.
                         cookies/account_<key>.json. Without it the freshest
                         account file in cookies/ is used.
+
+  A .env file is read at start-up and its values become these flags' defaults,
+  so an explicit flag always wins over the file. See .env.example for the whole
+  set, including the rate limits and the timing bounds.
 
 DOCTOR FLAGS
   --probe               Make one authenticated upstream call to prove the
@@ -120,32 +129,50 @@ DOCTOR FLAGS
   can answer honestly rather than by inspection.
 
 GENERATE FLAGS
-  --prompt              Prompt text (required)
+  --prompt              Prompt text (required, or give it as a positional
+                        argument)
   --duration            4 | 6 | 8 | 10                 (default 10)
   --quality             360p | 720p                    (default 720p)
   --count               1..4                           (default 1)
   --start-image         Local image path or media ID; makes it image-to-video
   --end-image           Local image path or media ID
+  --reference           Reference image, repeatable; makes it
+                        reference-to-video and selects the reference model
   --no-download         Skip writing the result to output/
 
-  --aspect, --resolution, --seed and --reference exist on the legacy aisandbox
-  transport and not on the batchexecute one. Passing one is reported on stderr
-  and the run continues without it, so a script carrying a stale flag still
-  produces its video.
+  --aspect, --resolution and --seed exist on the legacy aisandbox transport and
+  not on the batchexecute one. Passing one is reported on stderr and the run
+  continues without it, so a script carrying a stale flag still produces its
+  video.
 
 IMAGE FLAGS
-  --prompt              Prompt text (required)
+  --prompt              Prompt text (required, or give it as a positional
+                        argument)
   --model               harbor_seal | narwhal | gem_pix_2
+                        (default: $IMAGE_MODEL, else narwhal)
   --count               Accepted, but only 1 is honoured: the RPC returns one
                         asset per call
   --no-download         Skip writing the result to output/
 
+EDIT FLAGS
+  --source              The asset to edit, as a media ID or a content ID
+                        (required)
+  --prompt              What to change (required, or give it as a positional
+                        argument)
+  --model               Defaults to abra_edit
+  --no-download         Skip writing the result to output/
+
+  An edit cannot move accounts: its source is an asset inside the current
+  account's project, so a switch would take the project with it.
+
 EXAMPLES
   flow-go bridge
-  flow-go image --prompt "a single red paper boat"
+  flow-go image "a single red paper boat"
   flow-go image --prompt "a red cube" --cookies cookies/account_ab12cd34ef56.json
-  flow-go generate --prompt "a paper boat on a river" --duration 8
-  flow-go generate --prompt "slow push in" --start-image ./frame.png --quality 360p
+  flow-go generate "a paper boat on a river" --duration 8
+  flow-go generate "slow push in" --start-image ./frame.png --quality 360p
+  flow-go generate "keep the style" --reference ./style-a.png --reference ./style-b.png
+  flow-go edit --source <content-id> "make the boat drift slowly to the left"
   flow-go batch-all --prompt "a paper boat" --model narwhal
   flow-go stats
 `
@@ -172,12 +199,38 @@ type commonFlags struct {
 
 func (c *commonFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.projectID, "project-id", "", "Flow project ID")
-	fs.StringVar(&c.proxy, "proxy", "", "proxy URL for upstream traffic")
-	fs.StringVar(&c.captcha, "captcha", "auto", "reCAPTCHA strategy: auto|broker|http|off")
+	// The two env-backed defaults below are why this file has to be read after
+	// config.LoadEnv: a flag's default is the value the flag takes when it is
+	// not passed, so binding the environment into the default is what makes
+	// `.env` work at all. An explicit flag still wins, which is the point —
+	// `FLOW_PROXY` sets the baseline and `--proxy` overrides it for one run.
+	//
+	// Both were documented in .env.example and read by nothing before this, so
+	// a value set there was silently ignored.
+	fs.StringVar(&c.proxy, "proxy", envDefault("FLOW_PROXY", ""),
+		"proxy URL for upstream traffic (from $FLOW_PROXY)")
+	fs.StringVar(&c.captcha, "captcha", envDefault("FLOW_RECAPTCHA", "auto"),
+		"reCAPTCHA strategy: auto|broker|http|off (from $FLOW_RECAPTCHA, else auto)")
 	fs.StringVar(&c.db, "db", "", "database path")
 	fs.StringVar(&c.email, "email", "", "account email, used as the OAuth login hint")
 	fs.StringVar(&c.cookies, "cookies", "",
 		"cookie file to run as, e.g. cookies/account_<key>.json (default: the usual search)")
+}
+
+// envDefault returns the environment variable's value, or fallback when it is
+// unset or empty.
+//
+// Empty counts as unset deliberately. `FLOW_PROXY=` in a .env file is how that
+// file says "not configured", and treating it as a real value would set the
+// flag's default to the empty string — which happens to be the same thing here,
+// but the rule matters for a knob whose fallback is not empty, such as
+// FLOW_RECAPTCHA and its `auto`. Without it, an empty assignment would silently
+// disable the strategy rather than leave the default in place.
+func envDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func (c *commonFlags) build() (*app.App, error) {
@@ -304,7 +357,7 @@ func runGenerate(args []string) int {
 	startImage := fs.String("start-image", "", "local image path or media ID")
 	endImage := fs.String("end-image", "", "local image path or media ID")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
-	// These four exist on the legacy aisandbox transport and not on the
+	// These three exist on the legacy aisandbox transport and not on the
 	// batchexecute one, which is the only one that works. They are still
 	// declared, and still named when passed — but the run continues without
 	// them. Failing was defensible only while the alternative was silence, and
@@ -313,15 +366,22 @@ func runGenerate(args []string) int {
 	aspect := fs.String("aspect", "", "ignored — not implemented on the batchexecute transport")
 	resolution := fs.String("resolution", "", "ignored — not implemented on the batchexecute transport")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
+	// --reference is a real flag now. It used to be declared purely so that
+	// passing it could be reported as ignored, even though the engine has had a
+	// working reference-to-video path (MZZa6b / abra_r2v_*) all along — the
+	// command simply never called it.
 	var references stringList
 	fs.Var(&references, "reference",
-		"ignored — reference-to-video has no batchexecute transport; use --start-image")
+		"reference image path or media ID; repeatable, and selects reference-to-video")
 	_ = fs.Parse(args)
 
-	if *prompt == "" {
-		return fail(fmt.Errorf("--prompt is required"))
+	// The prompt may be given positionally, so `flow-go generate "a paper boat"`
+	// works.
+	*prompt = promptFromArgs(*prompt, fs.Args())
+	if strings.TrimSpace(*prompt) == "" {
+		return fail(fmt.Errorf("--prompt is required (or give the prompt as an argument)"))
 	}
-	warnIgnoredFlags(ignoredGenerateFlags(*aspect, *resolution, *seed, references))
+	warnIgnoredFlags(ignoredGenerateFlags(*aspect, *resolution, *seed))
 
 	a, err := common.build()
 	if err != nil {
@@ -339,6 +399,29 @@ func runGenerate(args []string) int {
 
 	if err := bootstrap(ctx, a); err != nil {
 		return fail(err)
+	}
+
+	// Reference-to-video is a different capability from conditioning on a start
+	// frame — a different RPC and a different payload shape — so it is selected
+	// by supplying references rather than combined with them. A submission
+	// carrying both would go to one RPC with the other's conditioning in slots
+	// that RPC does not read, and the server accepts that and answers with
+	// nothing rather than an error.
+	if len(references) > 0 {
+		if *startImage != "" || *endImage != "" {
+			return fail(fmt.Errorf("--reference cannot be combined with --start-image or " +
+				"--end-image: reference-to-video and frame conditioning are different " +
+				"submissions"))
+		}
+		if *quality != "720p" {
+			// The reference model family has no quality axis wired up — the keys
+			// are abra_r2v_<n>s, with no _360p variant in use — so there is
+			// nothing to apply the flag to. Reported rather than silently
+			// dropped, which is the convention every other unimplemented field
+			// follows here.
+			warnIgnoredFlags([]string{"--quality (reference-to-video has no quality variant)"})
+		}
+		return runReferenceGenerate(ctx, a, *prompt, references, *duration, !*noDownload)
 	}
 
 	fmt.Printf("generating %d video(s) at %ds, %s\n", *count, *duration, *quality)
@@ -364,10 +447,100 @@ func runGenerate(args []string) int {
 	return 0
 }
 
+// runReferenceGenerate submits a reference-to-video generation.
+//
+// Split from runGenerate because the two submissions share almost nothing: a
+// different engine entry point, a different model family, and no --count — the
+// reference RPC submits one render per call.
+func runReferenceGenerate(ctx context.Context, a *app.App, prompt string,
+	references []string, duration int, download bool) int {
+
+	fmt.Printf("generating from %d reference image(s) at %ds\n", len(references), duration)
+
+	outcome, err := a.Engine.GenerateVideoFromReferencesViaBatch(ctx, engine.BatchReferenceRequest{
+		Prompt:     prompt,
+		References: references,
+		Duration:   duration,
+		Wait:       download,
+		Download:   download,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	printJSON(outcome)
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * edit
+ * ------------------------------------------------------------------ */
+
+// runEdit edits an existing asset with abra_edit.
+//
+// The engine has had this path all along and nothing exposed it, so the
+// capability was unreachable from any operator surface. The source is an asset
+// id — a media id or a content id — and the engine resolves whichever it is
+// given to the content id the RPC actually wants.
+func runEdit(args []string) int {
+	fs := flag.NewFlagSet("edit", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	source := fs.String("source", "", "the asset to edit: a media ID or a content ID")
+	prompt := fs.String("prompt", "", "what to change")
+	model := fs.String("model", "", "edit model (default abra_edit)")
+	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
+	_ = fs.Parse(args)
+
+	// The prompt may be given positionally, as on generate and image. A source
+	// cannot be, because it is an opaque id and a bare id on the command line
+	// would be indistinguishable from a prompt.
+	*prompt = promptFromArgs(*prompt, fs.Args())
+	if strings.TrimSpace(*source) == "" {
+		return fail(fmt.Errorf("--source is required: the asset to edit, as a media ID or " +
+			"a content ID"))
+	}
+	if strings.TrimSpace(*prompt) == "" {
+		return fail(fmt.Errorf("--prompt is required (or give the prompt as an argument)"))
+	}
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	attachBridge(ctx, a)
+
+	if err := bootstrap(ctx, a); err != nil {
+		return fail(err)
+	}
+
+	fmt.Printf("editing %s\n", short(*source))
+
+	outcome, err := a.Engine.EditVideoViaBatch(ctx, engine.BatchEditRequest{
+		Source:   *source,
+		Prompt:   *prompt,
+		Model:    *model,
+		Wait:     !*noDownload,
+		Download: !*noDownload,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	printJSON(outcome)
+	return 0
+}
+
 // ignoredGenerateFlags names the generate flags the batchexecute transport does
 // not apply, so the caller is told rather than left to notice the result differs
 // from what they asked for.
-func ignoredGenerateFlags(aspect, resolution string, seed int64, references []string) []string {
+//
+// --reference is deliberately absent: it is applied now, by routing to the
+// reference-to-video submission rather than to the frame-conditioned one.
+func ignoredGenerateFlags(aspect, resolution string, seed int64) []string {
 	var out []string
 	if strings.TrimSpace(aspect) != "" {
 		out = append(out, "--aspect")
@@ -377,9 +550,6 @@ func ignoredGenerateFlags(aspect, resolution string, seed int64, references []st
 	}
 	if seed != 0 {
 		out = append(out, "--seed")
-	}
-	if len(references) > 0 {
-		out = append(out, "--reference")
 	}
 	return out
 }
@@ -397,6 +567,22 @@ func warnIgnoredFlags(names []string) {
 		strings.Join(names, ", "))
 }
 
+// promptFromArgs resolves a prompt from the flag and any positional arguments,
+// so `flow-go image "a red boat"` works as well as `--prompt "a red boat"`.
+//
+// An explicit --prompt wins when both are supplied. The positional form is a
+// convenience and a caller who names the flag has made a decision; silently
+// preferring the trailing words would make the flag unreliable.
+//
+// The positional words are joined with single spaces because the shell has
+// already split the prompt into them, and the server sees one string either way.
+func promptFromArgs(flagValue string, rest []string) string {
+	if strings.TrimSpace(flagValue) != "" {
+		return flagValue
+	}
+	return strings.Join(rest, " ")
+}
+
 /* ------------------------------------------------------------------ *
  * image
  * ------------------------------------------------------------------ */
@@ -407,7 +593,8 @@ func runImage(args []string) int {
 	common.bind(fs)
 	prompt := fs.String("prompt", "", "prompt text")
 	count := fs.Int("count", 1, "number of variations")
-	model := fs.String("model", "", "harbor_seal, narwhal, or gem_pix_2")
+	model := fs.String("model", envDefault("IMAGE_MODEL", ""),
+		"harbor_seal, narwhal, or gem_pix_2 (from $IMAGE_MODEL, else narwhal)")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
 	// Not implemented on the batchexecute transport; declared, and named when
 	// passed, but the run continues without them.
@@ -415,10 +602,13 @@ func runImage(args []string) int {
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	_ = fs.Parse(args)
 
-	if *prompt == "" {
-		return fail(fmt.Errorf("--prompt is required"))
+	// The prompt may be given positionally, so `flow-go image "a red boat"`
+	// works.
+	*prompt = promptFromArgs(*prompt, fs.Args())
+	if strings.TrimSpace(*prompt) == "" {
+		return fail(fmt.Errorf("--prompt is required (or give the prompt as an argument)"))
 	}
-	warnIgnoredFlags(ignoredGenerateFlags(*aspect, "", *seed, nil))
+	warnIgnoredFlags(ignoredGenerateFlags(*aspect, "", *seed))
 	if *count != 1 {
 		// The image RPC takes one prompt and returns one asset. Reporting it and
 		// continuing beats failing the run: the caller gets the image they asked
@@ -633,7 +823,8 @@ func runBatchAll(args []string) int {
 	var common commonFlags
 	common.bind(fs)
 	prompt := fs.String("prompt", "", "prompt to generate (required)")
-	model := fs.String("model", "narwhal", "image model: narwhal|lite|pro")
+	model := fs.String("model", envDefault("IMAGE_MODEL", "narwhal"),
+		"image model: narwhal|lite|pro (from $IMAGE_MODEL, else narwhal)")
 	download := fs.Bool("download", true, "write the results to output/")
 	_ = fs.Parse(args)
 

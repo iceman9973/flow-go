@@ -393,6 +393,25 @@ type Client struct {
 	// project belonging to one account and a session belonging to another is a
 	// reachable state, and a broken one.
 	authUser int
+
+	// subSlots caps how many submission calls may be in flight at once, and
+	// subGap spaces them apart. Both zero mean no limit, which is the default:
+	// the limits are opted into by the engine (see SetSubmissionLimits) rather
+	// than imposed on every caller, so a test or a diagnostic client is not
+	// silently slowed down or serialised.
+	//
+	// They exist because this is the only local defence against the pattern
+	// that plausibly triggers PUBLIC_ERROR_UNUSUAL_ACTIVITY. A refusal has no
+	// status to react to — it is HTTP 200 with a reason in the frame — so there
+	// is nothing to back off *from* after the fact. The only place to act is
+	// before the call goes out.
+	subSlots chan struct{}
+	subGap   time.Duration
+	// subMu guards subNext, the earliest instant the next submission may go out.
+	// Reserved rather than merely read, so concurrent callers space out instead
+	// of all measuring the same gap and firing together.
+	subMu   sync.Mutex
+	subNext time.Time
 }
 
 // SetAuthUser selects which signed-in Google account these calls act as.
@@ -649,6 +668,23 @@ type Frame struct {
 	RPCID string
 	// Payload is the raw JSON of the frame's data element, when present.
 	Payload json.RawMessage
+	// Error is the reason the server gave for refusing the call, when it gave
+	// one.
+	//
+	// It is a sibling of the data element rather than part of it, which is why
+	// it went unread for so long. A refusal is still HTTP 200 and still a
+	// `wrb.fr` frame, but its data slot is null and the reason sits two levels
+	// down in the slot after it:
+	//
+	//	["wrb.fr","ogiZ0b",null,null,null,
+	//	 [7,null,[["type.googleapis.com/google.rpc.ErrorInfo",
+	//	           ["PUBLIC_ERROR_UNUSUAL_ACTIVITY"]]]],"generic"]
+	//
+	// A parser that reads only the data element therefore sees a frame carrying
+	// nothing, and reports a refusal as a silent no-op. Those are different
+	// problems — one needs the assessment fixed, the other needs a model or a
+	// project fixed — so they must not arrive as the same message.
+	Error string
 }
 
 // CallOptions carries the parameters the app sends alongside f.req.
@@ -685,6 +721,20 @@ type CallOptions struct {
 	//
 	// Nil means "this call carries no captcha", and a resend is safe.
 	RefreshCaptcha func(ctx context.Context) (string, error)
+	// EscalateCaptcha mints a token from a higher-scoring strategy than the one
+	// that produced a refused one.
+	//
+	// It is asked for only after a call has been refused with
+	// ReasonUnusualActivity, and only once — the point is to answer "the
+	// assessment rejected this token" with a better token rather than with an
+	// explanation, and a second rejection means the assessment is refusing the
+	// client rather than the token.
+	//
+	// Nil is the default and means the refusal is final, which is the behaviour
+	// every caller had before this existed. It is also what a run with no
+	// browser attached must get: there is no page to ask, so the refusal stands
+	// and `auto` stays browser-free.
+	EscalateCaptcha func(ctx context.Context) (string, error)
 }
 
 // Call issues one RPC and returns its frames.
@@ -716,6 +766,15 @@ func (c *Client) CallWith(ctx context.Context, rpcID string, payload any, opts C
 // answers with an empty frame rather than an error.
 func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
 	build func(token string) (any, error)) ([]Frame, error) {
+
+	// Submissions are paced, reads are not. See enterSubmission for why that
+	// distinction is the point rather than a convenience.
+	release, err := c.enterSubmission(ctx, rpcID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	auth, err := c.Authorization()
 	if err != nil {
 		return nil, err
@@ -782,6 +841,122 @@ func (c *Client) call(ctx context.Context, rpcID string, opts CallOptions,
 		return nil, err
 	}
 	return ParseFrames(resp.Text())
+}
+
+/* ------------------------------------------------------------------ *
+ * Pacing the calls that spend credits
+ * ------------------------------------------------------------------ */
+
+// submissionRPCs are the calls that cost the account something.
+//
+// They are the ones Flow throttles, and the ones worth pacing: a refused read
+// costs nothing and can simply be repeated, whereas a refused submission has
+// either been charged or has spent the account's goodwill. So the limiter
+// applies here and nowhere else — reads must stay cheap and immediate, because
+// polling depends on them and a poll that is spaced two seconds apart turns a
+// seven-minute wait into a much longer one.
+//
+// maseQ (the upload) is deliberately absent. It is a write, but it spends no
+// credits and it happens once before a submission, so pacing it would only add
+// latency to the one step that is already a browser round trip.
+var submissionRPCs = map[string]bool{
+	RPCIDGenerate:                true, // ogiZ0b — image generation
+	RPCIDGenerateVideo:           true, // YhhmEf — text to video
+	RPCIDGenerateVideoImage:      true, // nprQif — first and last frame
+	RPCIDGenerateVideoImageStart: true, // eb1hJf — start frame only
+	RPCIDGenerateVideoReferences: true, // MZZa6b — reference images
+	RPCIDVideoEdit:               true, // jIps6 — video edit
+}
+
+// SetSubmissionLimits caps how many submission calls may be in flight and the
+// minimum gap between them.
+//
+// A zero or negative value for either means no limit, and the zero value of a
+// Client means no limit for both — so a client built without this call behaves
+// exactly as it did before the limiter existed. That is deliberate: the limits
+// are a policy the engine opts into, not a property of the transport, and a
+// test or a diagnostic client should not be serialised behind them.
+func (c *Client) SetSubmissionLimits(maxInFlight int, gap time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if maxInFlight > 0 {
+		c.subSlots = make(chan struct{}, maxInFlight)
+	} else {
+		c.subSlots = nil
+	}
+	c.subGap = gap
+	c.subNext = time.Time{}
+}
+
+// enterSubmission waits for a submission slot and for the spacing to elapse,
+// and returns the release function the caller must defer.
+//
+// Reads — and any rpc that is not in submissionRPCs — get a no-op release
+// immediately, so this costs them nothing.
+//
+// The slot is taken before the gap is waited out rather than after. That makes
+// the cap a real cap: with the wait outside the slot, a burst of callers would
+// all hold nothing and all be released at once.
+//
+// Both waits honour ctx, and a cancelled wait gives the slot back — otherwise a
+// client whose caller gave up would leak capacity it will never release.
+func (c *Client) enterSubmission(ctx context.Context, rpcID string) (func(), error) {
+	noop := func() {}
+
+	if !submissionRPCs[rpcID] {
+		return noop, nil
+	}
+
+	c.mu.Lock()
+	slots := c.subSlots
+	gap := c.subGap
+	c.mu.Unlock()
+
+	if slots == nil && gap <= 0 {
+		return noop, nil
+	}
+
+	if slots != nil {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("batchexecute: waiting to submit %s: %w", rpcID, ctx.Err())
+		}
+	}
+	release := func() {
+		if slots != nil {
+			<-slots
+		}
+	}
+
+	if gap <= 0 {
+		return release, nil
+	}
+
+	// Reserve this call's slot in the schedule rather than reading the last
+	// send time. Two callers arriving together would otherwise both measure the
+	// same gap and go out together, which is the burst the spacing exists to
+	// prevent.
+	c.subMu.Lock()
+	now := time.Now()
+	next := now
+	if c.subNext.After(now) {
+		next = c.subNext
+	}
+	c.subNext = next.Add(gap)
+	c.subMu.Unlock()
+
+	if wait := time.Until(next); wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			release()
+			return nil, fmt.Errorf("batchexecute: waiting to space out %s: %w", rpcID, ctx.Err())
+		}
+	}
+	return release, nil
 }
 
 // UnauthorizedHandler refreshes a session the server has rejected.
@@ -1055,15 +1230,20 @@ func (c *Client) GenerateMedia(ctx context.Context, req GenerateRequest, opts Ca
 // refresher — there is no token to re-mint, and such a call carries no captcha,
 // so an empty answer is the caller's to interpret. It does not retry twice; one
 // extra attempt is enough to cover the boot case and a second would only spend
-// credits on a genuine failure. And it does not turn an empty retry into an
-// error — the empty frames are returned as they are, so the caller reports what
-// actually happened rather than something invented here.
+// credits on a genuine failure. And it does not invent a cause for an empty
+// answer that carried none — the empty frames are returned as they are, so the
+// caller reports what actually happened.
 //
-// A mint *failure* is a different thing, and is returned. The empty response is
-// what an upstream refusal looks like, so passing it back without the reason
-// that explains it is how "nothing came back" became a symptom with no cause
-// attached. A provider that is deliberately off never reaches here: it answers
-// with an empty token and no error, and such a call carries no refresher at all.
+// What it does now do is stop conflating two answers that only look alike. An
+// empty frame with no reason is the silent no-op above; an empty frame carrying
+// an ErrorInfo is the server stating why it refused, and that is returned as a
+// RejectedError so the caller can report the reason instead of the symptom.
+// Before, both arrived as "no frames", and a submission the assessment had
+// thrown out was answered with a hint about the model enum and the project.
+//
+// A mint *failure* is a third thing, and is returned as itself. A provider that
+// is deliberately off never reaches here: it answers with an empty token and no
+// error, and such a call carries no refresher at all.
 func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	empty func([]Frame) bool,
 	submit func(token string) ([]Frame, error)) ([]Frame, error) {
@@ -1087,10 +1267,75 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	if err != nil {
 		return nil, err
 	}
-	if empty(retried) {
-		log.Printf("batchexecute: the retry came back empty too")
+	if !empty(retried) {
+		return retried, nil
 	}
-	return retried, nil
+
+	log.Printf("batchexecute: the retry came back empty too")
+
+	// A refusal that survived the retry is not the silent no-op this function
+	// exists to paper over. The retry is worth making either way — a spent or
+	// stale token is the common cause and a fresh one clears it — but when the
+	// second answer carries a reason as well, the reason is the answer, and
+	// reporting "empty" would hide it for a third time.
+	//
+	// The retry's reason wins when there is one: it is the later and more
+	// specific of the two, and a first attempt refused over a stale token says
+	// nothing about why the second was refused.
+	reason := UpstreamError(retried)
+	if reason == "" {
+		reason = UpstreamError(frames)
+	}
+	if reason == "" {
+		return retried, nil
+	}
+
+	// A refusal by the assessment is the one case worth a third attempt.
+	//
+	// Both attempts so far minted over the transport, so both presented a token
+	// of the same quality — and if that quality is what is being refused,
+	// repeating it only spends another round trip to learn the same thing. A
+	// page-minted token is a genuinely different answer, so it is asked for
+	// once, and only here.
+	//
+	// Every other reason is final. A wrong model, or a project belonging to
+	// another account, is not fixed by minting again.
+	if opts.EscalateCaptcha != nil && reason == ReasonUnusualActivity {
+		log.Printf("batchexecute: the assessment refused the token; asking a page for one instead")
+
+		escalated, mintErr := opts.EscalateCaptcha(ctx)
+		if mintErr != nil || escalated == "" {
+			// No page to ask, or it could not mint. The refusal stands — it is
+			// still the answer, and reporting the mint failure instead would
+			// replace a stated reason with a vaguer one.
+			//
+			// An empty token is treated as a failure rather than passed to
+			// submit: submit("") means "keep the token you already have", so
+			// accepting one here would resend the spent token and spend another
+			// attempt on the answer that was just refused.
+			log.Printf("batchexecute: no higher-scoring token available (%v); the refusal stands",
+				mintErr)
+			return nil, &RejectedError{Reason: reason, Frames: len(retried)}
+		}
+
+		third, err := submit(escalated)
+		if err != nil {
+			return nil, err
+		}
+		if !empty(third) {
+			log.Printf("batchexecute: the page-minted token was accepted")
+			return third, nil
+		}
+
+		// Refused again, and with a better token this time. The assessment is
+		// refusing the client rather than the token, and the second reason is
+		// the more specific of the two.
+		if escalatedReason := UpstreamError(third); escalatedReason != "" {
+			reason = escalatedReason
+		}
+	}
+
+	return nil, &RejectedError{Reason: reason, Frames: len(retried)}
 }
 
 // carriesNoMedia reports whether a response holds no asset URLs.
@@ -2404,9 +2649,22 @@ func ParseProjectAssets(payload json.RawMessage) []ProjectAsset {
 		}
 		if title != "" {
 			asset.Title = title
-		} else if detail, ok := row[5].([]any); ok && len(detail) > 1 {
-			if t, ok := detail[1].(string); ok {
-				asset.Title = t
+		} else if len(row) > 5 {
+			// The length is checked because this is the only index in this
+			// function that is read directly. Every other field goes through
+			// stringAt, which answers "" past the end, so a short row is
+			// tolerated everywhere except here — and here it was a panic, not a
+			// missing title.
+			//
+			// It is reachable: isAssetRow accepts the flat shape from four
+			// elements up, so a row of exactly four or five arrives as a valid
+			// asset and then indexes past its own end. An unrecovered panic in
+			// the parser takes the whole process down, which is a severe
+			// response to a listing that is merely shorter than expected.
+			if detail, ok := row[5].([]any); ok && len(detail) > 1 {
+				if t, ok := detail[1].(string); ok {
+					asset.Title = t
+				}
 			}
 		}
 		out = append(out, asset)
@@ -2615,6 +2873,12 @@ func ParseFrames(body string) ([]Frame, error) {
 			if payload, ok := item[2].(string); ok && payload != "" {
 				frame.Payload = json.RawMessage(payload)
 			}
+			// The whole item, not a fixed slot: the refusal block sits after the
+			// data element but its distance from it is not a contract. Scanning
+			// the item cannot reach the payload itself, which is a JSON string
+			// rather than nested arrays, so a legitimate response can never look
+			// like a refusal.
+			frame.Error = errorInfoReason(item)
 			frames = append(frames, frame)
 		}
 	}
@@ -2623,6 +2887,90 @@ func ParseFrames(body string) ([]Frame, error) {
 		return nil, fmt.Errorf("batchexecute: the response contained no wrb.fr frames")
 	}
 	return frames, nil
+}
+
+// errorInfoReason digs an ErrorInfo reason out of a frame.
+//
+// The refusal block is `["type.googleapis.com/google.rpc.ErrorInfo", ["<REASON>"]]`
+// — the same envelope Google uses for its status details. It is matched by
+// shape rather than by index because its position moved once already and
+// nothing here would have noticed: a missed reason reads exactly like a
+// response that carried none.
+func errorInfoReason(value any) string {
+	items, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+
+	if len(items) == 2 {
+		if kind, ok := items[0].(string); ok && strings.Contains(kind, "ErrorInfo") {
+			if reasons, ok := items[1].([]any); ok {
+				for _, reason := range reasons {
+					if text, ok := reason.(string); ok && text != "" {
+						return text
+					}
+				}
+			}
+		}
+	}
+
+	for _, item := range items {
+		if reason := errorInfoReason(item); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// UpstreamError returns the reason the server refused a call, or "" when it
+// refused nothing.
+//
+// Exported because the caller is the one that can act on it: the transport
+// knows the server said `PUBLIC_ERROR_UNUSUAL_ACTIVITY`, and only the engine
+// knows what that means for the account it is running as.
+func UpstreamError(frames []Frame) string {
+	for _, frame := range frames {
+		if frame.Error != "" {
+			return frame.Error
+		}
+	}
+	return ""
+}
+
+// ReasonUnusualActivity is the reason Flow gives when it will not accept the
+// reCAPTCHA token.
+//
+// It is exported because it is the one refusal a caller can do something about
+// beyond explaining it: the assessment rejected the *token*, and a token minted
+// in a real page scores higher than one minted over the transport. Every other
+// reason — a wrong model, a project belonging to another account — is answered
+// by changing the request, not by minting again.
+const ReasonUnusualActivity = "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+
+// RejectedError reports a call the server answered with an explicit refusal.
+//
+// It exists to keep a refusal from being reported as a silent no-op. Both
+// arrive as HTTP 200 with a `wrb.fr` frame, and only one of them carries a
+// reason — so before this, a submission the assessment had thrown out was
+// reported as "the transport returned no frames", and the hint attached to that
+// message sent the reader after the model enum and the project. Both were fine.
+//
+// PUBLIC_ERROR_UNUSUAL_ACTIVITY is what the assessment answers when it will not
+// accept the reCAPTCHA token — see the recaptcha package, which documents the
+// same reason for a token that is missing or stale. The remedy is a token the
+// assessment accepts, not a different model.
+type RejectedError struct {
+	// Reason is the ErrorInfo reason the server gave, e.g.
+	// "PUBLIC_ERROR_UNUSUAL_ACTIVITY".
+	Reason string
+	// Frames is how many frames the final response carried. Non-zero, because a
+	// refusal is an answer: reporting it as zero is what made it read as
+	// silence.
+	Frames int
+}
+
+func (e *RejectedError) Error() string {
+	return "batchexecute: the server refused the call: " + e.Reason
 }
 
 func truncate(value string, max int) string {

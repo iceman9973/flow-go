@@ -15,6 +15,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -111,6 +112,15 @@ type Engine struct {
 	projectID string
 	client    *flowapi.Client
 	captcha   recaptcha.Provider
+	// escalate mints a token from a real page, and is asked for only after the
+	// assessment has refused the transport's token. Kept separately from captcha
+	// because the two answer different questions: captcha is "give me a token",
+	// escalate is "give me a better one than that".
+	//
+	// It is a page-only provider — no transport fallback — because a fallback
+	// would hand back a token indistinguishable from the one just refused, and
+	// the caller would have spent a round trip to learn nothing.
+	escalate recaptcha.Provider
 	// primaryJar is the cookie set the engine acts as, captured at boot.
 	//
 	// Held here rather than read back off the bridge, because the bridge keeps
@@ -282,6 +292,19 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 
 	// Account selection is a query parameter, so every client has to carry it.
 	client.SetAuthUser(index)
+
+	// Pace the calls that spend credits, and only those.
+	//
+	// This is the only local defence against the pattern that plausibly triggers
+	// PUBLIC_ERROR_UNUSUAL_ACTIVITY: a refusal arrives as HTTP 200 with a reason
+	// in the frame, so there is no status to back off from after the fact — the
+	// only place to act is before the call goes out.
+	//
+	// Reads are deliberately not paced. Polling depends on them being immediate,
+	// a refused read costs nothing, and spacing a poll two seconds apart would
+	// turn a seven-minute wait into a much longer one.
+	client.SetSubmissionLimits(config.MaxConcurrentRequests,
+		time.Duration(config.RequestMinInterval*float64(time.Second)))
 
 	if fp != nil {
 		client.SetFingerprint(batchexecute.Fingerprint{
@@ -921,6 +944,16 @@ func (e *Engine) emptySubmissionHint() string {
 	name := "unknown"
 	if provider != nil {
 		name = provider.Name()
+		// A chain reports the whole chain — "chain(http,empty)" — which says what
+		// was tried and not what won. When the question is whether this run
+		// actually used the browser or fell through to the transport, the chain's
+		// own name is exactly the answer that is missing — so prefer the provider
+		// that supplied the token.
+		if reporter, ok := provider.(recaptcha.LastProviderReporter); ok {
+			if last := reporter.LastProvider(); last != "" {
+				name = last
+			}
+		}
 	}
 
 	// Ordered by how often each has been the answer.
@@ -970,7 +1003,34 @@ func (e *Engine) captchaOptions(action string, opts batchexecute.CallOptions) ba
 	opts.RefreshCaptcha = func(ctx context.Context) (string, error) {
 		return e.CaptchaToken(ctx, action)
 	}
+	opts.EscalateCaptcha = e.captchaEscalation(action)
 	return opts
+}
+
+// captchaEscalation returns a mint from a real page, or nil when no page can be
+// reached.
+//
+// Nil is the case that matters. `auto` deliberately does not require a browser,
+// so a run with no extension attached must behave exactly as it did before this
+// existed: the refusal is returned as the refusal, with no second attempt that
+// could only fail. Returning a non-nil function whenever a provider is merely
+// configured would turn every browserless refusal into a wasted round trip and a
+// less specific error.
+func (e *Engine) captchaEscalation(action string) func(ctx context.Context) (string, error) {
+	if e.bridge == nil || !e.bridge.Connected() {
+		return nil
+	}
+
+	e.mu.RLock()
+	provider := e.escalate
+	e.mu.RUnlock()
+	if provider == nil {
+		return nil
+	}
+
+	return func(ctx context.Context) (string, error) {
+		return provider.Token(ctx, action)
+	}
 }
 
 /* ------------------------------------------------------------------ *
@@ -1022,6 +1082,16 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// different machine than the one the generation call came from.
 	captchaProvider := recaptcha.Build(e.opts.CaptchaMode, e.hc, e.bridge.Current(),
 		e.captchaPageURL, e.bridge.Current, userAgentOf(browserFP))
+
+	// The escalation provider: the page-minting strategies only, with no
+	// transport fallback.
+	//
+	// Built unconditionally and asked for a token only after the assessment has
+	// refused one, so a run with no browser attached never calls it — which is
+	// what keeps `auto` browser-free. A fallback to the transport would defeat
+	// the point: it would return a token indistinguishable from the one just
+	// refused.
+	escalation := recaptcha.NewPageProvider(e.bridge.Current(), e.captchaPageURL, e.bridge.Current)
 
 	// The account the engine acts as, and the only one whose cookies came from
 	// the bridge or from cookies.json. Everything below reads the account and the
@@ -1075,6 +1145,7 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	e.projectID = projectID
 	e.client = client
 	e.captcha = captchaProvider
+	e.escalate = escalation
 	e.fingerprint = browserFP
 	// The jar this boot resolved, kept as the engine's own. `registerAccountDumps`
 	// and `registerConnectedExtensions` run above and each one syncs a profile,
@@ -2785,52 +2856,155 @@ type videoPlan struct {
 // Affordable reports whether the plan can be submitted.
 func (p videoPlan) Affordable() bool { return p.Reason == "" }
 
-// planVideo works out what a submission will cost and whether the account can
-// pay for it.
+// generationTarget is where a submission goes once affordability is settled.
 //
-// This check exists because the server does not make it. A submission the
-// balance cannot cover is accepted and answered with no media rather than an
-// error, so a 1-credit account against a 7-credit render presents as a broken
-// request — and the cost was previously consulted only *after* that empty
-// answer, to choose which log line to write. Deciding it before the call means
-// the request is either affordable or refused, and a reCAPTCHA is never spent on
-// a render that cannot be paid for.
-func (e *Engine) planVideo(ctx context.Context, client *batchexecute.Client, req BatchVideoRequest, model, quality string) videoPlan {
-	duration := req.Duration
+// The three parts travel together because a change of account changes all of
+// them: the switch is a full Bootstrap, so the client, the cookies and the
+// project all belong to the account that was just left behind and have to be
+// replaced before anything is sent under them.
+type generationTarget struct {
+	Client    *batchexecute.Client
+	Jar       *cookiejar.Jar
+	ProjectID string
+	// Balance is the balance the affordability check observed, and Known says
+	// whether it could be read at all. Returned so a caller can report what the
+	// account had when a submission produced nothing, without a second read.
+	Balance int
+	Known   bool
+}
+
+// videoJobCost is what a video submission costs and how to describe it.
+//
+// The figure and the phrase are produced together on purpose. A refusal quotes
+// the price the check used, and a refusal quoting a figure the check never
+// compared against would be worse than no refusal at all — so there is exactly
+// one place where this arithmetic happens.
+//
+// A pair the table does not record returns known=false and a cost of zero. That
+// is not a refusal: the table covers the durations the app offers, and a model
+// named outright can sit outside it, so making the table the limit on what can
+// be generated would be a worse failure than the one the check exists for.
+func videoJobCost(duration, count int, quality string) (cost int, known bool, job string) {
 	if duration == 0 {
 		duration = config.DefaultDuration
 	}
-	count := req.Count
 	if count < 1 {
 		count = 1
 	}
 
-	perRender, known := config.VideoCost(duration, quality)
-	if !known {
-		// An unrecorded pair is not a refusal. The table covers the durations the
-		// app offers, and a model named outright can sit outside it — making the
-		// table the limit on what can be generated would be a worse failure than
-		// the one being fixed.
-		log.Printf("engine: no recorded cost for %ds at %s; the balance cannot be checked "+
-			"before submitting", duration, quality)
-		return videoPlan{Model: model, Quality: quality}
+	perRender, ok := config.VideoCost(duration, quality)
+	if !ok {
+		return 0, false, fmt.Sprintf("%ds at %s", duration, quality)
 	}
+	return perRender * count, true, fmt.Sprintf("%ds at %s costs %d (%d per render ×%d)",
+		duration, quality, perRender*count, perRender, count)
+}
 
+// readBalance reads the account's authoritative balance over the transport.
+//
+// The read gets its own deadline. It is a round trip that cannot change the
+// outcome of anything the caller is about to do, so it must not be able to hold
+// a submission open for the whole request timeout.
+func (e *Engine) readBalance(ctx context.Context, client *batchexecute.Client) (int, error) {
 	creditCtx, cancel := context.WithTimeout(ctx, creditsReadTimeout)
-	balance, err := client.Credits(creditCtx, batchexecute.CallOptions{
+	defer cancel()
+	return client.Credits(creditCtx, batchexecute.CallOptions{
 		SourcePath: "/", BuildLabel: config.BuildLabel(),
 	})
-	cancel()
-	if err != nil {
-		// A failed read is not evidence of an empty wallet. Proceed, and say so —
-		// treating an unreadable balance as zero would refuse work the account can
-		// pay for.
-		log.Printf("engine: could not read the balance before submitting (%v); the "+
-			"affordability check cannot be made, so the submission proceeds", err)
-		return videoPlan{Model: model, Quality: quality, Cost: perRender * count}
+}
+
+// ensureAffordable settles which account a submission will go out as, and
+// reports the balance it observed.
+//
+// It reads the balance and, when the account in use cannot cover cost and the
+// job is allowed to travel, moves to one that can — returning the rebuilt
+// client, jar and project, because a switch is a full Bootstrap.
+//
+// **It is the shared pre-flight for every generation path.** Before it, only
+// text-to-video checked anything: an edit, a reference render or an image on a
+// drained account was submitted, accepted and answered with no media, which
+// reads as a broken request rather than as an empty wallet.
+//
+// **It does not decide whether a shortfall is a refusal.** Each path's price is
+// produced by its own arithmetic and quoted in its own refusal, so the decision
+// stays with the numbers that produced it; this reads, compares and moves. A
+// caller refuses by comparing cost against the returned Balance — see
+// refuseIfShort, or decideVideoPlan for the video case. That is also why it
+// returns no error: there is nothing here that can fail in a way the caller
+// should act on.
+//
+// A cost of zero means the price is not recorded and no check is made, which is
+// the honest answer for a job nobody has priced — refusing on a guess would
+// reject work the account can pay for.
+//
+// A balance that cannot be read is likewise not a refusal. The read failing
+// leaves the balance unknown, and treating unknown as zero would refuse work the
+// account can pay for — so the job proceeds, and the log says the check could
+// not be made.
+//
+// canMove is false when the request carries an asset id scoped to the current
+// account's project. Moving accounts moves the project with it, and an id from
+// the old one is not in the new listing — see canMoveAccounts.
+func (e *Engine) ensureAffordable(ctx context.Context, target generationTarget,
+	cost int, canMove bool) generationTarget {
+
+	if cost <= 0 {
+		return target
 	}
 
-	return decideVideoPlan(duration, count, model, quality, balance)
+	balance, err := e.readBalance(ctx, target.Client)
+	if err != nil {
+		log.Printf("engine: could not read the balance before submitting (%v); the "+
+			"affordability check cannot be made, so the submission proceeds", err)
+		return target
+	}
+	if balance >= cost {
+		target.Balance, target.Known = balance, true
+		return target
+	}
+
+	// The account in use cannot pay. Another signed-in account might, and
+	// preferring one that can is the whole reason for having several — but only
+	// when the request is allowed to travel, because moving accounts moves the
+	// project too.
+	if canMove && e.switchToAffordableAccount(ctx, cost) {
+		if switched := e.Jar(); switched != nil {
+			target.Jar = switched
+		}
+		target.Client = e.newBatchexecuteClient(target.Jar, e.hc)
+		if id := e.ProjectID(); id != "" {
+			target.ProjectID = id
+		}
+
+		// Re-read on the new account. The switch is not evidence that it can
+		// pay, only that it was the best candidate when the scan ran — and a
+		// balance read on the wrong index would refuse a render the new account
+		// can afford.
+		balance, err = e.readBalance(ctx, target.Client)
+		if err != nil {
+			log.Printf("engine: could not read the balance on account %s after moving (%v); "+
+				"the submission proceeds", e.AccountID(), err)
+			return target
+		}
+	}
+
+	target.Balance, target.Known = balance, true
+	return target
+}
+
+// refuseIfShort builds the refusal for a job priced at a flat figure.
+//
+// Nil means the account can pay, or that its balance could not be read — an
+// unreadable balance is not evidence of an empty wallet, so it must not become
+// a refusal. It is the counterpart of ensureAffordable for the paths whose
+// price does not depend on duration, quality or count, and it exists so those
+// paths refuse in one place rather than three.
+func (e *Engine) refuseIfShort(target generationTarget, cost int, job string) error {
+	if !target.Known || target.Balance >= cost {
+		return nil
+	}
+	return fmt.Errorf("insufficient credits: %s costs %d and account %s has %d",
+		job, cost, e.AccountID(), target.Balance)
 }
 
 // decideVideoPlan is the whole affordability decision, given a balance that has
@@ -2840,20 +3014,20 @@ func (e *Engine) planVideo(ctx context.Context, client *batchexecute.Client, req
 // arithmetic here is what decides whether a render is submitted, downgraded or
 // refused, and it is the part that has to be right.
 func decideVideoPlan(duration, count int, model, quality string, balance int) videoPlan {
-	perRender, known := config.VideoCost(duration, quality)
+	cost, known, job := videoJobCost(duration, count, quality)
 	if !known {
-		// An unrecorded pair is not a refusal; see planVideo.
+		// An unrecorded pair is not a refusal; see videoJobCost.
 		return videoPlan{Model: model, Quality: quality, Balance: balance, Known: true}
 	}
 
 	plan := videoPlan{
 		Model:   model,
 		Quality: quality,
-		Cost:    perRender * count,
+		Cost:    cost,
 		Balance: balance,
 		Known:   true,
 	}
-	if balance >= plan.Cost {
+	if balance >= cost {
 		return plan
 	}
 
@@ -2870,9 +3044,7 @@ func decideVideoPlan(duration, count int, model, quality string, balance int) vi
 	// The downgrade was also unnecessary. A caller who wants 360p sets
 	// `quality: "360p"`; silently substituting a different render than the one
 	// asked for is a different thing from serving the request.
-	plan.Reason = fmt.Sprintf(
-		"insufficient credits: %ds at %s costs %d (%d per render ×%d) and the account has %d",
-		duration, quality, plan.Cost, perRender, count, balance)
+	plan.Reason = fmt.Sprintf("insufficient credits: %s and the account has %d", job, balance)
 	return plan
 }
 
@@ -3105,42 +3277,33 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 
 	client := e.newBatchexecuteClient(jar, e.hc)
 
-	// Keep the pair as requested. A retry against another account has to re-plan
-	// from what was asked for, not from a downgrade the previous account forced —
-	// otherwise a richer account is handed the cheaper render it never needed.
-	requestedModel, requestedQuality := model, quality
-
 	// Decide whether this account can pay for the render before anything is spent
 	// on the request.
 	//
 	// This runs ahead of the reCAPTCHA mint deliberately: a token is a browser
 	// round trip, and minting one for a render the balance cannot cover wastes it
 	// and buries the real reason behind a captcha failure.
-	plan := e.planVideo(ctx, client, req, requestedModel, requestedQuality)
-	if !plan.Affordable() && canMoveAccounts(req) {
-		// The account in use cannot pay. Another signed-in account might, and
-		// preferring the one that can is the whole reason for having several — so
-		// look before refusing.
-		if e.switchToAffordableAccount(ctx, plan.Cost) {
-			// The switch re-bootstrapped, so both the client and the project now
-			// belong to the account that was just left behind and have to be
-			// rebuilt before anything is sent under them.
-			//
-			// `e.Jar()` and not `e.bridge.Jar()`: the re-bootstrap captured the
-			// new account's cookies as the primary jar, while the bridge's is
-			// whichever profile synced last — so reading the bridge here would
-			// rebuild the client under the wrong account, which is precisely the
-			// account this branch just decided not to use.
-			if switchedJar := e.Jar(); switchedJar != nil {
-				jar = switchedJar
-				client = e.newBatchexecuteClient(jar, e.hc)
-				if id := e.ProjectID(); id != "" {
-					projectID = id
-				}
-				plan = e.planVideo(ctx, client, req, requestedModel, requestedQuality)
-			}
-		}
+	cost, known, _ := videoJobCost(req.Duration, req.Count, quality)
+	if !known {
+		log.Printf("engine: no recorded cost for %ds at %s; the balance cannot be checked "+
+			"before submitting", req.Duration, quality)
 	}
+
+	// ensureAffordable reads the balance and, when this account cannot pay and
+	// the request is allowed to travel, moves to one that can — returning the
+	// rebuilt client, jar and project. `canMoveAccounts` is false when the
+	// request is conditioned on an existing asset, because moving accounts moves
+	// the project with it and the id would not be in the new listing.
+	target := e.ensureAffordable(ctx, generationTarget{
+		Client: client, Jar: jar, ProjectID: projectID,
+	}, cost, canMoveAccounts(req))
+	client, jar, projectID = target.Client, target.Jar, target.ProjectID
+
+	// The refusal is decided here rather than inside ensureAffordable, so the
+	// message keeps quoting the duration, quality and count the price came from.
+	// decideVideoPlan is the tested statement of that rule — including that an
+	// unaffordable quality is refused rather than quietly downgraded.
+	plan := decideVideoPlan(req.Duration, req.Count, model, quality, target.Balance)
 	if !plan.Affordable() {
 		err := fmt.Errorf("engine: %s", plan.Reason)
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
@@ -3210,14 +3373,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		for _, frame := range frames {
 			outcome.RawFrames = append(outcome.RawFrames, frame.Payload)
 		}
-		emptyErr = &EmptyResultError{
-			Kind:    "video",
-			Model:   model,
-			JobID:   jobID,
-			Account: e.AccountID(),
-			Frames:  len(frames),
-			Hint:    e.emptySubmissionHint(),
-		}
+		emptyErr = e.videoEmptyError("video", model, jobID, frames)
 	}
 
 	// The response carries the balance alongside the media, so record it rather
@@ -3371,19 +3527,47 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	}
 	_ = rowID
 
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's — see Engine.Jar, and the note
+	// in GenerateVideoViaBatch. This path used to read the bridge's jar, which
+	// answers with whichever profile synced last: an edit submitted as the
+	// primary account would then go out under a different profile's session
+	// while naming this account's project, and upstream answers that with an
+	// empty result rather than an error.
+	jar := e.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
+
+	// Can this account pay for an edit? Before this, the path minted a token and
+	// submitted, and the server accepted a job the balance could not cover and
+	// answered with no media — which reads as a broken request rather than as an
+	// empty wallet.
+	//
+	// The check runs before the mint and before the source is resolved, for the
+	// same reason it does on the video path: a token is a browser round trip and
+	// resolving an asset is a listing read, and neither should be spent on a job
+	// that cannot be paid for.
+	//
+	// An edit cannot move accounts. Its source is an asset id inside this
+	// account's project, and moving accounts moves the project with it — so the
+	// id would not be in the new listing. See canMoveAccounts.
+	target := e.ensureAffordable(ctx, generationTarget{
+		Client: client, Jar: jar, ProjectID: projectID,
+	}, config.CreditsPerVideoEdit, false)
+	client, projectID = target.Client, target.ProjectID
+	if err := e.refuseIfShort(target, config.CreditsPerVideoEdit, "a video edit"); err != nil {
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
+		return nil, err
+	}
+
+	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
+	if err != nil {
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
+		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
+	}
 
 	source, err := e.conditionImageID(ctx, req.Source)
 	if err != nil {
@@ -3421,20 +3605,30 @@ func (e *Engine) EditVideoViaBatch(ctx context.Context, req BatchEditRequest) (*
 	var emptyErr error
 	if len(outcome.MediaIDs) == 0 {
 		outcome.Status = "empty"
-		emptyErr = &EmptyResultError{
-			Kind:    "video edit",
-			Model:   model,
-			JobID:   jobID,
-			Account: e.AccountID(),
-			Frames:  len(frames),
-			Hint:    e.emptySubmissionHint(),
+		// The raw frames are the only record of what the transport actually
+		// said, and the outcome is returned alongside the error rather than
+		// instead of it — discarding them would throw away the one thing that
+		// makes a refusal diagnosable. Same reasoning as GenerateVideoViaBatch.
+		for _, frame := range frames {
+			outcome.RawFrames = append(outcome.RawFrames, frame.Payload)
 		}
+		emptyErr = e.videoEmptyError("video edit", model, jobID, frames)
 	}
 
-	if credits, credErr := client.Credits(ctx, batchexecute.CallOptions{
+	// Bookkeeping gets its own deadline, as it does in GenerateVideoViaBatch.
+	// On the request context a balance read can block a submission that has
+	// already been accepted: the media ids are in hand and this read cannot
+	// change the outcome, so it must not be able to hold the call open.
+	creditCtx, cancelCredits := context.WithTimeout(ctx, creditsReadTimeout)
+	credits, credErr := client.Credits(creditCtx, batchexecute.CallOptions{
 		SourcePath: "/", BuildLabel: config.BuildLabel(),
-	}); credErr == nil {
+	})
+	cancelCredits()
+	if credErr == nil {
 		outcome.Credits = credits
+	} else {
+		log.Printf("engine: could not read the balance after submitting (%v); the submission "+
+			"itself is unaffected", credErr)
 	}
 
 	if (req.Wait || req.Download) && len(outcome.MediaIDs) > 0 {
@@ -3517,31 +3711,53 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	accountID := e.AccountID()
 
 	rowID, err := e.store.RecordGeneration(store.Generation{
-		JobID:    jobID,
-		Kind:     "video",
-		Prompt:   req.Prompt,
-		Model:    model,
-		Duration: req.Duration,
-		Status:   "submitted",
+		JobID:     jobID,
+		AccountID: accountID,
+		Kind:      "video",
+		Prompt:    req.Prompt,
+		Model:     model,
+		Duration:  req.Duration,
+		Status:    "submitted",
 	})
 	if err != nil {
 		log.Printf("engine: could not record the job: %v", err)
 	}
 	_ = rowID
 
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's — see Engine.Jar, and the note
+	// in GenerateVideoViaBatch. The bridge's jar is whichever profile synced
+	// last, so on a multi-profile bridge this submission would go out under
+	// another account's session while naming this account's project.
+	jar := e.Jar()
 	if jar == nil {
 		err := fmt.Errorf("engine: no cookies loaded")
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		return nil, err
 	}
 	client := e.newBatchexecuteClient(jar, e.hc)
+
+	// Can this account pay for a reference render? Same reasoning as the edit
+	// path: without the check the submission is accepted and answered with
+	// nothing, which reads as a broken request rather than as an empty wallet.
+	//
+	// A reference render cannot move accounts either. Its references are asset
+	// ids inside this account's project, and moving accounts moves the project
+	// with it — so they would not be in the new listing.
+	target := e.ensureAffordable(ctx, generationTarget{
+		Client: client, Jar: jar, ProjectID: projectID,
+	}, config.CreditsPerReferenceVideo, false)
+	client, projectID = target.Client, target.ProjectID
+	if err := e.refuseIfShort(target, config.CreditsPerReferenceVideo,
+		"a reference-image video"); err != nil {
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
+		return nil, err
+	}
+
+	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
+	if err != nil {
+		e.finishJob(jobID, "failed", nil, start, err, accountID)
+		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
+	}
 
 	// The RPC takes content ids, the same as the condition images do.
 	refs := make([]string, 0, len(req.References))
@@ -3584,20 +3800,28 @@ func (e *Engine) GenerateVideoFromReferencesViaBatch(ctx context.Context, req Ba
 	var emptyErr error
 	if len(outcome.MediaIDs) == 0 {
 		outcome.Status = "empty"
-		emptyErr = &EmptyResultError{
-			Kind:    "video reference",
-			Model:   model,
-			JobID:   jobID,
-			Account: e.AccountID(),
-			Frames:  len(frames),
-			Hint:    e.emptySubmissionHint(),
+		// Keep the raw frames, for the reason GenerateVideoViaBatch does: they
+		// are the only record of what the transport actually said, and the
+		// outcome is returned alongside the error rather than instead of it.
+		for _, frame := range frames {
+			outcome.RawFrames = append(outcome.RawFrames, frame.Payload)
 		}
+		emptyErr = e.videoEmptyError("video reference", model, jobID, frames)
 	}
 
-	if credits, credErr := client.Credits(ctx, batchexecute.CallOptions{
+	// Bookkeeping gets its own deadline, as it does in GenerateVideoViaBatch —
+	// a balance read on the request context can hold open a submission that has
+	// already been accepted.
+	creditCtx, cancelCredits := context.WithTimeout(ctx, creditsReadTimeout)
+	credits, credErr := client.Credits(creditCtx, batchexecute.CallOptions{
 		SourcePath: "/", BuildLabel: config.BuildLabel(),
-	}); credErr == nil {
+	})
+	cancelCredits()
+	if credErr == nil {
 		outcome.Credits = credits
+	} else {
+		log.Printf("engine: could not read the balance after submitting (%v); the submission "+
+			"itself is unaffected", credErr)
 	}
 
 	if (req.Wait || req.Download) && len(outcome.MediaIDs) > 0 {
@@ -3650,7 +3874,14 @@ func (e *Engine) UploadImageViaBatch(ctx context.Context, data []byte, mimeType,
 		return "", "", fmt.Errorf("engine: no project id resolved")
 	}
 
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's — see Engine.Jar. This path
+	// carries a reCAPTCHA token, so it is bound by the same rule as a
+	// generation: a token minted for the account the engine acts as, spent under
+	// whichever profile synced last, is a mismatch upstream answers with an
+	// empty result. It had no callers when this was fixed, so it could not be
+	// tested — it is corrected here so that the caller S8 adds does not inherit
+	// the bug.
+	jar := e.Jar()
 	if jar == nil {
 		return "", "", fmt.Errorf("engine: no cookies loaded")
 	}
@@ -3734,7 +3965,15 @@ func (e *Engine) conditionImageID(ctx context.Context, id string) (string, error
 		return "", fmt.Errorf("engine: not ready — call Bootstrap first")
 	}
 
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's — see Engine.Jar.
+	//
+	// This is the condition-image half of a generation, so it has to be made as
+	// the account that is about to submit. Reading the project listing as
+	// whichever profile synced last reports the asset as absent from a project
+	// it is sitting in, and the error that produces ("not in the project
+	// listing, so its content id cannot be resolved") names the symptom rather
+	// than the account mismatch that caused it.
+	jar := e.Jar()
 	if jar == nil {
 		return "", fmt.Errorf("engine: no cookies loaded")
 	}
@@ -3786,7 +4025,10 @@ func (e *Engine) ResolveContentID(ctx context.Context, mediaID string) (string, 
 	if projectID == "" {
 		return "", fmt.Errorf("engine: no project id resolved")
 	}
-	jar := e.bridge.Jar()
+	// The engine's own cookies, not the bridge's — see Engine.Jar. Same reason
+	// as conditionImageID: this resolves an asset inside the account's project,
+	// so it has to read that project as that account.
+	jar := e.Jar()
 	if jar == nil {
 		return "", fmt.Errorf("engine: no cookies loaded")
 	}
@@ -4067,6 +4309,23 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 	}
 
 	client := e.newBatchexecuteClient(jar, e.hc)
+
+	// The shared pre-flight, wired here for the same reason it is on the video
+	// paths: an account that cannot pay must be refused before the request goes
+	// out, not diagnosed from the empty answer afterwards.
+	//
+	// The cost is zero because no per-image price is recorded, and a cost of zero
+	// means the check is not made — which is the honest answer rather than a
+	// guess. It is called anyway so that the four generation paths read the same
+	// way, and so that the day a price exists there is one place to put it.
+	//
+	// An image carries no conditioning, so it would be free to move accounts —
+	// but with no recorded price there is nothing to move for.
+	target := e.ensureAffordable(ctx, generationTarget{
+		Client: client, Jar: jar, ProjectID: projectID,
+	}, 0, true)
+	client, projectID = target.Client, target.ProjectID
+
 	media, err := client.GenerateMedia(ctx, batchexecute.GenerateRequest{
 		ProjectID:    projectID,
 		Model:        model,
@@ -4076,7 +4335,15 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		SourcePath: "/project/" + projectID,
 		BuildLabel: config.BuildLabel(),
 	}))
-	if err != nil {
+
+	// A stated refusal is not a broken call. The server answered — the answer
+	// was "no, and here is why" — so it is reported as an empty result carrying
+	// the reason, the same way the video paths report one, rather than as a
+	// transport failure. Before this it was not distinguished from a silent
+	// no-op, and the hint that came with that named the model enum and the
+	// project; both were correct.
+	var rejected *batchexecute.RejectedError
+	if err != nil && !errors.As(err, &rejected) {
 		e.finishJob(jobID, "failed", nil, start, err, accountID)
 		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
 		return nil, err
@@ -4095,13 +4362,23 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		// Accepted but nothing came back. The app's own call returns the asset
 		// inline, so this means the request was a no-op — worth surfacing rather
 		// than reporting success on an empty result.
+		//
+		// Unless it was refused, in which case it was neither silent nor a
+		// no-op and the reason is what the caller needs.
+		reason := ""
+		frames := 0
+		if rejected != nil {
+			reason, frames = rejected.Reason, rejected.Frames
+		}
 		outcome.Status = "empty"
 		emptyErr = &EmptyResultError{
-			Kind:    "image",
-			Model:   model,
-			JobID:   jobID,
-			Account: e.AccountID(),
-			Hint:    e.emptyImageHint(),
+			Kind:     "image",
+			Model:    model,
+			JobID:    jobID,
+			Account:  e.AccountID(),
+			Frames:   frames,
+			Rejected: reason,
+			Hint:     hintForRejection(reason, e.emptyImageHint()),
 		}
 	}
 

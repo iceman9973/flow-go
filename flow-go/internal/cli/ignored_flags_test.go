@@ -53,19 +53,29 @@ func captureStreams(t *testing.T, fn func()) (stdout, stderr string) {
 }
 
 func TestIgnoredGenerateFlagsNamesWhatWasPassed(t *testing.T) {
-	got := ignoredGenerateFlags("9:16", "4k", 7, []string{"media-1"})
+	got := ignoredGenerateFlags("9:16", "4k", 7)
 
-	for _, want := range []string{"--aspect", "--resolution", "--seed", "--reference"} {
+	for _, want := range []string{"--aspect", "--resolution", "--seed"} {
 		if !contains(got, want) {
 			t.Errorf("ignoredGenerateFlags missed %q: %v", want, got)
 		}
 	}
 }
 
+// --reference left this list when the CLI started routing it to the
+// reference-to-video submission. It used to be reported as ignored even though
+// the engine had a working path for it all along, and reporting it as ignored
+// now would be a lie about what the run actually did.
+func TestReferenceIsNoLongerReportedAsIgnored(t *testing.T) {
+	if got := ignoredGenerateFlags("", "", 0); contains(got, "--reference") {
+		t.Errorf("--reference is reported as ignored, but it is applied now: %v", got)
+	}
+}
+
 func TestIgnoredGenerateFlagsIsEmptyWhenNothingWasPassed(t *testing.T) {
 	// The common case. A warning printed for a run that passed no unsupported
 	// flag is noise, and noise on stderr is what teaches a caller to ignore it.
-	if got := ignoredGenerateFlags("", "", 0, nil); len(got) != 0 {
+	if got := ignoredGenerateFlags("", "", 0); len(got) != 0 {
 		t.Errorf("nothing was passed but %v was reported", got)
 	}
 }
@@ -75,10 +85,10 @@ func TestIgnoredGenerateFlagsTreatsAZeroSeedAsUnset(t *testing.T) {
 	// than a bug: the flag cannot distinguish "not passed" from "passed 0", and
 	// warning on every defaulted run would be worse than missing one explicit
 	// zero.
-	if got := ignoredGenerateFlags("", "", 0, nil); len(got) != 0 {
+	if got := ignoredGenerateFlags("", "", 0); len(got) != 0 {
 		t.Errorf("a defaulted seed was reported: %v", got)
 	}
-	if got := ignoredGenerateFlags("", "", 1, nil); !contains(got, "--seed") {
+	if got := ignoredGenerateFlags("", "", 1); !contains(got, "--seed") {
 		t.Errorf("an explicit non-zero seed was not reported: %v", got)
 	}
 }

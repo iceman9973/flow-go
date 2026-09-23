@@ -350,6 +350,24 @@ const MaxCount = 4
 // CreditsPerVideo is the cost of one video at each duration.
 var CreditsPerVideo = map[int]int{4: 7, 6: 10, 8: 12, 10: 15}
 
+// CreditsPerVideoEdit is what one video edit costs.
+//
+// Set to the standard 10s video price. The app does not expose a separate edit
+// price, and an edit is a full render of the same length, so quoting the 10s
+// figure is the closest honest answer available. It is a named constant rather
+// than a literal at the call site so the number is visible and revisable in one
+// place — the edit path had no price at all before this, which meant it had no
+// affordability check either.
+var CreditsPerVideoEdit = 10
+
+// CreditsPerReferenceVideo is what one reference-conditioned video costs.
+//
+// Same reasoning as CreditsPerVideoEdit: a `abra_r2v_*` render is the same
+// length and the same shape of work as the text-conditioned one, so it is priced
+// at the 10s figure. Before this the path had no price, so a reference render on
+// a drained account was submitted and answered with nothing rather than refused.
+var CreditsPerReferenceVideo = 10
+
 // SegmentDuration and FPS describe the produced media.
 const (
 	SegmentDuration = 10
@@ -476,12 +494,19 @@ func LabsAPIKey() string { return labsAPIKey }
 // value observed in the live app's own requests; override with FLOW_BUILD_LABEL
 // when the app ships a new build.
 //
-// Re-read it from a live request rather than trusting this: the app moved from
-// `.00_p0` to `.09_p0` and nothing here noticed, because a stale label produces
+// Re-read it from a live request rather than trusting this, and the reason is in
+// this comment's own history: the app moved from `.00_p0` to `.09_p0` and then
+// on again, and nothing here noticed either time, because a stale label produces
 // no error — the calls simply go out claiming to be an older frontend than the
 // one they are talking to.
+//
+// The current value was read back off https://flow.google.com/ on 2026-09-23
+// rather than assumed, which is the only way this stays true:
+//
+//	curl -sS -A "<a Chrome UA>" https://flow.google.com/ \
+//	  | grep -oE 'boq_labs-ai-sandbox-frontend_[0-9]+\.[0-9]+_p[0-9]'
 func BuildLabel() string {
-	return envOr("FLOW_BUILD_LABEL", "boq_labs-ai-sandbox-frontend_20260917.09_p0")
+	return envOr("FLOW_BUILD_LABEL", "boq_labs-ai-sandbox-frontend_20260922.00_p0")
 }
 
 // LoadEnv reads .env and config.env if present. Real environment variables win,

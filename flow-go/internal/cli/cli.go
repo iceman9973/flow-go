@@ -277,6 +277,12 @@ type commonFlags struct {
 	// one command as one named account, and a setting that persists would make
 	// the next command silently use the previous account.
 	cookies string
+	// refreshCredits reads every registered account's balance as the boot
+	// finishes. Set only by the daemon, where the figures feed the pool's
+	// affordability gate; a one-shot generation neither routes through the pool
+	// nor needs another account's balance, and the fan-out is a burst of upstream
+	// calls against accounts that are not being used.
+	refreshCredits bool
 }
 
 func (c *commonFlags) bind(fs *flag.FlagSet) {
@@ -317,11 +323,12 @@ func envDefault(key, fallback string) string {
 
 func (c *commonFlags) build() (*app.App, error) {
 	return app.Build(app.Config{
-		ProjectID:   c.projectID,
-		ProxyURL:    c.proxy,
-		CaptchaMode: c.captcha,
-		DBPath:      c.db,
-		CookieFile:  c.cookies,
+		ProjectID:            c.projectID,
+		ProxyURL:             c.proxy,
+		CaptchaMode:          c.captcha,
+		DBPath:               c.db,
+		CookieFile:           c.cookies,
+		RefreshCreditsOnBoot: c.refreshCredits,
 	})
 }
 
@@ -398,6 +405,10 @@ func runBridge(args []string) int {
 	var common commonFlags
 	common.bind(fs)
 	_ = fs.Parse(args)
+
+	// The one caller that wants the boot-time balance fan-out: it is the pool's
+	// affordability gate that uses those figures, and this process is the pool.
+	common.refreshCredits = true
 
 	a, err := common.build()
 	if err != nil {

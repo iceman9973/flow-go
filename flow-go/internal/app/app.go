@@ -69,6 +69,11 @@ type Config struct {
 	// client its token was minted for, so a process without this presents a
 	// generic profile and has its token silently discarded.
 	Fingerprint *flowapi.BrowserFingerprint
+	// RefreshCreditsOnBoot reads every registered account's balance as the boot
+	// finishes. Only the daemon sets it: the figures feed the pool's
+	// affordability gate, and a CLI generation run neither routes through the
+	// pool nor needs anyone else's balance. See engine.Options.
+	RefreshCreditsOnBoot bool
 }
 
 // App holds the assembled system.
@@ -123,7 +128,8 @@ func Build(cfg Config) (*App, error) {
 		Jar:          cfg.Jar,
 		// The env value is a default, not an instruction, so it ranks below the
 		// browser. An explicit cfg.ProjectID still outranks both.
-		DefaultProjectID: config.ProjectID,
+		DefaultProjectID:     config.ProjectID,
+		RefreshCreditsOnBoot: cfg.RefreshCreditsOnBoot,
 	})
 	if err != nil {
 		_ = st.Close()

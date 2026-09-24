@@ -73,6 +73,19 @@ type Options struct {
 	// attached — a live page is always the better source.
 	AtToken string
 	Fsid    string
+	// RefreshCreditsOnBoot fans a balance read out across every registered
+	// account as the boot finishes.
+	//
+	// Off by default, because it is only worth paying for where the balances are
+	// actually used: the pool's affordability gate. A CLI generation run does not
+	// route through the pool — it reads the balance for the account it is already
+	// using, at the one point it needs it — so for those commands the fan-out is a
+	// burst of upstream calls against every account that buys nothing and, on an
+	// account already near the edge, is traffic that can earn a refusal.
+	//
+	// The daemon sets it, because there the pool is the thing that decides which
+	// account pays.
+	RefreshCreditsOnBoot bool
 	// CookieFile names one cookie file to act as, e.g.
 	// `cookies/account_27b104997fa0.json`.
 	//
@@ -1201,6 +1214,12 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	primary := e.resolveAccount(ctx, jar, index, browserFP, captchaProvider, primaryBundle)
 	e.pool.Register(primary.Worker)
 
+	// Remember the project in the file it came from, so the next run does not
+	// have to list the projects again. See persistProject. The path is empty when
+	// the jar came from a browser rather than a file, which is the case with
+	// nothing to write to.
+	persistProject(e.opts.CookieFile, primary.ProjectID)
+
 	accountID := primary.AccountID
 	projectID := primary.ProjectID
 	hasSession := primary.HasSession
@@ -1290,9 +1309,15 @@ func (e *Engine) Bootstrap(ctx context.Context) error {
 	// Worker.Affordable reads as affordable, so it costs no capacity and must
 	// never be allowed to fail the boot. It is placed after the warnings so a
 	// slow read cannot delay them.
-	creditCtx, cancelCredits := context.WithTimeout(ctx, creditsReadTimeout)
-	e.RefreshCredits(creditCtx)
-	cancelCredits()
+	//
+	// Skipped unless the caller asked for it: this reads a balance for *every*
+	// registered account, and only the pool uses those figures. See
+	// Options.RefreshCreditsOnBoot.
+	if e.opts.RefreshCreditsOnBoot {
+		creditCtx, cancelCredits := context.WithTimeout(ctx, creditsReadTimeout)
+		e.RefreshCredits(creditCtx)
+		cancelCredits()
+	}
 
 	return nil
 }
@@ -1372,12 +1397,26 @@ func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index i
 	// cookie-authenticated path that was fine, so the failure is recorded and the
 	// boot continues. Calls that genuinely need a bearer token still fail, with
 	// their own error, at the point they need it.
-	session, sessionErr := provider.Session(ctx)
-	hasSession := sessionErr == nil
-	if sessionErr != nil {
-		log.Printf("engine: no Labs session (%v); the bearer path is unavailable, "+
-			"continuing on the cookie-authenticated path", sessionErr)
-		session = &auth.Session{}
+	//
+	// A complete bundle skips the call outright. That bundle is the cookie
+	// credential — cookies, page tokens, fingerprint — which is the setup the
+	// paragraph above describes, so the call is a round trip that is known in
+	// advance to answer an empty session. What it would have supplied is the
+	// subscription tier, and that is empty in exactly this case anyway.
+	//
+	// Nothing reads hasSession; it is recorded so a caller can tell which path a
+	// boot took, and false is what it would be after the call failed.
+	session := &auth.Session{}
+	hasSession := false
+	if bundle == nil || !bundle.Complete() {
+		var sessionErr error
+		session, sessionErr = provider.Session(ctx)
+		hasSession = sessionErr == nil
+		if sessionErr != nil {
+			log.Printf("engine: no Labs session (%v); the bearer path is unavailable, "+
+				"continuing on the cookie-authenticated path", sessionErr)
+			session = &auth.Session{}
+		}
 	}
 
 	// One browser can hold several signed-in accounts and they share a cookie
@@ -1402,7 +1441,7 @@ func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index i
 		bundleProject = bundle.ProjectID
 	}
 	projectID, projectSource := chooseProjectID(e.opts.ProjectID, bundleProject, e.opts.DefaultProjectID,
-		func() string { return e.projectFromRPC(ctx, jar, index) },
+		func() string { return e.projectFromRPC(ctx, jar, index, bundle) },
 		func() string { return e.projectFromBrowser(ctx, index) })
 	switch projectSource {
 	case projectSourceConfigured:
@@ -1536,6 +1575,10 @@ func (e *Engine) registerAccountDumps(ctx context.Context, fp *flowapi.BrowserFi
 
 		log.Printf("engine: registered account %s from %s (project %s)",
 			boot.AccountID, filepath.Base(dump.Path), boot.ProjectID)
+
+		// Remember the project in the file it came from, so the next run does not
+		// have to list the projects again. See persistProject.
+		persistProject(dump.Path, boot.ProjectID)
 	}
 }
 
@@ -1903,7 +1946,9 @@ func userAgentOf(fp *flowapi.BrowserFingerprint) string {
 // projects, because this is one of several sources and a caller that has to
 // distinguish "failed" from "empty" would only re-report both as "try the next
 // one".
-func (e *Engine) projectFromRPC(ctx context.Context, jar *cookiejar.Jar, index int) string {
+func (e *Engine) projectFromRPC(ctx context.Context, jar *cookiejar.Jar, index int,
+	bundle *cookiejar.Bundle) string {
+
 	if jar == nil {
 		return ""
 	}
@@ -1913,6 +1958,24 @@ func (e *Engine) projectFromRPC(ctx context.Context, jar *cookiejar.Jar, index i
 
 	client := e.newBatchexecuteClient(jar, e.hc)
 	client.SetAuthUser(index)
+
+	// This account's own page tokens, for the same reason creditsReader seeds
+	// them: newBatchexecuteClient carries whatever Bootstrap read for the
+	// *primary* account, and the primary is resolved before those tokens are
+	// read — so the listing used to go out with no usable token at all.
+	//
+	// The consequence was visible in every boot log as
+	// `batchexecute: UpteDb primed; retrying`: the listing earned a rejection,
+	// scraped a token out of the body, and sent itself again. Seeding the
+	// account's own pair removes that whole round trip.
+	at, fsid, clear := creditPageTokens(index, bundle)
+	switch {
+	case clear:
+		client.SeedToken("")
+	case at != "":
+		client.SeedToken(at)
+		client.SetSessionID(fsid)
+	}
 
 	projects, err := client.ProjectList(callCtx, batchexecute.CallOptions{
 		SourcePath: "/",
@@ -2053,6 +2116,44 @@ func loadLegacyPageTokens() pageTokenSet {
 		return pageTokenSet{}
 	}
 	return tokens
+}
+
+// persistProject records a project the engine had to work out into the account
+// file it was worked out for.
+//
+// Without this the resolution is thrown away at exit and paid for again on the
+// next run: the file is the only place a project is remembered between processes.
+// The bridge does not fill it either — mergeBundle only ever writes a project into
+// a bundle that has none, and it has no way to learn one — so a browserless run
+// re-lists the projects every single time.
+//
+// Best effort, and it never overwrites. A file that already names a project is
+// left alone: the value in it was chosen for that account, and a project belongs
+// to exactly one signed-in account, so replacing it with a fresher one would be
+// the mismatch this area exists to avoid. A write that fails costs a round trip
+// next run, which is what happens today, so it must not fail the boot.
+func persistProject(path, projectID string) {
+	if path == "" || projectID == "" {
+		return
+	}
+
+	bundle, err := cookiejar.LoadBundleFile(path)
+	if err != nil {
+		log.Printf("engine: could not read %s to record its project (%v)", filepath.Base(path), err)
+		return
+	}
+	if bundle.ProjectID != "" {
+		return
+	}
+
+	bundle.ProjectID = projectID
+	if err := bundle.Save(path); err != nil {
+		log.Printf("engine: could not record project %s in %s (%v); the next run will ask again",
+			projectID, filepath.Base(path), err)
+		return
+	}
+	log.Printf("engine: recorded project %s in %s, so the next run does not have to ask",
+		projectID, filepath.Base(path))
 }
 
 // pageTokens reads the two values the app puts on every batchexecute request:

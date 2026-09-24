@@ -145,7 +145,10 @@ func TestProjectFromRPCProvisionsWhenTheListingIsEmpty(t *testing.T) {
 	}
 	e := &Engine{hc: hc}
 
-	got := e.projectFromRPC(context.Background(), identityJar("sapisid-value", "rotating-value"), 0)
+	// A nil bundle: this engine has no account file, so there is no page-token
+	// pair to seed and the client primes for its own. The path under test is the
+	// provisioning one.
+	got := e.projectFromRPC(context.Background(), identityJar("sapisid-value", "rotating-value"), 0, nil)
 	if got != id {
 		t.Fatalf("projectFromRPC returned %q, want the auto-provisioned %q", got, id)
 	}

@@ -435,6 +435,7 @@ func renderDoctor(r doctorReport) {
 	fmt.Printf("  %-17s %s\n", "data dir", r.Paths.DataDir)
 	fmt.Printf("  %-17s %s\n", "cookie dir", r.Paths.CookieDir)
 	fmt.Printf("  %-17s %s\n", "output dir", r.Paths.OutputDir)
+	fmt.Printf("  %-17s %s\n", "log file", config.LogPath())
 	fmt.Println()
 
 	for _, c := range r.Checks {

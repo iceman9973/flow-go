@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,10 +33,17 @@ const Version = "0.1.0"
 func Run(args []string) int {
 	config.LoadEnv()
 
+	closeLog := initUnifiedLogging()
+	if closeLog != nil {
+		defer closeLog()
+	}
+
 	if len(args) == 0 {
 		fmt.Print(usage())
 		return 0
 	}
+
+	log.Printf("cli: run %s", strings.Join(args, " "))
 
 	switch args[0] {
 	case "bridge", "serve", "server":
@@ -1964,8 +1973,40 @@ func printJSON(value any) {
 }
 
 func fail(err error) int {
+	log.Printf("cli: error: %v", err)
 	fmt.Fprintf(os.Stderr, "error: %v\n", err)
 	return 1
+}
+
+// initUnifiedLogging configures log to write to both stderr and the unified
+// log file (data/flow.log), avoiding duplicate writes if stderr is already redirected.
+func initUnifiedLogging() func() {
+	logPath := config.LogPath()
+	if logPath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+		return nil
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil
+	}
+
+	var w io.Writer = f
+	stderrStat, err1 := os.Stderr.Stat()
+	fileStat, err2 := f.Stat()
+	if err1 == nil && err2 == nil && !os.SameFile(stderrStat, fileStat) {
+		w = io.MultiWriter(os.Stderr, f)
+	}
+
+	log.SetOutput(w)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	return func() {
+		_ = f.Sync()
+		_ = f.Close()
+	}
 }
 
 func yesNo(value bool) string {

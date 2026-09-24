@@ -2,8 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -21,6 +23,99 @@ func openTemp(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+// TestOpenSetsBusyTimeout is the regression test for a startup race.
+//
+// Five CLI processes were launched at once; four came up and one died with
+// "store: ping ...: database is locked (261)" — SQLITE_BUSY with nothing to wait
+// on. The setting lived only in schema.sql, which migrate applies *after* the
+// ping, so the ping was the one statement with no timeout.
+func TestOpenSetsBusyTimeout(t *testing.T) {
+	st := openTemp(t)
+
+	var timeout int
+	if err := st.db.QueryRow("PRAGMA busy_timeout").Scan(&timeout); err != nil {
+		t.Fatalf("reading busy_timeout: %v", err)
+	}
+	if timeout != 5000 {
+		t.Errorf("busy_timeout = %d, want 5000", timeout)
+	}
+}
+
+// TestConcurrentOpensOnAFreshDatabaseAllSucceed reproduces the live failure.
+//
+// Every process runs migrate, and migrate switches journal_mode to WAL, which
+// takes a lock — so the second one in has to wait. Without a busy timeout on the
+// connection it does not wait, it dies: that is the "database is locked (261)"
+// a fifth concurrent CLI process reported at startup.
+//
+// Five is not arbitrary. The run that failed had five, and the failure is
+// contention-shaped: it needs enough openers arriving together for the lock to
+// be held when the others reach the ping.
+func TestConcurrentOpensOnAFreshDatabaseAllSucceed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "contended.db")
+
+	const openers = 5
+	errs := make([]error, openers)
+	stores := make([]*Store, openers)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release them together, which is what makes it a race
+			stores[i], errs[i] = Open(path)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("opener %d failed: %v", i, err)
+		}
+		if stores[i] != nil {
+			_ = stores[i].Close()
+		}
+	}
+}
+
+// The positive case is covered by the concurrency test above — if isBusy never
+// matched, nothing would be retried and that test would fail. This pins the other
+// direction, so a plain failure is still reported rather than retried for two
+// seconds first.
+func TestIsBusyIsFalseForEverythingElse(t *testing.T) {
+	if isBusy(nil) {
+		t.Error("nil is not a lock contention")
+	}
+	if isBusy(fmt.Errorf("store: migration failed on \"x\": no such table: nope")) {
+		t.Error("an unrelated failure was read as lock contention")
+	}
+	if isBusy(fmt.Errorf("store: some wrapped error: %w", sql.ErrNoRows)) {
+		t.Error("a non-SQLite error was read as lock contention")
+	}
+}
+
+// The connection string has to survive a path that is already a URI, and an
+// in-memory database must be left exactly as it was: appending a query to
+// ":memory:" changes which database the driver opens.
+func TestBusyTimeoutIsAddedToTheConnectionString(t *testing.T) {
+	pragma := fmt.Sprintf("_pragma=busy_timeout(%d)", busyTimeout)
+
+	cases := map[string]string{
+		"/tmp/flow.db":                        "/tmp/flow.db?" + pragma,
+		"file:/tmp/flow.db":                   "file:/tmp/flow.db?" + pragma,
+		"file:/tmp/flow.db?_txlock=immediate": "file:/tmp/flow.db?_txlock=immediate&" + pragma,
+		":memory:":                            ":memory:",
+	}
+	for in, want := range cases {
+		if got := withBusyTimeout(in); got != want {
+			t.Errorf("withBusyTimeout(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 // TestEmptyDatabaseReportsZeros is the direct regression test for the reporting

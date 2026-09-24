@@ -15,6 +15,8 @@
 /flow-go/data/
 /flow-go/output/
 /flow-go/cookies/
+/flow-go/flow.log
+*.log
 .env
 config.env
 

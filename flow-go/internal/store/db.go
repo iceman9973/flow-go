@@ -23,7 +23,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
+	modernsqlite "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed schema.sql
@@ -33,6 +34,93 @@ var schemaSQL string
 type Store struct {
 	db   *sql.DB
 	path string
+}
+
+// busyTimeout is how long a statement waits for another process's lock before
+// giving up, in milliseconds.
+//
+// It goes on the connection string rather than only in schema.sql because the
+// two take effect at different times. schema.sql is applied by migrate, which
+// runs *after* the ping — so on a fresh connection the ping is the one statement
+// with no timeout at all, and SQLite's default is to fail immediately rather than
+// wait. A live run with five CLI processes starting at once showed exactly that:
+// "store: ping ...: database is locked (261)", which is SQLITE_BUSY with nothing
+// to wait on.
+//
+// The driver applies DSN pragmas as it opens the connection and deliberately
+// orders busy_timeout ahead of the rest (modernc.org/sqlite's applyQueryParams),
+// so this is the earliest the setting can take effect. schema.sql keeps its own
+// line as the schema's record of the intended settings; re-asserting a pragma is
+// harmless.
+//
+// This does NOT cover the migration — see migrateAttempts for why.
+const busyTimeout = 5000
+
+// migrateAttempts is how many times a migration is retried while another process
+// holds the lock.
+//
+// A busy_timeout does not help here, and the reason is specific: migrate switches
+// a fresh database to WAL, and SQLite does not run the busy handler for a
+// journal-mode change. It answers SQLITE_BUSY immediately however long the
+// timeout is. Five processes opening one fresh file together therefore raced —
+// one won the switch and the rest died at startup — and a connection-level
+// timeout only moved the failure from the ping to the migration.
+//
+// Retrying is safe because every statement is idempotent: the tables are
+// CREATE ... IF NOT EXISTS and the added columns are guarded by a PRAGMA
+// table_info check, so a half-finished migration is a valid starting point for
+// the next attempt.
+const migrateAttempts = 8
+
+// isBusy reports whether err is SQLite saying another connection holds the lock.
+//
+// Matched on the driver's result code rather than on the message. The code can be
+// the extended form (261, SQLITE_BUSY_RECOVERY) as well as the primary one (5),
+// and the primary code is the low byte of the extended code.
+func isBusy(err error) bool {
+	var sqliteErr *modernsqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
+// migrateWithRetry runs the migration, waiting out a lock held by another process
+// that is starting at the same time.
+//
+// The wait grows, because the contenders are not synchronised: a fixed pause
+// would just line them up to collide again. It stays short in total — the other
+// process is only switching journal mode — so a genuine failure is still reported
+// quickly rather than after a long silence.
+func migrateWithRetry(db *sql.DB) error {
+	var err error
+	for attempt := 0; attempt < migrateAttempts; attempt++ {
+		if err = migrate(db); err == nil {
+			return nil
+		}
+		if !isBusy(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+	}
+	return fmt.Errorf("store: the database stayed locked by another process through %d "+
+		"migration attempts: %w", migrateAttempts, err)
+}
+
+// withBusyTimeout adds the busy-timeout pragma to a connection string.
+//
+// An in-memory database is left alone: it has no other process to contend with,
+// and appending a query to ":memory:" changes which database the driver opens.
+// A path that already carries query parameters keeps them.
+func withBusyTimeout(path string) string {
+	if path == ":memory:" {
+		return path
+	}
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + fmt.Sprintf("_pragma=busy_timeout(%d)", busyTimeout)
 }
 
 // Open opens (and migrates) the database at path.
@@ -50,7 +138,7 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", withBusyTimeout(path))
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
@@ -67,7 +155,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: ping %s: %w", path, err)
 	}
 
-	if err := migrate(db); err != nil {
+	if err := migrateWithRetry(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

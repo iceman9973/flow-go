@@ -3,7 +3,43 @@ package engine
 import (
 	"strings"
 	"testing"
+
+	"github.com/kodelyx/flow-go/flow-go/internal/batchexecute"
 )
+
+// TestVideoEmptyErrorReadsTheReasonFromTheFrames pins the contract the video
+// paths depend on.
+//
+// They build their user-facing message from the refusal's frames, which is where
+// the reason and its hint come from. That only works while the transport hands
+// the frames back alongside the refusal — it used to return nil with the error,
+// which turned a named refusal into a bare "nothing came back", and this is the
+// test that says so.
+func TestVideoEmptyErrorReadsTheReasonFromTheFrames(t *testing.T) {
+	e := identityEngine(t, Options{})
+
+	refused := e.videoEmptyError("video", "abra_t2v_8s", "job-1", []batchexecute.Frame{{
+		RPCID: "YhhmEf",
+		Error: batchexecute.ReasonUnusualActivity,
+	}})
+
+	if refused.Rejected != batchexecute.ReasonUnusualActivity {
+		t.Errorf("Rejected = %q, want %q", refused.Rejected, batchexecute.ReasonUnusualActivity)
+	}
+	if refused.Frames != 1 {
+		t.Errorf("Frames = %d, want 1 — a refusal is a frame that came back, not silence", refused.Frames)
+	}
+	if !strings.Contains(refused.Error(), batchexecute.ReasonUnusualActivity) {
+		t.Errorf("Error() = %q, want it to name the reason", refused.Error())
+	}
+
+	// The reason buys a different hint, which is most of what the reason is for.
+	silent := e.videoEmptyError("video", "abra_t2v_8s", "job-1", nil)
+	if refused.Hint == silent.Hint {
+		t.Error("a refused video got the same hint as a silent one; the reason-specific " +
+			"hint is the point of carrying the reason at all")
+	}
+}
 
 // TestEmptyResultErrorCarriesTheDiagnosis checks the message is actually usable.
 //

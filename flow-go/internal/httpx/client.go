@@ -17,6 +17,7 @@ import (
 	"io"
 	stdhttp "net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,22 +59,65 @@ var ChromePseudoHeaderOrder = []string{
 	":path",
 }
 
-// platformDetails returns the UA / sec-ch-ua values matching the host OS, so the
-// client looks like the browser it claims to be.
-func platformDetails() (ua, platform, secChUa string) {
+// chromeFullVersion is the build every client hint and the User-Agent agree on.
+//
+// It is written down once and the headers that carry a version are derived from
+// it, because a Chrome reporting one build in its User-Agent and another in
+// sec-ch-ua-full-version is more distinctive than one that omits the hint
+// altogether — the mismatch is the tell. It matches profiles.Chrome_152, which
+// is the TLS profile this client presents.
+const chromeFullVersion = "152.0.0.0"
+
+// chromeMajorVersion is the significant version, which is what sec-ch-ua carries
+// in its brand list.
+var chromeMajorVersion = strings.SplitN(chromeFullVersion, ".", 2)[0]
+
+// chromeSecChUABrands is the brand list Chrome sends, built from the version
+// above so it cannot drift away from the full-version hint.
+var chromeSecChUABrands = `"Not(A:Brand";v="99", "Google Chrome";v="` +
+	chromeMajorVersion + `", "Chromium";v="` + chromeMajorVersion + `"`
+
+// platformDetails returns the User-Agent and client-hint values matching the
+// host OS and architecture, so the client looks like the browser it claims to
+// be.
+//
+// arch and bitness are the pair Chrome derives from the machine: "arm" on Apple
+// Silicon and 64-bit ARM Linux, "x86" on Intel Macs and Windows, 64 either way.
+// Reporting them rather than leaving them out is the point of this function —
+// ChromeHeaderOrder already declares both hints, and a header that is declared
+// in the order but absent from the request is itself an automation tell.
+func platformDetails() (ua, platform, secChUa, arch, bitness string) {
+	arch = clientHintArch()
+	bitness = strconv.Itoa(strconv.IntSize)
+
 	switch runtime.GOOS {
 	case "windows":
-		return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-			`"Windows"`,
-			`"Not(A:Brand";v="99", "Google Chrome";v="152", "Chromium";v="152"`
+		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+			"(KHTML, like Gecko) Chrome/" + chromeFullVersion + " Safari/537.36"
+		platform = `"Windows"`
 	case "linux":
-		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-			`"Linux"`,
-			`"Not(A:Brand";v="99", "Google Chrome";v="152", "Chromium";v="152"`
+		ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+			"(KHTML, like Gecko) Chrome/" + chromeFullVersion + " Safari/537.36"
+		platform = `"Linux"`
 	default:
-		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-			`"macOS"`,
-			`"Not(A:Brand";v="99", "Google Chrome";v="152", "Chromium";v="152"`
+		ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+			"(KHTML, like Gecko) Chrome/" + chromeFullVersion + " Safari/537.36"
+		platform = `"macOS"`
+	}
+	return ua, platform, chromeSecChUABrands, arch, bitness
+}
+
+// clientHintArch is the sec-ch-ua-arch value for this machine.
+//
+// Chrome reports the architecture *family* rather than the exact chip, so Go's
+// GOARCH is narrower than what the hint needs: amd64 and 386 are both "x86", and
+// arm64 and arm are both "arm".
+func clientHintArch() string {
+	switch runtime.GOARCH {
+	case "arm64", "arm":
+		return "arm"
+	default:
+		return "x86"
 	}
 }
 
@@ -83,10 +127,12 @@ var (
 	ChromeUA       = ""
 	ChromePlatform = ""
 	ChromeSecChUA  = ""
+	ChromeArch     = ""
+	ChromeBitness  = ""
 )
 
 func init() {
-	ChromeUA, ChromePlatform, ChromeSecChUA = platformDetails()
+	ChromeUA, ChromePlatform, ChromeSecChUA, ChromeArch, ChromeBitness = platformDetails()
 }
 
 // Request describes one outbound call.
@@ -356,14 +402,31 @@ func applyHeaders(hreq *http.Request, req *Request) {
 	}
 }
 
+// defaultHeaders are the headers every request carries.
+//
+// The set is chosen to match what Chrome sends on a fetch/XHR, because
+// ChromeHeaderOrder declares the order these arrive in and an order list is only
+// meaningful for headers that are actually present. Four of them were declared
+// and never sent — priority, and the arch/bitness/full-version hints — which is a
+// declared-versus-present mismatch that a fingerprinting edge can read directly.
+//
+// Note what is deliberately still absent: Accept-Encoding. Go's transport
+// negotiates it and transparently decodes whatever comes back; setting it by hand
+// turns that decoding off, and a caller handed compressed bytes has a worse bug
+// than a missing header. It is a separate change with its own verification, not
+// a line to add here.
 func defaultHeaders() map[string]string {
 	return map[string]string{
-		"User-Agent":         ChromeUA,
-		"Accept":             "*/*",
-		"Accept-Language":    "en-US,en;q=0.9",
-		"sec-ch-ua":          ChromeSecChUA,
-		"sec-ch-ua-mobile":   "?0",
-		"sec-ch-ua-platform": ChromePlatform,
+		"User-Agent":             ChromeUA,
+		"Accept":                 "*/*",
+		"Accept-Language":        "en-US,en;q=0.9",
+		"sec-ch-ua":              ChromeSecChUA,
+		"sec-ch-ua-mobile":       "?0",
+		"sec-ch-ua-platform":     ChromePlatform,
+		"sec-ch-ua-arch":         strconv.Quote(ChromeArch),
+		"sec-ch-ua-bitness":      strconv.Quote(ChromeBitness),
+		"sec-ch-ua-full-version": strconv.Quote(chromeFullVersion),
+		"priority":               "u=1, i",
 	}
 }
 

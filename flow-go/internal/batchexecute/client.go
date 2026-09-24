@@ -736,6 +736,17 @@ type CallOptions struct {
 	// browser attached must get: there is no page to ask, so the refusal stands
 	// and `auto` stays browser-free.
 	EscalateCaptcha func(ctx context.Context) (string, error)
+	// NoteUnusualActivity is called when the assessment refuses a token with
+	// ReasonUnusualActivity, whether or not a higher-scoring token can be
+	// obtained.
+	//
+	// It is deliberately separate from EscalateCaptcha, which answers a different
+	// question and is nil in a different set of runs. EscalateCaptcha asks "give
+	// me a better token" and is nil whenever no page can be reached. This one
+	// says "the rate is the problem", and it has to fire in exactly those runs —
+	// a browserless caller has no other way to learn that it should slow down,
+	// and it is the caller with the least ability to recover by other means.
+	NoteUnusualActivity func()
 }
 
 // Call issues one RPC and returns its frames.
@@ -887,6 +898,25 @@ func (c *Client) SetSubmissionLimits(maxInFlight int, gap time.Duration) {
 	}
 	c.subGap = gap
 	c.subNext = time.Time{}
+}
+
+// SetSubmissionGap changes the minimum spacing between submissions, leaving the
+// in-flight cap alone.
+//
+// It exists as its own setter because the two are set at different times. The
+// limits are chosen once, when the engine builds the client; the gap is widened
+// again the moment the assessment refuses a token. Re-sending the limits to
+// change the gap would allocate a new semaphore channel (see
+// SetSubmissionLimits), and any call already holding a slot on the old one would
+// release into the new one — handing back capacity it never took, or blocking on
+// a send that no longer has a reader.
+//
+// The new spacing takes effect on the next call that reserves a slot, which is
+// what a caller widening the gap after a refusal wants.
+func (c *Client) SetSubmissionGap(gap time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subGap = gap
 }
 
 // enterSubmission waits for a submission slot and for the spacing to elapse,
@@ -1287,6 +1317,31 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 		return frames, nil
 	}
 
+	// A refusal by the assessment is not a spent token, and a fresh one does not
+	// clear it — so the blind retry is skipped and the refusal goes straight back.
+	//
+	// A live run settled this. Every attempt made inside the same refused window
+	// was refused too, including one minted from a real page, while the same
+	// prompt succeeded once the caller waited. The retry therefore bought nothing
+	// and cost a submission against an account that was already being refused;
+	// the caller's cooldown is what recovers it. This cuts the submissions a
+	// single refusal costs from three to one.
+	//
+	// The rate signal is reported here rather than below, because the retry is
+	// what used to surface the reason and it is no longer made.
+	if reason := UpstreamError(frames); reason == ReasonUnusualActivity {
+		if opts.NoteUnusualActivity != nil {
+			opts.NoteUnusualActivity()
+		}
+		log.Printf("batchexecute: the assessment refused the first response; not retrying — " +
+			"a fresh token does not clear this, and the caller's cooldown does")
+		// The frames come back alongside the error rather than instead of it.
+		// They are the only record of what the transport actually said, and the
+		// video paths derive the user-facing reason from them — returning nil here
+		// is what would turn a named refusal into a bare "nothing came back".
+		return frames, &RejectedError{Reason: reason, Frames: len(frames)}
+	}
+
 	token, err := opts.RefreshCaptcha(ctx)
 	if err != nil {
 		// Fail rather than returning the empty frames as though they were the
@@ -1296,7 +1351,24 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 		return nil, fmt.Errorf("captcha mint failed: %w", err)
 	}
 
-	log.Printf("batchexecute: nothing came back; retrying once with a fresh captcha token")
+	// Say what the first response actually said, when it said anything.
+	//
+	// "Nothing came back" reads as a silent no-op, and it is the wrong line to
+	// print when the server had already stated a reason. A live run that ended in
+	// PUBLIC_ERROR_UNUSUAL_ACTIVITY printed this line twice with no mention of a
+	// refusal, and the only way to tell an ordinary empty response from a refusal
+	// was to infer it from how fast it came back — a real render takes about
+	// twenty seconds and these came back in one or two.
+	//
+	// The retry is made either way here: a spent token is the common cause and a
+	// fresh one clears it. But the reader should not have to guess which of the
+	// two they are looking at.
+	if first := UpstreamError(frames); first != "" {
+		log.Printf("batchexecute: the first response stated %s; retrying once with a fresh captcha token",
+			first)
+	} else {
+		log.Printf("batchexecute: nothing came back; retrying once with a fresh captcha token")
+	}
 
 	retried, err := submit(token)
 	if err != nil {
@@ -1325,6 +1397,17 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 		return retried, nil
 	}
 
+	// The rate signal, reported before the escalation branch rather than inside
+	// it.
+	//
+	// That branch needs a page to ask and is skipped entirely when none can be
+	// reached, so a caller that only observed the refusal there would never hear
+	// about it in a browserless run — which is the run that has to slow down and
+	// the one with no other way to find out.
+	if reason == ReasonUnusualActivity && opts.NoteUnusualActivity != nil {
+		opts.NoteUnusualActivity()
+	}
+
 	// A refusal by the assessment is the one case worth a third attempt.
 	//
 	// Both attempts so far minted over the transport, so both presented a token
@@ -1350,7 +1433,7 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 			// attempt on the answer that was just refused.
 			log.Printf("batchexecute: no higher-scoring token available (%v); the refusal stands",
 				mintErr)
-			return nil, &RejectedError{Reason: reason, Frames: len(retried)}
+			return retried, &RejectedError{Reason: reason, Frames: len(retried)}
 		}
 
 		third, err := submit(escalated)
@@ -1370,7 +1453,7 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 		}
 	}
 
-	return nil, &RejectedError{Reason: reason, Frames: len(retried)}
+	return retried, &RejectedError{Reason: reason, Frames: len(retried)}
 }
 
 // carriesNoMedia reports whether a response holds no asset URLs.

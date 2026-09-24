@@ -122,6 +122,14 @@ type Engine struct {
 	// would hand back a token indistinguishable from the one just refused, and
 	// the caller would have spent a round trip to learn nothing.
 	escalate recaptcha.Provider
+	// pacing is the adaptive cooldown on submission rate: widened when the
+	// assessment refuses a token, reset when a submission is accepted.
+	//
+	// Held here rather than on a client because clients are built per generation
+	// (see newBatchexecuteClient), so a cooldown remembered on one would be
+	// discarded by the next — which is exactly the sequence a refused run
+	// produces.
+	pacing *submissionPacing
 	// primaryJar is the cookie set the engine acts as, captured at boot.
 	//
 	// Held here rather than read back off the bridge, because the bridge keeps
@@ -301,11 +309,16 @@ func (e *Engine) newBatchexecuteClient(jar *cookiejar.Jar, hc *httpx.Client) *ba
 	// in the frame, so there is no status to back off from after the fact — the
 	// only place to act is before the call goes out.
 	//
+	// The gap comes from the engine's pacing rather than straight from config, so
+	// a refusal widens it for every client built afterwards. A client is built
+	// per generation, so reading the config here would reset the cooldown on each
+	// attempt and a flagged run would keep retrying at the rate that earned the
+	// refusal.
+	//
 	// Reads are deliberately not paced. Polling depends on them being immediate,
 	// a refused read costs nothing, and spacing a poll two seconds apart would
 	// turn a seven-minute wait into a much longer one.
-	client.SetSubmissionLimits(config.MaxConcurrentRequests,
-		time.Duration(config.RequestMinInterval*float64(time.Second)))
+	client.SetSubmissionLimits(config.MaxConcurrentRequests, e.pacing.gap())
 
 	if fp != nil {
 		client.SetFingerprint(batchexecute.Fingerprint{
@@ -381,6 +394,9 @@ func New(st *store.Store, br *bridge.Bridge, opts Options) (*Engine, error) {
 		hc:           hc,
 		opts:         opts,
 		accountIndex: storedAccountIndex(st, opts.AccountIndex),
+		pacing: newSubmissionPacing(
+			time.Duration(config.RequestMinInterval*float64(time.Second)),
+			maxSubmissionGap),
 	}, nil
 }
 
@@ -1005,7 +1021,39 @@ func (e *Engine) captchaOptions(action string, opts batchexecute.CallOptions) ba
 		return e.CaptchaToken(ctx, action)
 	}
 	opts.EscalateCaptcha = e.captchaEscalation(action)
+	// Set unconditionally, unlike EscalateCaptcha: the cooldown has to work in a
+	// browserless run, which is exactly the run with no page to escalate to and
+	// therefore the one that most needs to slow itself down.
+	opts.NoteUnusualActivity = e.noteUnusualActivity
 	return opts
+}
+
+// noteUnusualActivity widens the submission pacing after the assessment has
+// refused a token.
+//
+// Acted on even when the refusal is about to be retried with a better token: the
+// retry is one attempt, and the cooldown is what stops the *next* generation
+// repeating it. A run that only ever retried would keep arriving at the same
+// rate and keep earning the same answer.
+func (e *Engine) noteUnusualActivity() {
+	gap, widened := e.pacing.widen()
+	if !widened {
+		return
+	}
+	log.Printf("engine: unusual activity detected; submission spacing widened to %v "+
+		"(spacing between calls — the retry wait is separate)", gap)
+}
+
+// noteSubmissionAccepted returns the pacing to its base interval after a
+// submission was accepted.
+//
+// Silent unless it actually restored something — see submissionPacing.reset.
+func (e *Engine) noteSubmissionAccepted() {
+	gap, restored := e.pacing.reset()
+	if !restored {
+		return
+	}
+	log.Printf("engine: submission accepted; pacing restored to %v", gap)
 }
 
 // captchaEscalation returns a mint from a real page, or nil when no page can be
@@ -3331,31 +3379,78 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		return nil, err
 	}
 
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
+	maxAttempts := 1
+	if autoRetryEnabled() {
+		maxAttempts = 3
 	}
 
-	frames, err := client.GenerateVideo(ctx, batchexecute.GenerateVideoRequest{
-		ProjectID:    projectID,
-		Model:        model,
-		Prompt:       req.Prompt,
-		Count:        req.Count,
-		AspectRatio:  req.Aspect,
-		CaptchaToken: captcha,
-		StartImage:   startImage,
-		EndImage:     endImage,
-		StartFrame:   req.StartFrame,
-		EndFrame:     req.EndFrame,
-	}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
-		SourcePath: "/project/" + projectID,
-		BuildLabel: config.BuildLabel(),
-	}))
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
-		return nil, err
+	var frames []batchexecute.Frame
+	var rejected *batchexecute.RejectedError
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionVideo)
+		if err != nil {
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
+		}
+
+		frames, err = client.GenerateVideo(ctx, batchexecute.GenerateVideoRequest{
+			ProjectID:    projectID,
+			Model:        model,
+			Prompt:       req.Prompt,
+			Count:        req.Count,
+			AspectRatio:  req.Aspect,
+			CaptchaToken: captcha,
+			StartImage:   startImage,
+			EndImage:     endImage,
+			StartFrame:   req.StartFrame,
+			EndFrame:     req.EndFrame,
+		}, e.captchaOptions(recaptcha.ActionVideo, batchexecute.CallOptions{
+			SourcePath: "/project/" + projectID,
+			BuildLabel: config.BuildLabel(),
+		}))
+
+		rejected = nil
+		if err != nil && !errors.As(err, &rejected) {
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
+			return nil, err
+		}
+
+		hasMedia := false
+		for _, frame := range frames {
+			if len(batchexecute.ParseGeneratedMediaIDs(frame.Payload)) > 0 {
+				hasMedia = true
+				break
+			}
+		}
+		if hasMedia {
+			break
+		}
+
+		if rejected != nil && rejected.Reason == batchexecute.ReasonUnusualActivity && attempt < maxAttempts {
+			// Push the widened spacing onto the client this run is already using.
+			//
+			// newBatchexecuteClient read the pacing when it built the client, which
+			// was before the refusal — so without this the widening would only
+			// reach clients built later, and the retry would go out at the rate
+			// that earned the refusal. It is also what makes the two log lines
+			// agree: one is the spacing between calls, the other is the wait
+			// before this retry.
+			client.SetSubmissionGap(e.pacing.gap())
+
+			cooldown := unusualActivityCooldown(attempt)
+			log.Printf("engine: unusual activity cooldown active; waiting %v before auto-retry (%d/%d)...", cooldown, attempt+1, maxAttempts)
+			fmt.Fprintf(os.Stderr, "⏳ Google rate limit detected. Waiting %v before auto-retry (%d/%d)...\n", cooldown, attempt+1, maxAttempts)
+
+			select {
+			case <-time.After(cooldown):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		break
 	}
 
 	outcome := &BatchVideoOutcome{
@@ -4320,15 +4415,6 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		log.Printf("engine: could not record the job: %v", err)
 	}
 
-	// A fresh token per call. The page mints one per generation, and the value
-	// is embedded in the request, so reusing one across submissions is not
-	// something the app ever does.
-	captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
-	if err != nil {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
-	}
-
 	// The engine's own cookies, not the bridge's — see Engine.Jar.
 	jar := e.Jar()
 	if jar == nil {
@@ -4339,44 +4425,74 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 
 	client := e.newBatchexecuteClient(jar, e.hc)
 
-	// The shared pre-flight, wired here for the same reason it is on the video
-	// paths: an account that cannot pay must be refused before the request goes
-	// out, not diagnosed from the empty answer afterwards.
-	//
-	// The cost is zero because no per-image price is recorded, and a cost of zero
-	// means the check is not made — which is the honest answer rather than a
-	// guess. It is called anyway so that the four generation paths read the same
-	// way, and so that the day a price exists there is one place to put it.
-	//
-	// An image carries no conditioning, so it would be free to move accounts —
-	// but with no recorded price there is nothing to move for.
 	target := e.ensureAffordable(ctx, generationTarget{
 		Client: client, Jar: jar, ProjectID: projectID,
 	}, 0, true)
 	client, projectID = target.Client, target.ProjectID
 
-	media, err := client.GenerateMedia(ctx, batchexecute.GenerateRequest{
-		ProjectID:    projectID,
-		Model:        model,
-		Prompt:       req.Prompt,
-		AspectRatio:  req.Aspect,
-		CaptchaToken: captcha,
-	}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
-		SourcePath: "/project/" + projectID,
-		BuildLabel: config.BuildLabel(),
-	}))
+	maxAttempts := 1
+	if autoRetryEnabled() {
+		maxAttempts = 3
+	}
 
-	// A stated refusal is not a broken call. The server answered — the answer
-	// was "no, and here is why" — so it is reported as an empty result carrying
-	// the reason, the same way the video paths report one, rather than as a
-	// transport failure. Before this it was not distinguished from a silent
-	// no-op, and the hint that came with that named the model enum and the
-	// project; both were correct.
+	var media []batchexecute.GeneratedMedia
 	var rejected *batchexecute.RejectedError
-	if err != nil && !errors.As(err, &rejected) {
-		e.finishJob(jobID, "failed", nil, start, err, accountID)
-		_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
-		return nil, err
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// A fresh token per attempt. The page mints one per generation, and the value
+		// is embedded in the request, so reusing one across submissions is not
+		// something the app ever does.
+		captcha, err := e.CaptchaToken(ctx, recaptcha.ActionImage)
+		if err != nil {
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			return nil, fmt.Errorf("engine: could not obtain a reCAPTCHA token: %w", err)
+		}
+
+		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
+			ProjectID:    projectID,
+			Model:        model,
+			Prompt:       req.Prompt,
+			AspectRatio:  req.Aspect,
+			CaptchaToken: captcha,
+		}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
+			SourcePath: "/project/" + projectID,
+			BuildLabel: config.BuildLabel(),
+		}))
+
+		rejected = nil
+		if err != nil && !errors.As(err, &rejected) {
+			e.finishJob(jobID, "failed", nil, start, err, accountID)
+			_ = e.store.RecordAccountOutcome(e.AccountID(), true, err.Error())
+			return nil, err
+		}
+
+		if len(media) > 0 {
+			break
+		}
+
+		if rejected != nil && rejected.Reason == batchexecute.ReasonUnusualActivity && attempt < maxAttempts {
+			// Push the widened spacing onto the client this run is already using.
+			//
+			// newBatchexecuteClient read the pacing when it built the client, which
+			// was before the refusal — so without this the widening would only
+			// reach clients built later, and the retry would go out at the rate
+			// that earned the refusal. It is also what makes the two log lines
+			// agree: one is the spacing between calls, the other is the wait
+			// before this retry.
+			client.SetSubmissionGap(e.pacing.gap())
+
+			cooldown := unusualActivityCooldown(attempt)
+			log.Printf("engine: unusual activity cooldown active; waiting %v before auto-retry (%d/%d)...", cooldown, attempt+1, maxAttempts)
+			fmt.Fprintf(os.Stderr, "⏳ Google rate limit detected. Waiting %v before auto-retry (%d/%d)...\n", cooldown, attempt+1, maxAttempts)
+
+			select {
+			case <-time.After(cooldown):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		break
 	}
 
 	outcome := &BatchOutcome{
@@ -4629,6 +4745,14 @@ func (e *Engine) finishJob(jobID, status string, credits *int, start time.Time, 
 	}
 	if err := e.store.FinishGeneration(jobID, status, credits, time.Since(start).Milliseconds(), message, accountID); err != nil {
 		log.Printf("engine: could not finalise job %s: %v", shortID(jobID), err)
+	}
+
+	// This is the one place every generation path converges with its final
+	// status, which is what makes it the right place to relax the cooldown: a
+	// reset at the call sites would have to be repeated in four of them and would
+	// drift the first time one was added.
+	if submissionAccepted(status) {
+		e.noteSubmissionAccepted()
 	}
 }
 

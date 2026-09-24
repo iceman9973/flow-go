@@ -61,6 +61,14 @@ func CookieDir() string {
 	return absExpand("cookies")
 }
 
+// LogPath returns the path to the unified log file for server, bridge and CLI operations.
+func LogPath() string {
+	if v := os.Getenv("FLOW_LOG_FILE"); v != "" {
+		return absExpand(v)
+	}
+	return absExpand("flow.log")
+}
+
 func absExpand(p string) string {
 	if strings.HasPrefix(p, "~") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -471,8 +479,10 @@ var (
 var (
 	// MaxConcurrentRequests is the in-flight generation cap per worker.
 	MaxConcurrentRequests = envInt("MAX_CONCURRENT_REQUESTS", 4)
-	// RequestMinInterval is the minimum spacing between generation starts.
-	RequestMinInterval = envFloat("REQUEST_MIN_INTERVAL", 2.0)
+	// RequestMinInterval is the minimum spacing between generation starts, and
+	// the base the engine's adaptive cooldown doubles from when the assessment
+	// refuses a token with UNUSUAL_ACTIVITY (see engine.submissionPacing).
+	RequestMinInterval = envFloat("REQUEST_MIN_INTERVAL", 3.0)
 )
 
 // UserAgents rotated across requests.

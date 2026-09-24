@@ -130,6 +130,12 @@ type Engine struct {
 	// discarded by the next — which is exactly the sequence a refused run
 	// produces.
 	pacing *submissionPacing
+	// cooldowns records which signed-in accounts are cooling down after a rate
+	// refusal, so the next attempt can move to one that is not rather than wait.
+	//
+	// Engine-level for the same reason pacing is: a client is built per
+	// generation, so a cooldown remembered on one would be discarded by the next.
+	cooldowns *accountCooldowns
 	// primaryJar is the cookie set the engine acts as, captured at boot.
 	//
 	// Held here rather than read back off the bridge, because the bridge keeps
@@ -397,6 +403,7 @@ func New(st *store.Store, br *bridge.Bridge, opts Options) (*Engine, error) {
 		pacing: newSubmissionPacing(
 			time.Duration(config.RequestMinInterval*float64(time.Second)),
 			maxSubmissionGap),
+		cooldowns: &accountCooldowns{},
 	}, nil
 }
 
@@ -756,13 +763,53 @@ func (e *Engine) Credits(ctx context.Context) (int, error) {
 // sku is what the caller already learned from the Labs session. The balance RPC
 // does not carry a tier, so an empty value leaves the worker's stored tier alone
 // rather than clearing it.
-func (e *Engine) creditsReader(index int, jar *cookiejar.Jar, sku string) pool.CreditsReader {
+// creditPageTokens decides which anti-CSRF pair a balance read presents for one
+// account, and whether the client's existing seed should be cleared instead.
+//
+// A separate function because this is the whole of the fix and the rule is worth
+// stating once rather than reading out of a switch. The pair is account-bound:
+// pageTokens' own comment records that a request going out under account A's
+// cookies carrying account B's tokens is answered with an empty frame, and this
+// RPC answers 400 instead. newBatchexecuteClient seeds the pair Bootstrap read for
+// the *primary* account, so before this every account registered from a dump sent
+// the primary's token — a live run showed every dump-registered account failing
+// its credit check while the primary passed, in the same process.
+//
+// The at and f.sid are returned together so they cannot be applied apart: an `at`
+// from one account beside an `f.sid` from another is the mismatch this exists to
+// prevent. clear means "drop the seed and let the client prime for its own".
+func creditPageTokens(index int, bundle *cookiejar.Bundle) (at, fsid string, clear bool) {
+	if index != 0 {
+		// A specific signed-in account was asked for, and the pair in the file
+		// belongs to whichever account the browser was showing — so it is the
+		// wrong one here whatever it says.
+		return "", "", true
+	}
+	if own, _ := persistedPageTokens(bundle); own.At != "" && own.Fsid != "" {
+		return own.At, own.Fsid, false
+	}
+	// Nothing recorded for this account. Leave the seed as it is rather than
+	// guessing: the primary's pair is the right one for the primary, and this
+	// case is reached for it whenever its file predates the pair being stored.
+	return "", "", false
+}
+
+func (e *Engine) creditsReader(index int, jar *cookiejar.Jar, sku string,
+	bundle *cookiejar.Bundle) pool.CreditsReader {
+
 	return func(ctx context.Context) (pool.Balance, error) {
 		client := e.newBatchexecuteClient(jar, e.hc)
 		client.SetAuthUser(index)
-		if index != 0 {
+
+		at, fsid, clear := creditPageTokens(index, bundle)
+		switch {
+		case clear:
 			client.SeedToken("")
+		case at != "":
+			client.SeedToken(at)
+			client.SetSessionID(fsid)
 		}
+
 		client.SetUnauthorizedHandler(nil)
 
 		credits, err := client.Credits(ctx, batchexecute.CallOptions{
@@ -1049,6 +1096,11 @@ func (e *Engine) noteUnusualActivity() {
 //
 // Silent unless it actually restored something — see submissionPacing.reset.
 func (e *Engine) noteSubmissionAccepted() {
+	// The account that just succeeded is no longer cooling, whatever it was
+	// marked for: a submission was accepted on it, which is the only evidence
+	// that its window has passed.
+	e.cooldowns.clear(e.AccountIndex())
+
 	gap, restored := e.pacing.reset()
 	if !restored {
 		return
@@ -1383,7 +1435,7 @@ func (e *Engine) resolveAccount(ctx context.Context, jar *cookiejar.Jar, index i
 	// so the pool never has a window in which it could read a balance from the
 	// worker's own client — which is the legacy aisandbox surface and reports
 	// whichever account that credential belongs to.
-	worker.SetCreditsReader(e.creditsReader(index, jar, session.Sku))
+	worker.SetCreditsReader(e.creditsReader(index, jar, session.Sku, bundle))
 	// Record the project on the worker, not just on the engine.
 	//
 	// Registration is additive: each account bootstrapped here keeps its worker,
@@ -3428,19 +3480,45 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 			break
 		}
 
-		if rejected != nil && rejected.Reason == batchexecute.ReasonUnusualActivity && attempt < maxAttempts {
+		if rejected != nil && batchexecute.IsUnusualActivity(rejected.Reason) && attempt < maxAttempts {
 			// Push the widened spacing onto the client this run is already using.
 			//
 			// newBatchexecuteClient read the pacing when it built the client, which
 			// was before the refusal — so without this the widening would only
 			// reach clients built later, and the retry would go out at the rate
-			// that earned the refusal. It is also what makes the two log lines
-			// agree: one is the spacing between calls, the other is the wait
-			// before this retry.
+			// that earned the refusal.
 			client.SetSubmissionGap(e.pacing.gap())
 
+			// Mark the account that was refused, so the next attempt does not go
+			// straight back to it.
+			refused := e.AccountID()
+			e.cooldowns.mark(e.AccountIndex(), unusualActivityCooldown(attempt))
+
+			// Another account that is not cooling is strictly better than waiting:
+			// the wait is on the account, not on the work. Move to one and retry
+			// at once.
+			if next, moved := e.rotateAwayFromCooling(ctx, cost); moved {
+				log.Printf("engine: account %s rate-limited; rotating immediately to account %s (0-wait)",
+					refused, describeAccount(next))
+				if switched := e.Jar(); switched != nil {
+					jar = switched
+				}
+				client = e.newBatchexecuteClient(jar, e.hc)
+				client.SetSubmissionGap(e.pacing.gap())
+				if id := e.ProjectID(); id != "" {
+					projectID = id
+				}
+				continue
+			}
+
+			// Every account is cooling, so there is nothing to move to. Wait for
+			// the first one to come back rather than for the last.
 			cooldown := unusualActivityCooldown(attempt)
-			log.Printf("engine: unusual activity cooldown active; waiting %v before auto-retry (%d/%d)...", cooldown, attempt+1, maxAttempts)
+			if shortest, cooling := e.cooldowns.soonest(time.Now()); cooling && shortest < cooldown {
+				cooldown = shortest
+			}
+			log.Printf("engine: every account is cooling; waiting %v (the shortest remaining) "+
+				"before auto-retry (%d/%d)...", cooldown, attempt+1, maxAttempts)
 			fmt.Fprintf(os.Stderr, "⏳ Google rate limit detected. Waiting %v before auto-retry (%d/%d)...\n", cooldown, attempt+1, maxAttempts)
 
 			select {
@@ -4470,7 +4548,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			break
 		}
 
-		if rejected != nil && rejected.Reason == batchexecute.ReasonUnusualActivity && attempt < maxAttempts {
+		if rejected != nil && batchexecute.IsUnusualActivity(rejected.Reason) && attempt < maxAttempts {
 			// Push the widened spacing onto the client this run is already using.
 			//
 			// newBatchexecuteClient read the pacing when it built the client, which
@@ -4481,8 +4559,38 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 			// before this retry.
 			client.SetSubmissionGap(e.pacing.gap())
 
+			// Mark the account that was refused, so the next attempt does not go
+			// straight back to it.
+			refused := e.AccountID()
+			e.cooldowns.mark(e.AccountIndex(), unusualActivityCooldown(attempt))
+
+			// Another account that is not cooling is strictly better than waiting:
+			// the wait is on the account, not on the work. Move to one and retry
+			// at once. The cost is zero because no per-image price is recorded —
+			// the same reason the affordability check above passes zero — so the
+			// rotation only has to avoid the account that was refused.
+			if next, moved := e.rotateAwayFromCooling(ctx, 0); moved {
+				log.Printf("engine: account %s rate-limited; rotating immediately to account %s (0-wait)",
+					refused, describeAccount(next))
+				if switched := e.Jar(); switched != nil {
+					jar = switched
+				}
+				client = e.newBatchexecuteClient(jar, e.hc)
+				client.SetSubmissionGap(e.pacing.gap())
+				if id := e.ProjectID(); id != "" {
+					projectID = id
+				}
+				continue
+			}
+
+			// Every account is cooling, so there is nothing to move to. Wait for
+			// the first one to come back rather than for the last.
 			cooldown := unusualActivityCooldown(attempt)
-			log.Printf("engine: unusual activity cooldown active; waiting %v before auto-retry (%d/%d)...", cooldown, attempt+1, maxAttempts)
+			if shortest, cooling := e.cooldowns.soonest(time.Now()); cooling && shortest < cooldown {
+				cooldown = shortest
+			}
+			log.Printf("engine: every account is cooling; waiting %v (the shortest remaining) "+
+				"before auto-retry (%d/%d)...", cooldown, attempt+1, maxAttempts)
 			fmt.Fprintf(os.Stderr, "⏳ Google rate limit detected. Waiting %v before auto-retry (%d/%d)...\n", cooldown, attempt+1, maxAttempts)
 
 			select {

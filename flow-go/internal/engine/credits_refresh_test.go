@@ -6,9 +6,68 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/pool"
 	"github.com/kodelyx/flow-go/flow-go/internal/store"
 )
+
+// creditPageTokens is the whole of the balance-read fix, so its rule is stated
+// here rather than read out of a switch.
+//
+// The pair is account-bound: pageTokens' own comment records that a request going
+// out under account A's cookies carrying account B's tokens is answered with an
+// empty frame, and the balance RPC answers 400 instead. newBatchexecuteClient
+// seeds the pair Bootstrap read for the *primary* account, so every account
+// registered from a dump used to send the primary's token — which is what a live
+// run showed, every dump-registered account failing its credit check while the
+// primary passed.
+func TestCreditPageTokensPrefersTheAccountsOwnPair(t *testing.T) {
+	own := &cookiejar.Bundle{At: "account-a-at", Fsid: "account-a-sid"}
+
+	at, fsid, clear := creditPageTokens(0, own)
+
+	if clear {
+		t.Fatal("an account with its own pair was told to clear its seed")
+	}
+	if at != "account-a-at" || fsid != "account-a-sid" {
+		t.Errorf("got (%q, %q), want the account's own pair", at, fsid)
+	}
+}
+
+// A specific signed-in index is the one case where the file's pair is still the
+// wrong one: it belongs to whichever account the browser was showing.
+func TestCreditPageTokensClearsForASpecificIndex(t *testing.T) {
+	own := &cookiejar.Bundle{At: "account-a-at", Fsid: "account-a-sid"}
+
+	for _, index := range []int{1, 2, 7} {
+		at, fsid, clear := creditPageTokens(index, own)
+		if !clear {
+			t.Errorf("index %d kept a pair that belongs to another account", index)
+		}
+		if at != "" || fsid != "" {
+			t.Errorf("index %d returned (%q, %q) alongside clear", index, at, fsid)
+		}
+	}
+}
+
+// Half a pair is not a pair, and it must not be completed from somewhere else:
+// an `at` from one account beside an `f.sid` from another is precisely the
+// mismatch this exists to prevent. Leaving the seed alone is the honest answer.
+func TestCreditPageTokensIgnoresAHalfPair(t *testing.T) {
+	cases := map[string]*cookiejar.Bundle{
+		"at only":   {At: "at-only"},
+		"fsid only": {Fsid: "sid-only"},
+		"nil":       nil,
+		"empty":     {},
+	}
+	for name, bundle := range cases {
+		at, fsid, clear := creditPageTokens(0, bundle)
+		if clear || at != "" || fsid != "" {
+			t.Errorf("%s: got (%q, %q, clear=%v), want the seed left alone",
+				name, at, fsid, clear)
+		}
+	}
+}
 
 // newCreditsTestEngine builds just enough engine to exercise RefreshCredits:
 // a pool and a store, with no bridge and no HTTP client. RefreshCredits touches

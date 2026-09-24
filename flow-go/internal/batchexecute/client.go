@@ -1329,7 +1329,7 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	//
 	// The rate signal is reported here rather than below, because the retry is
 	// what used to surface the reason and it is no longer made.
-	if reason := UpstreamError(frames); reason == ReasonUnusualActivity {
+	if reason := UpstreamError(frames); IsUnusualActivity(reason) {
 		if opts.NoteUnusualActivity != nil {
 			opts.NoteUnusualActivity()
 		}
@@ -1404,7 +1404,7 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	// reached, so a caller that only observed the refusal there would never hear
 	// about it in a browserless run — which is the run that has to slow down and
 	// the one with no other way to find out.
-	if reason == ReasonUnusualActivity && opts.NoteUnusualActivity != nil {
+	if IsUnusualActivity(reason) && opts.NoteUnusualActivity != nil {
 		opts.NoteUnusualActivity()
 	}
 
@@ -1418,7 +1418,7 @@ func retryIfEmpty(ctx context.Context, opts CallOptions, frames []Frame,
 	//
 	// Every other reason is final. A wrong model, or a project belonging to
 	// another account, is not fixed by minting again.
-	if opts.EscalateCaptcha != nil && reason == ReasonUnusualActivity {
+	if opts.EscalateCaptcha != nil && IsUnusualActivity(reason) {
 		log.Printf("batchexecute: the assessment refused the token; asking a page for one instead")
 
 		escalated, mintErr := opts.EscalateCaptcha(ctx)
@@ -3146,6 +3146,24 @@ func UpstreamError(frames []Frame) string {
 // reason — a wrong model, a project belonging to another account — is answered
 // by changing the request, not by minting again.
 const ReasonUnusualActivity = "PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+
+// IsUnusualActivity reports whether a reason is the assessment refusing the
+// token, including the suffixed variants of that refusal.
+//
+// Flow answers PUBLIC_ERROR_UNUSUAL_ACTIVITY, and it also answers
+// PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC — the same refusal with the
+// rate named. Matching the string exactly meant the suffixed form bypassed every
+// piece of the rate-limit handling at once: the blind retry was made, the pacing
+// was not widened, the cooldown never started, and the hint fell back to the
+// generic one. A live run showed the two side by side inside a single call — the
+// first response suffixed, the retry plain — which is how the gap was found.
+//
+// A prefix rather than a list of known suffixes, because the family is the
+// server's to extend: an unrecognised member should still be read as the
+// assessment refusing the token rather than as an ordinary error.
+func IsUnusualActivity(reason string) bool {
+	return strings.HasPrefix(reason, ReasonUnusualActivity)
+}
 
 // RejectedError reports a call the server answered with an explicit refusal.
 //

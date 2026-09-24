@@ -113,7 +113,7 @@ const reasonUnusualActivity = batchexecute.ReasonUnusualActivity
 // are already right is worse than no hint, because it costs the time spent
 // checking them.
 func refusedHint(reason string) string {
-	if reason == reasonUnusualActivity {
+	if batchexecute.IsUnusualActivity(reason) {
 		return "The server declined the reCAPTCHA assessment, not the model and not the project — " +
 			reasonUnusualActivity + " is what Flow answers when it will not accept the token, and the " +
 			"same enum and the same project generate normally once it does. Mint the token from a real " +

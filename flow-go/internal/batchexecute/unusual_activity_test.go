@@ -237,6 +237,70 @@ func TestTheRefusalFramesComeBackWithTheError(t *testing.T) {
 	}
 }
 
+// The refusal has more than one spelling, and the family is the server's to
+// extend.
+//
+// A live run showed both inside a single call — the first response
+// PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC, the retry the plain one. The
+// suffixed form is the same refusal with the rate named, so treating it as an
+// ordinary error disabled the retry suppression, the pacing hook, the escalation
+// and the cooldown all at once.
+func TestIsUnusualActivityMatchesTheFamily(t *testing.T) {
+	accepted := []string{
+		ReasonUnusualActivity,
+		ReasonUnusualActivity + "_TOO_MUCH_TRAFFIC",
+		ReasonUnusualActivity + "_SOMETHING_THE_SERVER_ADDS_LATER",
+	}
+	for _, reason := range accepted {
+		if !IsUnusualActivity(reason) {
+			t.Errorf("IsUnusualActivity(%q) = false, want true", reason)
+		}
+	}
+
+	refused := []string{
+		"",
+		"PUBLIC_ERROR_MODEL_ACCESS_DENIED",
+		// A truncation of the constant is not a member of the family, and
+		// neither is the constant with anything prepended.
+		"PUBLIC_ERROR_UNUSUAL",
+		"X" + ReasonUnusualActivity,
+	}
+	for _, reason := range refused {
+		if IsUnusualActivity(reason) {
+			t.Errorf("IsUnusualActivity(%q) = true, want false", reason)
+		}
+	}
+}
+
+// The suffixed refusal is suppressed exactly like the plain one. This is the
+// behaviour the family check exists for, and the one the live run was getting
+// wrong: it made the blind retry, which is the submission the suppression was
+// added to stop.
+func TestTheSuffixedRefusalIsNotRetriedEither(t *testing.T) {
+	tokens, submit := recorder(answer())
+
+	var fired int
+	opts := CallOptions{
+		RefreshCaptcha:      func(context.Context) (string, error) { return "transport-2", nil },
+		NoteUnusualActivity: func() { fired++ },
+	}
+
+	_, err := retryIfEmpty(context.Background(), opts,
+		refusal(ReasonUnusualActivity+"_TOO_MUCH_TRAFFIC"), carriesNothing, submit)
+
+	if err == nil {
+		t.Fatal("the refusal should be returned as an error")
+	}
+	if len(*tokens) != 0 {
+		t.Errorf("the server saw %d attempts after the first; the suffixed refusal must not "+
+			"be retried either", len(*tokens))
+	}
+	if fired != 1 {
+		t.Errorf("the hook fired %d times, want exactly 1 — the suffixed refusal is a rate "+
+			"signal too", fired)
+	}
+}
+
 // SetSubmissionGap must not disturb the in-flight cap.
 //
 // It is a separate setter for that reason: re-sending the limits to change the

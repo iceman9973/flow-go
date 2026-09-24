@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,6 +63,8 @@ func Run(args []string) int {
 		return runProjects(args[1:])
 	case "stats":
 		return runStats(args[1:])
+	case "balance", "credits":
+		return runBalance(args[1:])
 	case "doctor":
 		return runDoctor(args[1:])
 	case "export":
@@ -107,6 +110,7 @@ COMMANDS
   batch-all             Generate one image per account in cookies/account_*.json
   projects              List the account's Flow projects
   stats                 Print database statistics
+  balance, credits      Per-account balances, with a combined total
   export [file]         Export statistics as JSON
   cookies               Show cookie and credential status
   version               Print the version
@@ -125,6 +129,12 @@ COMMON FLAGS
   A .env file is read at start-up and its values become these flags' defaults,
   so an explicit flag always wins over the file. See .env.example for the whole
   set, including the rate limits and the timing bounds.
+
+BALANCE FLAGS
+  --refresh             Probe each account's live balance over the transport
+                        before reporting. Without it the cached figures are
+                        printed, which needs no browser, no session and no
+                        network.
 
 DOCTOR FLAGS
   --probe               Make one authenticated upstream call to prove the
@@ -153,6 +163,8 @@ GENERATE FLAGS
                         reference-to-video and selects the reference model
   --aspect              landscape | 16:9 | portrait | 9:16 (default landscape)
   --no-download         Skip writing the result to output/
+  --all                 Run the same generation on every account in cookies/ at
+                        once, one goroutine each, and print a summary table
 
   --resolution and --seed exist on the legacy aisandbox transport and not on
   the batchexecute one. Passing one is reported on stderr and the run continues
@@ -179,6 +191,8 @@ IMAGE FLAGS
   --aspect              landscape | 16:9 | portrait | 9:16 | square | 1:1 |
                         4:3 | 3:4                     (default landscape)
   --no-download         Skip writing the result to output/
+  --all                 Run the same generation on every account in cookies/ at
+                        once, one goroutine each, and print a summary table
 
   SHORTHAND
   The options above may also be given as tokens after the prompt, in any order:
@@ -236,6 +250,8 @@ EXAMPLES
   flow-go generate "cyberpunk car in neon rain" 9:16 8s 720p x2
   flow-go generate "golden sunset over mountains" 4s 360p x2
   flow-go image "cute origami owl" 1:1 x2
+  flow-go image "a cyberpunk city at night" 1:1 --all
+  flow-go generate "ocean waves on sand" 16:9 4s 360p --all
   flow-go upload-video clip.mp4
   flow-go edit clip.mp4 "make it a cybernetic neon city"
   flow-go edit --source <content-id> "make the boat drift slowly to the left"
@@ -434,6 +450,7 @@ func runGenerate(args []string) int {
 	// and it is wired, so passing this now changes the render rather than being
 	// reported and dropped.
 	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16")
+	all := fs.Bool("all", false, "run the same generation on every account in cookies/ at once")
 	resolution := fs.String("resolution", "", "ignored — not implemented on the batchexecute transport")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	// --reference is a real flag now. It used to be declared purely so that
@@ -475,6 +492,39 @@ func runGenerate(args []string) int {
 		}
 	}
 	warnIgnoredFlags(ignoredGenerateFlags(*resolution, *seed))
+
+	if *all {
+		// Refused rather than ignored. Reference-to-video is a different RPC with
+		// a different payload shape, so running it "per account" would mean a
+		// second job type rather than a second account — and quietly generating
+		// frame-conditioned videos for someone who asked for references is the
+		// failure this refusal exists to prevent.
+		if len(references) > 0 {
+			return fail(fmt.Errorf("--all cannot be combined with --reference: reference-to-video " +
+				"is a different submission, and --all runs one job per account"))
+		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		return runAllAccounts(ctx, common, "generate", func(ctx context.Context, a *app.App) ([]string, error) {
+			outcome, err := a.Engine.GenerateVideoViaBatch(ctx, engine.BatchVideoRequest{
+				Prompt:     *prompt,
+				Duration:   *duration,
+				Quality:    *quality,
+				Count:      *count,
+				Aspect:     *aspect,
+				StartImage: *startImage,
+				EndImage:   *endImage,
+				Wait:       !*noDownload,
+				Download:   !*noDownload,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return filePaths(outcome.Files), nil
+		})
+	}
 
 	a, err := common.build()
 	if err != nil {
@@ -1226,6 +1276,7 @@ func runImage(args []string) int {
 	// hardcoded constant used to occupy, whose value turned out to be the
 	// default aspect rather than a mode flag.
 	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16 | square | 1:1 | 4:3 | 3:4")
+	all := fs.Bool("all", false, "run the same generation on every account in cookies/ at once")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	// Flags and the positional prompt may be interleaved, so
 	// `flow-go image "a red boat" --model narwhal` applies both.
@@ -1260,6 +1311,25 @@ func runImage(args []string) int {
 		}
 	}
 	warnIgnoredFlags(ignoredGenerateFlags("", *seed))
+
+	if *all {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		return runAllAccounts(ctx, common, "image", func(ctx context.Context, a *app.App) ([]string, error) {
+			outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
+				Prompt:   *prompt,
+				Model:    *model,
+				Aspect:   *aspect,
+				Download: !*noDownload,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return filePaths(outcome.Files), nil
+		})
+	}
+
 	if *count != 1 {
 		// The image RPC takes one prompt and returns one asset. Reporting it and
 		// continuing beats failing the run: the caller gets the image they asked
@@ -1485,107 +1555,477 @@ func runBatchAll(args []string) int {
 		return 2
 	}
 
-	paths, err := engine.DiscoverAccountJars(config.CookieDir())
-	if err != nil {
-		return fail(fmt.Errorf("batch-all: list account cookie files: %w", err))
-	}
-	if len(paths) == 0 {
-		fmt.Fprintf(os.Stderr, "batch-all: no account_*.json in %s — run `flow-go bridge` "+
-			"with the extension attached so it writes them\n", config.CookieDir())
-		return 1
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	ctx := context.Background()
-	fmt.Printf("\n  flow-go — batch-all over %d account(s)\n", len(paths))
-	fmt.Println("  " + strings.Repeat("-", 52))
-
-	var ok, skipped, failed int
-	for i, path := range paths {
-		fmt.Printf("  [%d/%d] %s\n", i+1, len(paths), filepath.Base(path))
-
-		// Checked here rather than left to the engine: a file with no credential
-		// cookie has no session to act as, and the failure it produces upstream
-		// reads like a server fault rather than like an unusable input.
-		jar, loadErr := cookiejar.LoadFile(path)
-		if loadErr != nil {
-			fmt.Printf("        skipped: %v\n", loadErr)
-			skipped++
-			continue
-		}
-		if !jar.HasAuthCookies() {
-			fmt.Printf("        skipped: no credential cookies in the file\n")
-			skipped++
-			continue
-		}
-
-		// Then the rest of what a run needs, which lives on the bundle. The two
-		// checks are split rather than folded into one `Complete()` because they
-		// say different things: a file with no credential cookie is a different
-		// mistake from one whose sync never had a Flow tab open, and an operator
-		// acts on them differently.
-		//
-		// Cookies alone cannot generate. Without the page tokens batchexecute has
-		// to prime for a token, and without the identity a captcha token is
-		// rejected with no error at all — both of which surface upstream as a
-		// server fault rather than as an unusable input. Skipping here names the
-		// real cause before a credit is spent on discovering it.
-		bundle, bundleErr := cookiejar.LoadBundleFile(path)
-		if bundleErr != nil {
-			fmt.Printf("        skipped: %v\n", bundleErr)
-			skipped++
-			continue
-		}
-		if !bundle.Complete() {
-			fmt.Printf("        skipped: bundle incomplete (missing tokens or fingerprint)\n")
-			skipped++
-			continue
-		}
-
-		perAccount := common
-		perAccount.cookies = path
-
-		a, buildErr := perAccount.build()
-		if buildErr != nil {
-			fmt.Printf("        failed to open: %v\n", buildErr)
-			failed++
-			continue
-		}
-
-		if bootErr := bootstrap(ctx, a); bootErr != nil {
-			fmt.Printf("        bootstrap failed: %v\n", bootErr)
-			_ = a.Close()
-			failed++
-			continue
-		}
-
-		outcome, genErr := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
+	return runAllAccounts(ctx, common, "batch-all", func(ctx context.Context, a *app.App) ([]string, error) {
+		outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 			Prompt:   *prompt,
 			Model:    *model,
 			Download: *download,
 		})
-		_ = a.Close()
+		if err != nil {
+			return nil, err
+		}
+		return filePaths(outcome.Files), nil
+	})
+}
 
-		if genErr != nil {
-			fmt.Printf("        FAILED: %v\n", genErr)
-			failed++
-			continue
-		}
+/* ------------------------------------------------------------------ *
+ * --all: the same job on every account
+ * ------------------------------------------------------------------ */
 
-		ok++
-		if len(outcome.Files) == 0 {
-			fmt.Printf("        SUCCESS but nothing was downloaded (account %s)\n", outcome.AccountID)
-			continue
+// accountRun is one account's outcome from a --all run.
+//
+// Status is a word rather than a bool because "skipped" is a third outcome, and
+// the one an operator most needs to see: an account that never ran produced no
+// failure and no output, and folding it into "ok" would hide exactly the accounts
+// that are not working.
+type accountRun struct {
+	AccountID string
+	Label     string
+	Duration  time.Duration
+	Status    string
+	Files     []string
+	Err       string
+}
+
+const (
+	runOK      = "ok"
+	runFailed  = "failed"
+	runSkipped = "skipped"
+)
+
+// accountGenerate performs the job for one account and returns what it wrote.
+type accountGenerate func(ctx context.Context, a *app.App) ([]string, error)
+
+// runAccounts runs the job for every path, one goroutine each, and returns the
+// results in the order the paths were given.
+//
+// The order is preserved deliberately: the summary is read against the file list,
+// and a table that reshuffles itself between runs cannot be compared with the
+// previous one. It is also what lets a test assert the shape without racing.
+//
+// A failure is confined to its own account. One dead session must not stop the
+// others — that is the whole point of running them separately — so every error is
+// captured into the result rather than propagated.
+func runAccounts(paths []string, run func(string) accountRun) []accountRun {
+	runs := make([]accountRun, len(paths))
+
+	var wg sync.WaitGroup
+	for i, path := range paths {
+		wg.Add(1)
+		go func(i int, path string) {
+			defer wg.Done()
+			runs[i] = run(path)
+		}(i, path)
+	}
+	wg.Wait()
+	return runs
+}
+
+// formatDuration rounds to a tenth of a second, which is the resolution that
+// matters here: a generation is tens of seconds, and printing milliseconds would
+// widen the column to say nothing.
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "-"
+	}
+	return d.Round(100 * time.Millisecond).String()
+}
+
+// renderAccountRuns formats the summary table.
+func renderAccountRuns(runs []accountRun) string {
+	headers := []string{"#", "Account ID", "Duration", "Status", "Output"}
+
+	body := make([][]string, 0, len(runs))
+	for i, run := range runs {
+		output := "-"
+		switch {
+		case len(run.Files) == 1:
+			output = run.Files[0]
+		case len(run.Files) > 1:
+			output = fmt.Sprintf("%s (+%d more)", run.Files[0], len(run.Files)-1)
+		case run.Err != "":
+			// The failure's own words, so the table is the whole record and a
+			// reader does not have to scroll back through interleaved logs.
+			output = run.Err
 		}
-		for _, file := range outcome.Files {
-			fmt.Printf("        SUCCESS -> %s (account %s)\n", file.Path, outcome.AccountID)
+		body = append(body, []string{
+			strconv.Itoa(i + 1), run.AccountID, formatDuration(run.Duration), run.Status, output,
+		})
+	}
+	return renderTable(headers, body)
+}
+
+// filePaths pulls the written paths out of a result's media files.
+func filePaths(files []engine.MediaFile) []string {
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		out = append(out, file.Path)
+	}
+	return out
+}
+
+// runForAccount builds an app for one account file and performs the job.
+//
+// The whole run is one function because every step needs the same app: the
+// cookies, the page tokens and the fingerprint all come from the file, and the
+// engine reads them at Bootstrap. That is also why `--all` needs no new
+// generation path — each account's run is an ordinary single-account run, and
+// `--cookies` is the only thing that differs between them.
+//
+// The duration is measured from before the file is even read, because that is
+// what an operator waits for. It is a named result so the deferred measurement
+// lands on the returned value rather than on a copy.
+func runForAccount(ctx context.Context, common commonFlags, path string, generate accountGenerate) (run accountRun) {
+	// Named before anything can fail, so a skipped account is still named in the
+	// table. The bundle's own id replaces it as soon as one loads.
+	run = accountRun{
+		AccountID: accountHashFromFile(path),
+		Label:     filepath.Base(path),
+		Status:    runFailed,
+	}
+	start := time.Now()
+	defer func() {
+		// A skipped account never ran, so it has no duration. Measuring the file
+		// checks and printing "0s" would read as "ran instantly", which is the
+		// opposite of what happened — and the column is meant to answer "how long
+		// did the generation take", which for this row is not a number at all.
+		if run.Status != runSkipped {
+			run.Duration = time.Since(start)
 		}
+	}()
+
+	// Checked here rather than left to the engine: a file with no credential
+	// cookie has no session to act as, and the failure it produces upstream reads
+	// like a server fault rather than like an unusable input.
+	jar, err := cookiejar.LoadFile(path)
+	if err != nil {
+		run.Status, run.Err = runSkipped, err.Error()
+		return run
+	}
+	if !jar.HasAuthCookies() {
+		run.Status, run.Err = runSkipped, "no credential cookies in the file"
+		return run
 	}
 
+	bundle, err := cookiejar.LoadBundleFile(path)
+	if err != nil {
+		run.Status, run.Err = runSkipped, err.Error()
+		return run
+	}
+	if bundle.AccountID != "" {
+		run.AccountID = bundle.AccountID
+	}
+	if !bundle.Complete() {
+		run.Status, run.Err = runSkipped, "bundle incomplete (needs at+fsid and a fingerprint)"
+		return run
+	}
+
+	perAccount := common
+	perAccount.cookies = path
+
+	a, err := perAccount.build()
+	if err != nil {
+		run.Err = err.Error()
+		return run
+	}
+	defer a.Close()
+
+	if err := bootstrap(ctx, a); err != nil {
+		run.Err = err.Error()
+		return run
+	}
+
+	files, err := generate(ctx, a)
+	if err != nil {
+		run.Err = err.Error()
+		return run
+	}
+	run.Status, run.Files = runOK, files
+	return run
+}
+
+// runAllAccounts discovers the account files and runs the job on every one at
+// once.
+func runAllAccounts(ctx context.Context, common commonFlags, what string, generate accountGenerate) int {
+	paths, err := engine.DiscoverAccountJars(config.CookieDir())
+	if err != nil {
+		return fail(fmt.Errorf("--all: list account cookie files: %w", err))
+	}
+	if len(paths) == 0 {
+		fmt.Fprintf(os.Stderr, "--all: no account_*.json in %s — run `flow-go bridge` "+
+			"with the extension attached so it writes them\n", config.CookieDir())
+		return 1
+	}
+
+	fmt.Printf("\n  %s on %d account(s), concurrently\n", what, len(paths))
+	fmt.Println("  " + strings.Repeat("-", 52))
+
+	// Said once, before any of them start. The engine's own log lines go to the
+	// global logger, which has no per-account identity to attach — so they
+	// interleave, and a reader who has not been told will read them as belonging
+	// to whichever account's block they happen to land in.
+	fmt.Println("  The engine's log lines interleave across accounts below; the table at")
+	fmt.Println("  the end is the per-account record.")
 	fmt.Println()
-	fmt.Printf("  %d succeeded, %d skipped, %d failed\n\n", ok, skipped, failed)
+
+	runs := runAccounts(paths, func(path string) accountRun {
+		return runForAccount(ctx, common, path, generate)
+	})
+
+	fmt.Print(renderAccountRuns(runs))
+
+	var ok, skipped, failed int
+	for _, run := range runs {
+		switch run.Status {
+		case runOK:
+			ok++
+		case runSkipped:
+			skipped++
+		default:
+			failed++
+		}
+	}
+	fmt.Printf("\n  %d succeeded, %d skipped, %d failed\n\n", ok, skipped, failed)
 	if failed > 0 {
 		return 1
 	}
+	return 0
+}
+
+/* ------------------------------------------------------------------ *
+ * balance
+ * ------------------------------------------------------------------ */
+
+// balanceRow is one line of the balance table.
+type balanceRow struct {
+	AccountID string
+	ShortHash string
+	ProjectID string
+	Credits   *int
+	Status    string
+}
+
+// formatCredits renders a balance, keeping "not read" distinct from zero.
+//
+// The store holds them apart on purpose — a nil balance is "nobody has asked",
+// a zero is "asked, and the wallet is empty" — and printing both as 0 would put
+// them back to being the same number, which is the confusion the pointer exists
+// to prevent.
+func formatCredits(credits *int) string {
+	if credits == nil {
+		return "not read"
+	}
+	return strconv.Itoa(*credits)
+}
+
+// accountHashFromFile pulls the short hash out of an `account_<hash>.json` name.
+//
+// The hash is the file's own identifier, which is what an operator has in front
+// of them when they look in cookies/, so it is more useful in the table than the
+// account id's own prefix.
+func accountHashFromFile(path string) string {
+	name := strings.TrimSuffix(filepath.Base(path), ".json")
+	return strings.TrimPrefix(name, "account_")
+}
+
+// renderTable lays out a header and rows in fixed-width columns, with a rule
+// beneath the header.
+//
+// Every line is padded to the full width rather than trimmed, so the header, the
+// rule and each row come out the same length. That is what makes alignment
+// something a test can assert instead of something a reader has to eyeball — and
+// the last column is padded too, without which the header comes out one short of
+// the rule whenever the widest cell is in the final column.
+//
+// Two tables need this now, and the second one is why it is not a closure inside
+// the first.
+func renderTable(headers []string, rows [][]string) string {
+	widths := make([]int, len(headers))
+	for i, header := range headers {
+		widths[i] = len(header)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < len(widths) && len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+
+	line := func(cells []string) string {
+		var b strings.Builder
+		b.WriteString("  ")
+		for i, cell := range cells {
+			b.WriteString(cell)
+			if i < len(widths) {
+				b.WriteString(strings.Repeat(" ", widths[i]-len(cell)))
+			}
+			if i < len(cells)-1 {
+				b.WriteString("  ")
+			}
+		}
+		return b.String()
+	}
+
+	var out strings.Builder
+	out.WriteString(line(headers))
+	out.WriteString("\n  ")
+	for i, width := range widths {
+		out.WriteString(strings.Repeat("-", width))
+		if i < len(widths)-1 {
+			out.WriteString("  ")
+		}
+	}
+	out.WriteString("\n")
+	for _, row := range rows {
+		out.WriteString(line(row))
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// renderBalanceTable formats the rows, with the combined spendable total beneath
+// them.
+//
+// The total counts only the balances that were actually read. Folding an unread
+// balance in as zero would understate it by exactly the accounts nobody has
+// checked — the opposite of what a total is for — so the number of unread
+// accounts is printed beside it rather than left to be inferred.
+func renderBalanceTable(rows []balanceRow) string {
+	headers := []string{"#", "Account ID", "Short Hash", "Project ID", "Credits", "Status"}
+
+	body := make([][]string, 0, len(rows))
+	for i, row := range rows {
+		project, status := row.ProjectID, row.Status
+		if project == "" {
+			project = "-"
+		}
+		if status == "" {
+			status = "unknown"
+		}
+		body = append(body, []string{
+			strconv.Itoa(i + 1), row.AccountID, row.ShortHash, project,
+			formatCredits(row.Credits), status,
+		})
+	}
+
+	var out strings.Builder
+	out.WriteString(renderTable(headers, body))
+
+	var total int
+	unread := 0
+	for _, row := range rows {
+		if row.Credits == nil {
+			unread++
+			continue
+		}
+		total += *row.Credits
+	}
+
+	out.WriteString("\n")
+	fmt.Fprintf(&out, "  Total spendable: %d credit(s) across %d account(s)",
+		total, len(rows)-unread)
+	if unread > 0 {
+		fmt.Fprintf(&out, " — %d unread, so the real total is at least this", unread)
+	}
+	out.WriteString("\n")
+	return out.String()
+}
+
+// runBalance reports every account's balance in one table.
+//
+// The default reads the cached figures from the database, so it costs nothing
+// and works with no browser, no session and no network. `--refresh` probes each
+// account over the transport first, which is what makes the numbers current at
+// the price of a round trip per account.
+func runBalance(args []string) int {
+	fs := flag.NewFlagSet("balance", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	refresh := fs.Bool("refresh", false, "probe each account's live balance before reporting")
+	_ = fs.Parse(args)
+
+	paths, err := engine.DiscoverAccountJars(config.CookieDir())
+	if err != nil {
+		return fail(fmt.Errorf("balance: list account cookie files: %w", err))
+	}
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	if *refresh {
+		if len(paths) == 0 {
+			fmt.Fprintf(os.Stderr, "balance: --refresh needs at least one account_*.json in %s\n",
+				config.CookieDir())
+			return 1
+		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		attachBridge(ctx, a)
+		if err := bootstrap(ctx, a); err != nil {
+			return fail(err)
+		}
+
+		// One pass covers every account: bootstrap registers a pool worker per
+		// dump, and RefreshCredits fans the balance read out across them. Asking
+		// per file instead would rebuild the whole app — cookies, page tokens,
+		// fingerprint, captcha chain — once per account.
+		a.Engine.RefreshCredits(ctx)
+	}
+
+	accounts, err := a.Store.ListAccounts()
+	if err != nil {
+		return fail(fmt.Errorf("balance: read accounts: %w", err))
+	}
+	byID := make(map[string]*int, len(accounts))
+	status := make(map[string]string, len(accounts))
+	for i := range accounts {
+		byID[accounts[i].AccountID] = accounts[i].Credits
+		status[accounts[i].AccountID] = accounts[i].Status
+	}
+
+	// The rows come from the files, not from the database. A file is what a run
+	// acts as, and an account with a dump but no row yet is real — it would be
+	// missing from a database-first listing, which is precisely the account an
+	// operator is looking for when they run this.
+	rows := make([]balanceRow, 0, len(paths))
+	for _, path := range paths {
+		row := balanceRow{ShortHash: accountHashFromFile(path)}
+		if bundle, loadErr := cookiejar.LoadBundleFile(path); loadErr == nil {
+			row.AccountID, row.ProjectID = bundle.AccountID, bundle.ProjectID
+		}
+		if row.AccountID == "" {
+			// A file with no recorded identity still has a balance to report, so
+			// it is listed rather than skipped — the hash is what identifies it.
+			row.AccountID = "(" + row.ShortHash + ")"
+		}
+		row.Credits = byID[row.AccountID]
+		row.Status = status[row.AccountID]
+		rows = append(rows, row)
+	}
+
+	fmt.Printf("\n  flow-go — %d account(s) in %s\n", len(rows), config.CookieDir())
+	if len(rows) == 0 {
+		fmt.Printf("\n  No account_*.json there yet. Run `flow-go bridge` with the extension\n" +
+			"  attached so each signed-in profile writes one.\n\n")
+		return 1
+	}
+
+	source := "cached"
+	if *refresh {
+		source = "refreshed over the transport"
+	}
+	fmt.Printf("  balances %s\n", source)
+	fmt.Print(renderBalanceTable(rows))
+	fmt.Println()
 	return 0
 }
 

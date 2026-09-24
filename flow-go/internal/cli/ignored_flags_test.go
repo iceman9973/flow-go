@@ -53,12 +53,22 @@ func captureStreams(t *testing.T, fn func()) (stdout, stderr string) {
 }
 
 func TestIgnoredGenerateFlagsNamesWhatWasPassed(t *testing.T) {
-	got := ignoredGenerateFlags("9:16", "4k", 7)
+	got := ignoredGenerateFlags("4k", 7)
 
-	for _, want := range []string{"--aspect", "--resolution", "--seed"} {
+	for _, want := range []string{"--resolution", "--seed"} {
 		if !contains(got, want) {
 			t.Errorf("ignoredGenerateFlags missed %q: %v", want, got)
 		}
+	}
+}
+
+// --aspect left this list when the video payload's aspect slot was wired. It is
+// the same story as --reference below: reporting it as ignored is now a lie
+// about what the run did, and a caller who passed it would go looking for why
+// their render came back landscape anyway.
+func TestAspectIsNoLongerReportedAsIgnored(t *testing.T) {
+	if got := ignoredGenerateFlags("", 0); contains(got, "--aspect") {
+		t.Errorf("--aspect is reported as ignored, but the video slot is wired now: %v", got)
 	}
 }
 
@@ -67,7 +77,7 @@ func TestIgnoredGenerateFlagsNamesWhatWasPassed(t *testing.T) {
 // the engine had a working path for it all along, and reporting it as ignored
 // now would be a lie about what the run actually did.
 func TestReferenceIsNoLongerReportedAsIgnored(t *testing.T) {
-	if got := ignoredGenerateFlags("", "", 0); contains(got, "--reference") {
+	if got := ignoredGenerateFlags("", 0); contains(got, "--reference") {
 		t.Errorf("--reference is reported as ignored, but it is applied now: %v", got)
 	}
 }
@@ -75,7 +85,7 @@ func TestReferenceIsNoLongerReportedAsIgnored(t *testing.T) {
 func TestIgnoredGenerateFlagsIsEmptyWhenNothingWasPassed(t *testing.T) {
 	// The common case. A warning printed for a run that passed no unsupported
 	// flag is noise, and noise on stderr is what teaches a caller to ignore it.
-	if got := ignoredGenerateFlags("", "", 0); len(got) != 0 {
+	if got := ignoredGenerateFlags("", 0); len(got) != 0 {
 		t.Errorf("nothing was passed but %v was reported", got)
 	}
 }
@@ -85,23 +95,23 @@ func TestIgnoredGenerateFlagsTreatsAZeroSeedAsUnset(t *testing.T) {
 	// than a bug: the flag cannot distinguish "not passed" from "passed 0", and
 	// warning on every defaulted run would be worse than missing one explicit
 	// zero.
-	if got := ignoredGenerateFlags("", "", 0); len(got) != 0 {
+	if got := ignoredGenerateFlags("", 0); len(got) != 0 {
 		t.Errorf("a defaulted seed was reported: %v", got)
 	}
-	if got := ignoredGenerateFlags("", "", 1); !contains(got, "--seed") {
+	if got := ignoredGenerateFlags("", 1); !contains(got, "--seed") {
 		t.Errorf("an explicit non-zero seed was not reported: %v", got)
 	}
 }
 
 func TestWarnIgnoredFlagsWritesToStderrNotStdout(t *testing.T) {
 	stdout, stderr := captureStreams(t, func() {
-		warnIgnoredFlags([]string{"--aspect", "--seed"})
+		warnIgnoredFlags([]string{"--resolution", "--seed"})
 	})
 
 	if stdout != "" {
 		t.Errorf("the warning polluted stdout, which callers pipe into jq: %q", stdout)
 	}
-	for _, want := range []string{"--aspect", "--seed", "ignoring"} {
+	for _, want := range []string{"--resolution", "--seed", "ignoring"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr is missing %q: %q", want, stderr)
 		}

@@ -271,8 +271,12 @@ func TestGenerateArgumentFields(t *testing.T) {
 	if request[3] != int64(99) {
 		t.Errorf("seed at [3] = %v, want 99", request[3])
 	}
-	if request[4] != generateMode {
-		t.Errorf("mode at [4] = %v, want %d", request[4], generateMode)
+	// Index 4 is the aspect slot. With no aspect asked for it must carry the
+	// value a live submission is known to accept — this is the byte-level
+	// guarantee that adding the flag changed nothing for a caller who never
+	// mentions it.
+	if request[4] != imageAspectDefault {
+		t.Errorf("aspect at [4] = %v, want the default %d", request[4], imageAspectDefault)
 	}
 	if request[5] != req.Model {
 		t.Errorf("model at [5] = %v, want %q", request[5], req.Model)

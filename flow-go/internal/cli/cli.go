@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -141,12 +142,23 @@ GENERATE FLAGS
   --end-image           Local image path or media ID
   --reference           Reference image, repeatable; makes it
                         reference-to-video and selects the reference model
+  --aspect              landscape | 16:9 | portrait | 9:16 (default landscape)
   --no-download         Skip writing the result to output/
 
-  --aspect, --resolution and --seed exist on the legacy aisandbox transport and
-  not on the batchexecute one. Passing one is reported on stderr and the run
-  continues without it, so a script carrying a stale flag still produces its
-  video.
+  --resolution and --seed exist on the legacy aisandbox transport and not on
+  the batchexecute one. Passing one is reported on stderr and the run continues
+  without it, so a script carrying a stale flag still produces its video.
+
+  SHORTHAND
+  The options above may also be given as tokens after the prompt, in any order:
+    flow-go generate "cyberpunk car in neon rain" 9:16 8s 720p x2
+    9:16 | 16:9 | portrait | landscape    aspect ratio
+    4s | 6s | 8s | 10s                    duration
+    360p | 720p                           quality
+    x1..x4 | 1x..4x                       count
+  Each token must be its own argument, and only the tail is read — a quoted
+  prompt is one argument, so "a study in 4:3" is left alone. A token that
+  contradicts a flag is an error, not a silent preference.
 
 IMAGE FLAGS
   --prompt              Prompt text (required, or give it as a positional
@@ -155,7 +167,17 @@ IMAGE FLAGS
                         (default: $IMAGE_MODEL, else narwhal)
   --count               Accepted, but only 1 is honoured: the RPC returns one
                         asset per call
+  --aspect              landscape | 16:9 | portrait | 9:16 | square | 1:1 |
+                        4:3 | 3:4                     (default landscape)
   --no-download         Skip writing the result to output/
+
+  SHORTHAND
+  The options above may also be given as tokens after the prompt, in any order:
+    flow-go image "cute origami owl" 1:1 x2
+    1:1 | 16:9 | 9:16 | 4:3 | 3:4         aspect ratio
+    x1..x4 | 1x..4x                       count
+  Duration and quality are not image options, so "8s" and "720p" stay in the
+  prompt here.
 
 EDIT FLAGS
   --source              The asset to edit: a media ID, a content ID, or a path
@@ -202,6 +224,9 @@ EXAMPLES
   flow-go generate "a paper boat on a river" --duration 8
   flow-go generate "slow push in" --start-image ./frame.png --quality 360p
   flow-go generate "keep the style" --reference ./style-a.png --reference ./style-b.png
+  flow-go generate "cyberpunk car in neon rain" 9:16 8s 720p x2
+  flow-go generate "golden sunset over mountains" 4s 360p x2
+  flow-go image "cute origami owl" 1:1 x2
   flow-go upload-video clip.mp4
   flow-go edit clip.mp4 "make it a cybernetic neon city"
   flow-go edit --source <content-id> "make the boat drift slowly to the left"
@@ -389,13 +414,17 @@ func runGenerate(args []string) int {
 	startImage := fs.String("start-image", "", "local image path or media ID")
 	endImage := fs.String("end-image", "", "local image path or media ID")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
-	// These three exist on the legacy aisandbox transport and not on the
-	// batchexecute one, which is the only one that works. They are still
+	// --resolution and --seed exist on the legacy aisandbox transport and not
+	// on the batchexecute one, which is the only one that works. They are still
 	// declared, and still named when passed — but the run continues without
 	// them. Failing was defensible only while the alternative was silence, and
 	// the caller's next move was always to drop the flag and retry, which is a
 	// move this command can make for them.
-	aspect := fs.String("aspect", "", "ignored — not implemented on the batchexecute transport")
+	//
+	// --aspect is no longer in that group. The video payload has an aspect slot
+	// and it is wired, so passing this now changes the render rather than being
+	// reported and dropped.
+	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16")
 	resolution := fs.String("resolution", "", "ignored — not implemented on the batchexecute transport")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
 	// --reference is a real flag now. It used to be declared purely so that
@@ -405,15 +434,38 @@ func runGenerate(args []string) int {
 	var references stringList
 	fs.Var(&references, "reference",
 		"reference image path or media ID; repeatable, and selects reference-to-video")
-	_ = fs.Parse(args)
+	// Flags and the positional prompt may be interleaved, so
+	// `flow-go generate "a paper boat" --duration 8` applies both rather than
+	// folding the flag into the prompt.
+	positional := parseInterspersed(fs, args)
+
+	// Trailing shorthand — `"…" 9:16 8s 720p x2` — is peeled off before the
+	// prompt is assembled, so none of it can end up inside the prompt text.
+	opts, positional, err := extractTrailingOptions(*prompt, positional, videoShorthand)
+	if err != nil {
+		return fail(err)
+	}
 
 	// The prompt may be given positionally, so `flow-go generate "a paper boat"`
 	// works.
-	*prompt = promptFromArgs(*prompt, fs.Args())
+	*prompt = promptFromArgs(*prompt, positional)
 	if strings.TrimSpace(*prompt) == "" {
 		return fail(fmt.Errorf("--prompt is required (or give the prompt as an argument)"))
 	}
-	warnIgnoredFlags(ignoredGenerateFlags(*aspect, *resolution, *seed))
+	if err := mergeShorthand(fs, opts, duration, quality, count, aspect,
+		config.VideoAspectValue); err != nil {
+		return fail(err)
+	}
+	// Refused here, before the engine is built, so a typo costs nothing: an
+	// aspect the server does not recognise is accepted and renders nothing, so
+	// the alternative is discovering it from an empty result minutes later.
+	if strings.TrimSpace(*aspect) != "" {
+		if _, ok := config.VideoAspectValue(*aspect); !ok {
+			return fail(fmt.Errorf("--aspect %q is not a video aspect; use one of %s",
+				*aspect, strings.Join(config.VideoAspectNames, ", ")))
+		}
+	}
+	warnIgnoredFlags(ignoredGenerateFlags(*resolution, *seed))
 
 	a, err := common.build()
 	if err != nil {
@@ -453,6 +505,15 @@ func runGenerate(args []string) int {
 			// follows here.
 			warnIgnoredFlags([]string{"--quality (reference-to-video has no quality variant)"})
 		}
+		if strings.TrimSpace(*aspect) != "" {
+			// The reference payload is not the text-to-video layout the aspect
+			// slot belongs to: it puts the prompt at index 0 and the reference
+			// images at index 1, where the text-to-video one puts them last. So
+			// there is no verified slot to write. Reported rather than silently
+			// dropped — the flag is applied on the text-to-video path, which
+			// makes a silent drop here the more surprising of the two.
+			warnIgnoredFlags([]string{"--aspect (reference-to-video has no aspect slot)"})
+		}
 		return runReferenceGenerate(ctx, a, *prompt, references, *duration, !*noDownload)
 	}
 
@@ -467,6 +528,7 @@ func runGenerate(args []string) int {
 		Duration:   *duration,
 		Quality:    *quality,
 		Count:      *count,
+		Aspect:     *aspect,
 		StartImage: *startImage,
 		EndImage:   *endImage,
 		Wait:       !*noDownload,
@@ -524,11 +586,13 @@ func runEdit(args []string) int {
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
 	forceUpload := fs.Bool("force-upload", false,
 		"upload the file again even if it is already in this project")
-	_ = fs.Parse(args)
+	// Flags and the two positional arguments may be interleaved, so
+	// `flow-go edit clip.mp4 "make it neon" --force-upload` applies all three.
+	positional := parseInterspersed(fs, args)
 
 	// Both the source and the prompt may be given positionally, so
 	// `flow-go edit clip.mp4 "make it neon"` reads the way it should.
-	*source, *prompt = resolveEditArgs(*source, *prompt, fs.Args())
+	*source, *prompt = resolveEditArgs(*source, *prompt, positional)
 
 	if strings.TrimSpace(*source) == "" {
 		return fail(fmt.Errorf("--source is required: a media ID, a content ID, or a path to a " +
@@ -731,13 +795,11 @@ func runUploadVideo(args []string) int {
 // not apply, so the caller is told rather than left to notice the result differs
 // from what they asked for.
 //
-// --reference is deliberately absent: it is applied now, by routing to the
-// reference-to-video submission rather than to the frame-conditioned one.
-func ignoredGenerateFlags(aspect, resolution string, seed int64) []string {
+// --reference and --aspect are deliberately absent: both are applied now, the
+// first by routing to the reference-to-video submission rather than to the
+// frame-conditioned one, the second by the video payload's aspect slot.
+func ignoredGenerateFlags(resolution string, seed int64) []string {
 	var out []string
-	if strings.TrimSpace(aspect) != "" {
-		out = append(out, "--aspect")
-	}
 	if strings.TrimSpace(resolution) != "" {
 		out = append(out, "--resolution")
 	}
@@ -776,6 +838,365 @@ func promptFromArgs(flagValue string, rest []string) string {
 	return strings.Join(rest, " ")
 }
 
+// parseInterspersed parses args so that flags and positional arguments may be
+// interleaved, and returns the positional arguments in the order they appeared.
+//
+// The standard flag package stops at the first non-flag argument. That makes
+// `generate "a paper boat" --duration 8` parse no flags at all and then hand
+// "--duration 8" to the prompt — so the duration is ignored *and* the prompt is
+// wrong, silently, with a render as the only feedback. Every example in this
+// command's own help text is written in that order, and it is the order anyone
+// types.
+//
+// This walks the remainder instead: parse, take one positional, parse what is
+// left, until nothing remains. Flags keep last-wins semantics, and a repeatable
+// flag such as --reference accumulates exactly as it does when given up front.
+//
+// A bare "--" still ends flag parsing, so a caller can pass something that looks
+// like a flag; everything after it is positional.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	head, tail := args, []string(nil)
+	for i, arg := range args {
+		if arg == "--" {
+			head, tail = args[:i], args[i+1:]
+			break
+		}
+	}
+
+	var positional []string
+	rest := head
+	for {
+		if err := fs.Parse(rest); err != nil {
+			break
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		// Parse stopped here, so this argument is positional. Take it and keep
+		// walking, so the flags after it are still read.
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+	return append(positional, tail...)
+}
+
+/* ------------------------------------------------------------------ *
+ * trailing shorthand
+ *
+ * `flow-go generate "a cyberpunk warrior" 9:16 8s 720p x2` is how a person
+ * writes the command. These helpers read those tokens off the end of the
+ * argument list, before the prompt is assembled, so none of them can end up
+ * inside the prompt text.
+ * ------------------------------------------------------------------ */
+
+// tokenKind says which option a shorthand token sets.
+type tokenKind int
+
+const (
+	tokenAspect tokenKind = iota
+	tokenDuration
+	tokenQuality
+	tokenCount
+)
+
+// shorthandToken is one recognised trailing token.
+type shorthandToken struct {
+	Kind     tokenKind
+	Aspect   string // as spelled, e.g. "9:16"
+	Duration int
+	Quality  string
+	Count    int
+}
+
+// trailingOptions is what the trailing tokens resolved to. A zero field means no
+// token supplied it, which is unambiguous here because no token carries a zero:
+// durations are 4..10 and counts are 1..4.
+type trailingOptions struct {
+	Aspect   string
+	Duration int
+	Quality  string
+	Count    int
+}
+
+// shorthandSpec says which token classes a command accepts.
+//
+// Duration and quality are video only. On the image command "8s" and "720p" are
+// plausible endings for a prompt, and reading them as options would cut the
+// prompt and change the request. Aspect and count apply to both.
+type shorthandSpec struct {
+	Duration     bool
+	Quality      bool
+	Count        bool
+	AspectLookup func(string) (int, bool)
+}
+
+// videoShorthand and imageShorthand are the two token sets. They differ in the
+// classes and in the aspect table, which is what keeps `3:4` an image aspect and
+// a prompt word on the video path.
+var (
+	videoShorthand = shorthandSpec{
+		Duration:     true,
+		Quality:      true,
+		Count:        true,
+		AspectLookup: config.VideoAspectValue,
+	}
+	imageShorthand = shorthandSpec{
+		Count:        true,
+		AspectLookup: config.ImageAspectValue,
+	}
+)
+
+// videoQualities are the quality tokens the shorthand accepts.
+//
+// A literal, because the parser has to match a token exactly and
+// NormalizeVideoQuality cannot: it answers "720p" for anything it does not
+// recognise, so it cannot tell a token from a word. A test keeps this list and
+// config.VideoCosts from drifting apart.
+var videoQualities = []string{"360p", "720p"}
+
+// extractTrailingOptions peels recognised shorthand tokens off the END of the
+// positional arguments, and reports both what they set and what is left as the
+// prompt.
+//
+// Only the tail is peeled: the first argument from the end that is not a token
+// ends the scan, so `flow-go generate "a paper boat" 8s tomorrow` peels nothing
+// rather than reaching past "tomorrow" for the "8s". A prompt is never picked
+// apart from the middle.
+//
+// At least one positional stays behind as the prompt unless --prompt names it,
+// so `flow-go generate 8s` keeps "8s" as the prompt rather than leaving nothing
+// to generate — the same rule the ratio shorthand already followed.
+func extractTrailingOptions(promptFlag string, positional []string, spec shorthandSpec) (trailingOptions, []string, error) {
+	minKeep := 1
+	if strings.TrimSpace(promptFlag) != "" {
+		minKeep = 0
+	}
+
+	var opts trailingOptions
+	end := len(positional)
+	for end > minKeep {
+		token, ok := classifyShorthand(positional[end-1], spec)
+		if !ok {
+			break
+		}
+		if err := opts.apply(token, spec); err != nil {
+			return trailingOptions{}, positional, err
+		}
+		end--
+	}
+	return opts, positional[:end], nil
+}
+
+// classifyShorthand reports what a positional argument means as a shorthand
+// token, if anything.
+//
+// The match is exact and on the whole token. That is the property the whole
+// feature rests on: a prompt is normally one quoted string, so
+// `flow-go image "a study in 4:3"` is a single argument that matches nothing,
+// while a token standing alone is read as an option. A substring or suffix match
+// would eat the tail of that prompt instead.
+func classifyShorthand(token string, spec shorthandSpec) (shorthandToken, bool) {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return shorthandToken{}, false
+	}
+
+	if spec.AspectLookup != nil {
+		if _, ok := spec.AspectLookup(trimmed); ok {
+			return shorthandToken{Kind: tokenAspect, Aspect: trimmed}, true
+		}
+	}
+	if spec.Duration {
+		if seconds, ok := parseDurationToken(trimmed); ok {
+			return shorthandToken{Kind: tokenDuration, Duration: seconds}, true
+		}
+	}
+	if spec.Quality {
+		if quality, ok := parseQualityToken(trimmed); ok {
+			return shorthandToken{Kind: tokenQuality, Quality: quality}, true
+		}
+	}
+	if spec.Count {
+		if n, ok := parseCountToken(trimmed); ok {
+			return shorthandToken{Kind: tokenCount, Count: n}, true
+		}
+	}
+	return shorthandToken{}, false
+}
+
+// parseDurationToken reads "4s", "6s", "8s" and "10s", in any case.
+//
+// The accepted seconds come from config.Durations, so "12s" is not a duration
+// token at all — it stays in the prompt rather than being refused as an
+// unsupported length. A prompt may legitimately end in "12s", and refusing the
+// whole run over it would make that prompt unusable.
+func parseDurationToken(token string) (int, bool) {
+	lower := strings.ToLower(strings.TrimSpace(token))
+	if !strings.HasSuffix(lower, "s") {
+		return 0, false
+	}
+	seconds, err := strconv.Atoi(strings.TrimSuffix(lower, "s"))
+	if err != nil {
+		return 0, false
+	}
+	for _, allowed := range config.Durations {
+		if seconds == allowed {
+			return seconds, true
+		}
+	}
+	return 0, false
+}
+
+// parseQualityToken reads "360p" and "720p", in any case.
+func parseQualityToken(token string) (string, bool) {
+	for _, quality := range videoQualities {
+		if strings.EqualFold(strings.TrimSpace(token), quality) {
+			return quality, true
+		}
+	}
+	return "", false
+}
+
+// parseCountToken reads "x2" and "2x", in any case, for 1..4.
+//
+// Both spellings are accepted because both get typed. A number outside 1..4 is
+// not a count token, for the same reason "12s" is not a duration token: the
+// prompt has to keep it.
+func parseCountToken(token string) (int, bool) {
+	lower := strings.ToLower(strings.TrimSpace(token))
+	var digits string
+	switch {
+	case strings.HasPrefix(lower, "x"):
+		digits = lower[1:]
+	case strings.HasSuffix(lower, "x"):
+		digits = lower[:len(lower)-1]
+	default:
+		return 0, false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 1 || n > 4 {
+		return 0, false
+	}
+	return n, true
+}
+
+// apply folds one token in, refusing a second token of the same class that
+// contradicts the first.
+//
+// `8s 4s` is two instructions, not a preference order. Quietly honouring one of
+// them would render something the caller did not ask for, which is the failure
+// this codebase spends its time removing.
+func (o *trailingOptions) apply(token shorthandToken, spec shorthandSpec) error {
+	switch token.Kind {
+	case tokenAspect:
+		if o.Aspect != "" && !aspectsAgree(o.Aspect, token.Aspect, spec.AspectLookup) {
+			return fmt.Errorf("the trailing %s and %s disagree; give one of them",
+				o.Aspect, token.Aspect)
+		}
+		o.Aspect = token.Aspect
+	case tokenDuration:
+		if o.Duration != 0 && o.Duration != token.Duration {
+			return fmt.Errorf("the trailing %ds and %ds disagree; give one of them",
+				o.Duration, token.Duration)
+		}
+		o.Duration = token.Duration
+	case tokenQuality:
+		if o.Quality != "" && o.Quality != token.Quality {
+			return fmt.Errorf("the trailing %s and %s disagree; give one of them",
+				o.Quality, token.Quality)
+		}
+		o.Quality = token.Quality
+	case tokenCount:
+		if o.Count != 0 && o.Count != token.Count {
+			return fmt.Errorf("the trailing x%d and x%d disagree; give one of them",
+				o.Count, token.Count)
+		}
+		o.Count = token.Count
+	}
+	return nil
+}
+
+// aspectsAgree reports whether two aspect spellings name the same ratio.
+//
+// Compared by resolved value rather than as strings, so `--aspect 9:16` beside a
+// trailing `portrait` is the same request written twice and not a contradiction.
+func aspectsAgree(a, b string, lookup func(string) (int, bool)) bool {
+	av, aok := lookup(a)
+	bv, bok := lookup(b)
+	return aok && bok && av == bv
+}
+
+// flagWasSet reports whether the caller named a flag, as opposed to it sitting
+// at its default.
+//
+// The distinction is the reason this exists at all: --duration defaults to 10 and
+// --quality to "720p", so a command carrying a trailing `4s 360p` would otherwise
+// look like a contradiction with flags nobody passed, and every shorthand token
+// would be refused.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// mergeShorthand folds the trailing shorthand into the flag values.
+//
+// A flag the caller set explicitly conflicts with a token that disagrees; a flag
+// left at its default is simply not an instruction. Equal values are never an
+// error — refusing `--duration 8 "…" 8s` would punish a caller for saying the
+// same thing twice.
+//
+// A nil target is a flag this command does not have, and is skipped: the image
+// command has no --duration or --quality, and its token set never fills them
+// either.
+func mergeShorthand(fs *flag.FlagSet, opts trailingOptions,
+	duration *int, quality *string, count *int, aspect *string,
+	lookup func(string) (int, bool)) error {
+
+	if opts.Duration != 0 && duration != nil {
+		if flagWasSet(fs, "duration") && *duration != opts.Duration {
+			return fmt.Errorf("--duration %d and the trailing %ds disagree; give one of them",
+				*duration, opts.Duration)
+		}
+		*duration = opts.Duration
+	}
+	if opts.Quality != "" && quality != nil {
+		if flagWasSet(fs, "quality") && *quality != opts.Quality {
+			return fmt.Errorf("--quality %s and the trailing %s disagree; give one of them",
+				*quality, opts.Quality)
+		}
+		*quality = opts.Quality
+	}
+	if opts.Count != 0 && count != nil {
+		if flagWasSet(fs, "count") && *count != opts.Count {
+			return fmt.Errorf("--count %d and the trailing x%d disagree; give one of them",
+				*count, opts.Count)
+		}
+		*count = opts.Count
+	}
+	if opts.Aspect != "" && aspect != nil {
+		if flagWasSet(fs, "aspect") {
+			if !aspectsAgree(*aspect, opts.Aspect, lookup) {
+				return fmt.Errorf("--aspect %s and the trailing %s disagree; give one of them, "+
+					"or make them the same ratio", *aspect, opts.Aspect)
+			}
+			// They agree, and the flag keeps its spelling: it is the more
+			// explicit of the two, so `--aspect 9:16 "…" portrait` should read
+			// back as what the caller typed rather than as the alias. The other
+			// three classes hold canonical values, so assigning is a no-op there
+			// and they do not need the same care.
+		} else {
+			*aspect = opts.Aspect
+		}
+	}
+	return nil
+}
+
 /* ------------------------------------------------------------------ *
  * image
  * ------------------------------------------------------------------ */
@@ -789,19 +1210,47 @@ func runImage(args []string) int {
 	model := fs.String("model", envDefault("IMAGE_MODEL", ""),
 		"harbor_seal, narwhal, or gem_pix_2 (from $IMAGE_MODEL, else narwhal)")
 	noDownload := fs.Bool("no-download", false, "skip writing the result to disk")
-	// Not implemented on the batchexecute transport; declared, and named when
-	// passed, but the run continues without them.
-	aspect := fs.String("aspect", "", "ignored — not implemented on the batchexecute transport")
+	// --seed is not implemented on the batchexecute transport; declared, and
+	// named when passed, but the run continues without it.
+	//
+	// --aspect is applied now, at request[4] of the image payload — the slot a
+	// hardcoded constant used to occupy, whose value turned out to be the
+	// default aspect rather than a mode flag.
+	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16 | square | 1:1 | 4:3 | 3:4")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
-	_ = fs.Parse(args)
+	// Flags and the positional prompt may be interleaved, so
+	// `flow-go image "a red boat" --model narwhal` applies both.
+	positional := parseInterspersed(fs, args)
+
+	// Trailing shorthand — `flow-go image "an origami owl" 1:1 x2` — is peeled
+	// off before the prompt is assembled, so none of it can end up inside the
+	// prompt text. The image token set is narrower: no duration and no quality.
+	opts, positional, err := extractTrailingOptions(*prompt, positional, imageShorthand)
+	if err != nil {
+		return fail(err)
+	}
 
 	// The prompt may be given positionally, so `flow-go image "a red boat"`
 	// works.
-	*prompt = promptFromArgs(*prompt, fs.Args())
+	*prompt = promptFromArgs(*prompt, positional)
 	if strings.TrimSpace(*prompt) == "" {
 		return fail(fmt.Errorf("--prompt is required (or give the prompt as an argument)"))
 	}
-	warnIgnoredFlags(ignoredGenerateFlags(*aspect, "", *seed))
+	if err := mergeShorthand(fs, opts, nil, nil, count, aspect,
+		config.ImageAspectValue); err != nil {
+		return fail(err)
+	}
+	// Validated here, before the engine is built, so a typo costs nothing. The
+	// server does not reject an aspect it does not recognise — it accepts the
+	// submission and renders nothing — so the alternative is diagnosing it from
+	// an empty result minutes later.
+	if strings.TrimSpace(*aspect) != "" {
+		if _, ok := config.ImageAspectValue(*aspect); !ok {
+			return fail(fmt.Errorf("--aspect %q is not an image aspect; use one of %s",
+				*aspect, strings.Join(config.ImageAspectNames, ", ")))
+		}
+	}
+	warnIgnoredFlags(ignoredGenerateFlags("", *seed))
 	if *count != 1 {
 		// The image RPC takes one prompt and returns one asset. Reporting it and
 		// continuing beats failing the run: the caller gets the image they asked
@@ -831,6 +1280,7 @@ func runImage(args []string) int {
 	outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
 		Prompt:   *prompt,
 		Model:    *model,
+		Aspect:   *aspect,
 		Download: !*noDownload,
 	})
 	if err != nil {

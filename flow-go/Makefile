@@ -1,5 +1,5 @@
 GO ?= go
-BINARY ?= flow-go
+BINARY ?= flow
 
 # The daemon's bookkeeping.
 #

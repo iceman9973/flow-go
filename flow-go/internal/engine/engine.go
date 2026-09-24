@@ -2787,6 +2787,11 @@ type BatchVideoRequest struct {
 	Quality   string
 	Count     int
 	ProjectID string
+	// Aspect is the output aspect ratio: "landscape"/"16:9" (the default) or
+	// "portrait"/"9:16". Empty leaves the payload's aspect slot null, which is
+	// what the server reads as landscape — so an unset flag and an explicit
+	// landscape are the same render but not the same bytes.
+	Aspect string
 	// Wait blocks until the render finishes, then resolves and downloads it.
 	Wait bool
 	// Download writes the finished video to output/. Implies Wait.
@@ -3258,6 +3263,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		Prompt:    req.Prompt,
 		Model:     model,
 		Duration:  req.Duration,
+		Aspect:    req.Aspect,
 		Count:     req.Count,
 		Status:    "submitted",
 	})
@@ -3336,6 +3342,7 @@ func (e *Engine) GenerateVideoViaBatch(ctx context.Context, req BatchVideoReques
 		Model:        model,
 		Prompt:       req.Prompt,
 		Count:        req.Count,
+		AspectRatio:  req.Aspect,
 		CaptchaToken: captcha,
 		StartImage:   startImage,
 		EndImage:     endImage,
@@ -4251,6 +4258,10 @@ type BatchImageRequest struct {
 	Model string
 	// ProjectID overrides the resolved project.
 	ProjectID string
+	// Aspect is the output aspect ratio: "landscape"/"16:9" (the default),
+	// "portrait"/"9:16", "square"/"1:1", "4:3" or "3:4". Empty sends the value
+	// every working submission already carries, so an unset flag changes nothing.
+	Aspect string
 	// Download writes the result to output/.
 	Download bool
 }
@@ -4302,6 +4313,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		Kind:      "image",
 		Prompt:    req.Prompt,
 		Model:     model,
+		Aspect:    req.Aspect,
 		Status:    "submitted",
 	})
 	if err != nil {
@@ -4347,6 +4359,7 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		ProjectID:    projectID,
 		Model:        model,
 		Prompt:       req.Prompt,
+		AspectRatio:  req.Aspect,
 		CaptchaToken: captcha,
 	}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
 		SourcePath: "/project/" + projectID,

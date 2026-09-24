@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kodelyx/flow-go/flow-go/internal/config"
 	"github.com/kodelyx/flow-go/flow-go/internal/cookiejar"
 	"github.com/kodelyx/flow-go/flow-go/internal/httpx"
 )
@@ -1141,6 +1142,14 @@ type GenerateRequest struct {
 	Prompt string
 	// Seed makes a take reproducible. Zero lets the server choose.
 	Seed int64
+	// AspectRatio is the friendly name or ratio alias of the output aspect:
+	// "square"/"1:1", "portrait"/"9:16", "landscape"/"16:9", "3:4" or "4:3". It
+	// is resolved via config.ImageAspectValue and written at request[4].
+	//
+	// Empty does not mean "send nothing" here, the way it does on the video
+	// path, because this slot carries a value in every working submission
+	// already. Empty means "the default", which is what that value encodes.
+	AspectRatio string
 	// CaptchaToken is a reCAPTCHA Enterprise token.
 	//
 	// This is the field that took longest to identify. It sits at [1][0][7][10][0]
@@ -1153,10 +1162,25 @@ type GenerateRequest struct {
 	CaptchaToken string
 }
 
-// generateMode is the flag at position [4] of a generation request. Observed as 3
-// on every captured call; its meaning is unknown, so it is reproduced rather
-// than guessed at.
-const generateMode = 3
+// imageAspectDefault is what position [4] of an image request carries when the
+// caller names no aspect.
+//
+// That slot was a constant called generateMode for a long time, documented as
+// "observed as 3 on every captured call; its meaning is unknown, so it is
+// reproduced rather than guessed at". That was the honest reading of one value
+// seen across a handful of submissions, and it is now understood to be the
+// aspect ratio: 3 is IMAGE_ASPECT_RATIO_LANDSCAPE in the image protobuf enum
+// (see config.ImageAspectRatios), and every capture was taken at the composer's
+// default. That is what makes the old observation and the mapping agree rather
+// than merely coexist — a mode flag that happened to equal the landscape value
+// would be a coincidence; an aspect slot carrying the default aspect is not.
+//
+// The value stays 3 rather than becoming the mapping's square (1). Three is what
+// a live submission is known to accept, and moving it would silently re-aspect
+// every image rendered by a caller who never mentioned aspect at all — a change
+// no one asked for, in the one direction (square crops) that cannot be undone
+// after the fact.
+const imageAspectDefault = 3
 
 // toolContextID is the value at [7][1], observed as 22.
 const toolContextID = 22
@@ -1177,6 +1201,17 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, opts CallOpt
 	}
 	if req.CaptchaToken == "" {
 		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
+	}
+	// Refused here rather than defaulted in the builder, for the same reason the
+	// video path refuses one: the server does not reject an aspect it does not
+	// recognise, it accepts the submission and returns nothing, so a bad value
+	// would be diagnosed from an empty result rather than from its cause. This
+	// runs before the captcha token is spent.
+	if req.AspectRatio != "" {
+		if _, ok := config.ImageAspectValue(req.AspectRatio); !ok {
+			return nil, fmt.Errorf("batchexecute: unknown image aspect %q; use one of %s",
+				req.AspectRatio, strings.Join(config.ImageAspectNames, ", "))
+		}
 	}
 
 	seed := req.Seed
@@ -1403,6 +1438,29 @@ func videoImageBlock(mediaID string, frame []float64) []any {
 //
 // so the uuid block's index moves with the number of images. It is appended last
 // rather than written at a fixed position for that reason.
+// videoAspectSlot resolves an aspect name into the value the video payload
+// carries at request[3].
+//
+// Empty answers nil, which leaves the slot exactly as every capture has it, so
+// the existing fixtures stay byte-identical and a caller who never mentions
+// aspect is unaffected. An unrecognised name also answers nil.
+//
+// This function is total on purpose: the payload builder cannot fail
+// mid-construction, and an unknown name is refused by GenerateVideo before any
+// work is done, so the fallback here is unreachable from the CLI. It is nil
+// rather than a default because a silently-substituted aspect is the failure
+// this slot's whole history is about.
+func videoAspectSlot(aspect string) any {
+	if strings.TrimSpace(aspect) == "" {
+		return nil
+	}
+	value, ok := config.VideoAspectValue(aspect)
+	if !ok {
+		return nil
+	}
+	return value
+}
+
 func buildVideoArgument(req GenerateVideoRequest) []any {
 	count := req.Count
 	if count < 1 {
@@ -1428,7 +1486,17 @@ func buildVideoArgument(req GenerateVideoRequest) []any {
 			[]any{nil, nil, []any{[]any{[]any{req.Prompt}}}},
 			req.Model,
 			mode,
-			nil,
+			// The aspect ratio. Every capture carries a bare null here, because
+			// every capture was taken at the composer's default — and null is also
+			// what the server reads as landscape, so an absent flag and an explicit
+			// "landscape" are two different payloads that render the same way.
+			//
+			// This slot was a hardcoded nil until the bundle's own mapping showed
+			// what belongs in it: the video protobuf class has a setter that writes
+			// one field, and that field is this one. A wrong value here is not
+			// rejected — the server accepts the submission and renders nothing —
+			// which is why the value is resolved from a table rather than guessed.
+			videoAspectSlot(req.AspectRatio),
 		}
 		// One slot per supplied image, in order, each before the uuid block. The
 		// layout is the same for one image as for two; what differs is the RPC
@@ -1467,6 +1535,28 @@ func buildVideoArgument(req GenerateVideoRequest) []any {
 // nesting depth of the prompt in particular is not something a live call can
 // confirm: get it wrong and the server still answers 200 while generating
 // nothing, so a unit test is the only cheap guard.
+// imageAspectSlot resolves an aspect name into the value an image request
+// carries at index 4.
+//
+// Empty answers the default, not nil: this slot holds a value in every
+// submission known to work, and null is not one of the things it has been
+// observed to accept. That is the opposite of the video path, where the slot is
+// null in every capture and an absent flag has to leave it that way.
+//
+// An unrecognised name also answers the default, for the same reason
+// videoAspectSlot falls back to nil: the builder is total, and GenerateMedia
+// refuses an unknown name before any work is done.
+func imageAspectSlot(aspect string) any {
+	if strings.TrimSpace(aspect) == "" {
+		return imageAspectDefault
+	}
+	value, ok := config.ImageAspectValue(aspect)
+	if !ok {
+		return imageAspectDefault
+	}
+	return value
+}
+
 func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 	// The context block appears twice in the captured payload, byte for byte
 	// identical, so it is built once and referenced twice.
@@ -1482,7 +1572,10 @@ func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 	request := []any{
 		nil, nil, nil,
 		seed,
-		generateMode,
+		// The aspect ratio, at index 4. Unset leaves this at the value a live
+		// submission is known to accept, so a caller who never mentions aspect
+		// sends exactly the bytes they sent before this slot was understood.
+		imageAspectSlot(req.AspectRatio),
 		req.Model,
 		nil,
 		contextBlock,
@@ -2029,6 +2122,16 @@ type GenerateVideoRequest struct {
 	// Count is how many variations to submit. Each becomes its own entry in the
 	// requests array with its own uuid pair.
 	Count int
+	// AspectRatio is the friendly name or ratio alias of the output aspect
+	// ("portrait", "9:16", "landscape", "16:9", "square", "1:1"). It is resolved
+	// to the integer the payload carries at request[3] via config.VideoAspectValue.
+	//
+	// Empty is the default and is NOT the same as "landscape" on the wire: empty
+	// leaves the slot null, which is what every capture carries and what the
+	// server reads as landscape, while "landscape" writes the integer 2. Both
+	// render landscape today, and keeping them distinct is what lets the existing
+	// fixtures stay byte-identical.
+	AspectRatio string
 	// CaptchaToken is a reCAPTCHA token, minted for the VIDEO_GENERATION action.
 	CaptchaToken string
 	// StartImage and EndImage are project media ids the video is conditioned on.
@@ -2075,6 +2178,16 @@ func (c *Client) GenerateVideo(ctx context.Context, req GenerateVideoRequest, op
 	}
 	if req.CaptchaToken == "" {
 		return nil, fmt.Errorf("batchexecute: a reCAPTCHA token is required")
+	}
+	// Refused here rather than defaulted in the builder: an aspect the server
+	// does not recognise is not an error to it — it accepts the submission and
+	// renders nothing — so a bad value would be diagnosed from an empty result
+	// several minutes later. This runs before the captcha token is spent.
+	if req.AspectRatio != "" {
+		if _, ok := config.VideoAspectValue(req.AspectRatio); !ok {
+			return nil, fmt.Errorf("batchexecute: unknown video aspect %q; use one of %s",
+				req.AspectRatio, strings.Join(config.VideoAspectNames, ", "))
+		}
 	}
 
 	count := req.Count

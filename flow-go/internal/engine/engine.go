@@ -4536,6 +4536,9 @@ type BatchImageRequest struct {
 	// "portrait"/"9:16", "square"/"1:1", "4:3" or "3:4". Empty sends the value
 	// every working submission already carries, so an unset flag changes nothing.
 	Aspect string
+	// ReferenceImages are project media ids the image model conditions on, so a
+	// product can be kept looking like itself across shots. Empty is text-only.
+	ReferenceImages []string
 	// Download writes the result to output/.
 	Download bool
 }
@@ -4628,11 +4631,12 @@ func (e *Engine) GenerateImageViaBatch(ctx context.Context, req BatchImageReques
 		}
 
 		media, err = client.GenerateMedia(ctx, batchexecute.GenerateRequest{
-			ProjectID:    projectID,
-			Model:        model,
-			Prompt:       req.Prompt,
-			AspectRatio:  req.Aspect,
-			CaptchaToken: captcha,
+			ProjectID:       projectID,
+			Model:           model,
+			Prompt:          req.Prompt,
+			AspectRatio:     req.Aspect,
+			ReferenceImages: req.ReferenceImages,
+			CaptchaToken:    captcha,
 		}, e.captchaOptions(recaptcha.ActionImage, batchexecute.CallOptions{
 			SourcePath: "/project/" + projectID,
 			BuildLabel: config.BuildLabel(),

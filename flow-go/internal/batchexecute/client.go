@@ -1172,6 +1172,11 @@ type GenerateRequest struct {
 	Prompt string
 	// Seed makes a take reproducible. Zero lets the server choose.
 	Seed int64
+	// ReferenceImages are project media ids the image model conditions on,
+	// written at request[2] in the image item. Each keeps the render looking
+	// like the original shot — the same layout Merctra's cdp channel verifies
+	// live for image generation. Nil or empty sends no references.
+	ReferenceImages []string
 	// AspectRatio is the friendly name or ratio alias of the output aspect:
 	// "square"/"1:1", "portrait"/"9:16", "landscape"/"16:9", "3:4" or "4:3". It
 	// is resolved via config.ImageAspectValue and written at request[4].
@@ -1671,6 +1676,12 @@ func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 		uuid.NewString(),
 	}
 
+	// Reference images live at request[2] — the slot that stays nil on a
+	// text-only call. Filling it is what turns a render into a conditioned one;
+	// the server rejects nothing, so dropping it here would render without the
+	// reference and still look successful.
+	request[2] = buildImageReferenceArg(req.ReferenceImages)
+
 	return []any{
 		nil,
 		[]any{request},
@@ -1678,6 +1689,21 @@ func buildGenerateArgument(req GenerateRequest, seed int64) []any {
 		contextBlock,
 		[]any{uuid.NewString()},
 	}
+}
+
+// buildImageReferenceArg encodes project media ids into the image payload's
+// reference slot at request[2]. Each reference is [media_id, nil, nil, nil, 1]
+// — image reference type 1, the layout Merctra's cdp channel verified live.
+// Nil when there are no ids, which is the value a text-only call already sends.
+func buildImageReferenceArg(ids []string) any {
+	if len(ids) == 0 {
+		return nil
+	}
+	refs := make([]any, 0, len(ids))
+	for _, id := range ids {
+		refs = append(refs, []any{id, nil, nil, nil, 1})
+	}
+	return refs
 }
 
 // ParseGeneratedMediaIDs extracts the media ids from a generation response.

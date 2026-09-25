@@ -1289,6 +1289,12 @@ func runImage(args []string) int {
 	aspect := fs.String("aspect", "", "landscape | 16:9 | portrait | 9:16 | square | 1:1 | 4:3 | 3:4")
 	all := fs.Bool("all", false, "run the same generation on every account in cookies/ at once")
 	seed := fs.Int64("seed", 0, "ignored — not implemented on the batchexecute transport")
+	// A project media id to condition the image on, repeatable. The id must
+	// already exist in the account's project — a generated or uploaded image's
+	// media id is the working source — because there is no upload path here.
+	var refs stringList
+	fs.Var(&refs, "ref-media",
+		"project media id the image conditions on; repeatable (keeps the render looking like its reference)")
 	// Flags and the positional prompt may be interleaved, so
 	// `flow-go image "a red boat" --model narwhal` applies both.
 	positional := parseInterspersed(fs, args)
@@ -1323,16 +1329,24 @@ func runImage(args []string) int {
 	}
 	warnIgnoredFlags(ignoredGenerateFlags("", *seed))
 
+	// Reference media ids are project-scoped, so a run across every account would
+	// condition one account's render on another account's media. Refuse it up
+	// front, the way the video path refuses --all with --reference.
+	if *all && len(refs) > 0 {
+		return fail(fmt.Errorf("--all cannot be combined with --ref-media: reference ids are account- and project-scoped"))
+	}
+
 	if *all {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
 		return runAllAccounts(ctx, common, "image", func(ctx context.Context, a *app.App) ([]string, error) {
 			outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-				Prompt:   *prompt,
-				Model:    *model,
-				Aspect:   *aspect,
-				Download: !*noDownload,
+				Prompt:          *prompt,
+				Model:           *model,
+				Aspect:          *aspect,
+				ReferenceImages: refs,
+				Download:        !*noDownload,
 			})
 			if err != nil {
 				return nil, err
@@ -1368,10 +1382,11 @@ func runImage(args []string) int {
 
 	// The batchexecute path, which is the one the HTTP API already uses.
 	outcome, err := a.Engine.GenerateImageViaBatch(ctx, engine.BatchImageRequest{
-		Prompt:   *prompt,
-		Model:    *model,
-		Aspect:   *aspect,
-		Download: !*noDownload,
+		Prompt:          *prompt,
+		Model:           *model,
+		Aspect:          *aspect,
+		ReferenceImages: refs,
+		Download:        !*noDownload,
 	})
 	if err != nil {
 		return fail(err)

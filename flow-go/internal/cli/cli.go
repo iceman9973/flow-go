@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -57,6 +58,8 @@ func Run(args []string) int {
 		return runEdit(args[1:])
 	case "upload-video", "upload":
 		return runUploadVideo(args[1:])
+	case "upload-image":
+		return runUploadImage(args[1:])
 	case "batch-all":
 		return runBatchAll(args[1:])
 	case "projects":
@@ -107,6 +110,7 @@ COMMANDS
   image                 Generate an image
   edit                  Edit an existing video
   upload-video, upload  Upload a local video and print its media ID
+  upload-image          Upload a local image and print its ids
   batch-all             Generate one image per account in cookies/account_*.json
   projects              List the account's Flow projects
   stats                 Print database statistics
@@ -1392,6 +1396,59 @@ func runImage(args []string) int {
 		return fail(err)
 	}
 	printJSON(outcome)
+	return 0
+}
+
+// runUploadImage uploads one image file into the account's project and prints
+// the ids to take back out: the media id is what --ref-media conditions on, the
+// content id is what the app's start/end-image arguments carry. The upload is
+// the reason a reference can exist at all — without it the only reference ids
+// available are ones the account already generated.
+func runUploadImage(args []string) int {
+	fs := flag.NewFlagSet("upload-image", flag.ExitOnError)
+	var common commonFlags
+	common.bind(fs)
+	positional := parseInterspersed(fs, args)
+	if len(positional) == 0 {
+		return fail(fmt.Errorf("usage: flow-go upload-image <file>"))
+	}
+	path := positional[0]
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	a, err := common.build()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.Close()
+
+	attachBridge(ctx, a)
+
+	if err := bootstrap(ctx, a); err != nil {
+		return fail(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fail(fmt.Errorf("upload-image: read %s: %w", path, err))
+	}
+	if len(data) == 0 {
+		return fail(fmt.Errorf("upload-image: refusing to upload an empty file: %s", path))
+	}
+	mimeType := http.DetectContentType(data)
+
+	mediaID, contentID, err := a.Engine.UploadImageViaBatch(ctx, data, mimeType, filepath.Base(path))
+	if err != nil {
+		return fail(err)
+	}
+
+	log.Printf("cli: uploaded %s -> media %s (content %s)", path, mediaID, contentID)
+	printJSON(map[string]string{
+		"media_id":   mediaID,
+		"content_id": contentID,
+		"project_id": a.Engine.ProjectID(),
+	})
 	return 0
 }
 
